@@ -1,0 +1,65 @@
+# mw/decision_paths.yaml — 决策路径路由表 (issue #70, 「暂不抽象」最小形态)
+#
+# main 收到用户输入后只做**粗分类** (按文本形态), 迅速建首卡派发;
+# 分析/复现/审查是承接角色的产出物, 不是 main 的。
+# 判定算法见 mw/decision_paths.py classify() docstring (PLAN-78-70 §3.4)。
+# 新增输入类型 = 新增一条 path + 对应 worker; 改路由只改本文件,
+# 不要把判断写死在 main 的推理里。
+#
+# 注: route_to/first_card 写**语义角色名** (非运行时 profile 名),
+# main 在运行时现读 GET /api/workers 按 scope.tags 语义选人 (§3.5)。
+version: 1
+paths:
+  - id: requirement
+    label_zh: 需求类输入
+    label_en: requirement-shaped input
+    # 判定依据 = 用户输入的文本形态 (不是根因分析结果)
+    signals_zh:
+      - 验收标准 / 用户故事 / 期望行为
+      - 功能缺失 / 交互不符预期 / 文案措辞
+    signals_en:
+      - acceptance criteria / user story / expected behaviour
+      - missing feature / interaction does not match expectation
+    match:
+      any_of: ["验收标准", "用户故事", "期望行为", "acceptance criteria", "user story"]
+      none_of: ["堆栈", "traceback", "报错", "复现步骤", "stack trace"]
+    route_to: product-manager
+    role_tags: ["req-analysis", "requirements"]
+    first_card: product-manager
+    then_cards:
+      - role: system-engineer
+        when: "方案需要技术落地细化"
+      - role: coder
+        when: "方案已定"
+    forbidden_for_main:
+      - 复现问题
+      - 分析根因
+      - 审查代码
+      - 设计实现方案
+
+  - id: technical
+    label_zh: 技术类输入
+    label_en: technical-shaped input
+    signals_zh: ["报错 / 堆栈 / 性能数据 / 接口契约 / 复现步骤"]
+    signals_en: ["error / stack trace / perf numbers / API contract / repro steps"]
+    match:
+      any_of: ["堆栈", "traceback", "stack trace", "报错", "复现步骤", "repro steps", "性能", "perf"]
+      # ★ 与 PLAN §3.3 示例的偏差 (如实登记): 示例里 technical 的 none_of
+      # 含需求词, 但按 §3.4 的 得分=命中−2×否决 且「全 ≤0 ⇒ None」规则,
+      # §4.3 T-70-3 的混合输入 (既说验收标准又说堆栈) 两边得分都 ≤0,
+      # 永远得不出 PLAN 自己要求的 path_id=technical。
+      # 「技术信号优先」改由**非对称否决**实现: 需求路径被技术信号否决,
+      # 技术路径不设否决 ⇒ 混合输入必归技术类 (有报错栈 = 可复现技术问题)。
+      none_of: []
+    route_to: system-engineer
+    role_tags: ["analysis", "design", "arch"]
+    first_card: system-engineer
+    then_cards:
+      - role: coder
+        when: "修复方案已定"
+      - role: tester
+        when: "实施完成"
+    forbidden_for_main:
+      - 复现问题
+      - 分析根因
+      - 审查代码

@@ -1,0 +1,105 @@
+# tools/i18n_allowlist.txt — i18n v1.0 string-allowlist (架构 §8.2)
+#
+# 形如 `path::literal` 的行允许 ast_diff 把该字符串差异标为 OK
+# (不强制进入 mw/i18n/zh-cn.json)。
+#
+# 行内可用 # 注释;空行忽略。
+# 维护:每次新增条目必须有 code-review 留痕;这是 i18n 改造的
+# 「故意保留中文」受控登记处。
+
+# —— TODO.md 协议字面量(架构 §2.3 / D10) ——
+## 当前任务
+## 待执行
+## 已完成
+## 已放弃
+- 状态:
+- 结果:
+- 目标:
+- 承接方:
+- 产物目录:
+- 产出文件:
+- 跳过:
+进行中
+
+# —— mw/todo.py status enum(协议字面量,不入词条) ——
+STATUS_WORKING
+STATUS_COMPLETED
+STATUS_BLOCKED
+STATUS_FAILED
+RESULT_PLACEHOLDER
+
+# —— 内部错误码 / harvest_status / reaper 内部状态(D10:机器面) ——
+WORKING
+NEED_CLARIFICATION
+BLOCKED
+HARVESTED
+PENDING
+FAILED
+harvest_status
+PHYSICAL_ERROR
+
+# —— logging 调用站点的字符串(架构 §5.3 OUT 项:logging 不入表) ——
+logging.
+logger.info(
+logger.warning(
+logger.error(
+
+# —— mw/workflows.yaml id 匹配键(架构 §5.3:id/name 不动) ——
+# workflow id 来自 registry/workflow.yaml;不是字面量供差异比对,此处占位说明。
+
+# —— 测试数据 / fixtures(CJK 字面量在测试里作为断言样本,不入词条) ——
+tests/test_todo_contract.py::team-work
+tests/test_todo_contract.py::乌龟骑自行车小游戏
+tests/test_team_work_console.py::t_a
+tests/test_team_work_console.py::t_b
+tests/test_team_work_console.py::t_1
+tests/test_team_work_console.py::t_2
+tests/test_team_work_console.py::t_3
+tests/test_advance_todo_binding.py::
+
+# —— regex pattern 中的 CJK(todo.py / workflow parse) ——
+re.compile(.*[\u4e00-\u9fff].*)
+
+# —— 中文注释代码块字符(write_html / print_test_report / 等等工具函数注释) ——
+# (留空 — 注释中如整段中文 prose,AST 不计入常量差异,无需逐条登记)
+
+# —— console_ui.py 的 Python raw string 大块 HTML(架构 §5.3 item 4 — 整段进 t()) ——
+# 整块 HTML 内的中文 label 是由 t() 模板嵌入的;HTML 模板本身的非标签字符
+# (CSS / JS / 数字常量 / HTML 标签属性值) 不入词条,不被 ast_diff 标记。
+
+# —— 测试断言用的中文(production strings 已在 zh-cn.json, 测试断言也算 verbatim) ——
+进行中
+未结算
+已结算
+等回答
+等裁决
+PASS
+FAIL
+PASSED
+BLOCKED.
+COMPLETE
+CHANGES_REQUESTED
+
+# —— mw/reaper.py protocol literals(架构 §8.1 step 5:协议禁区未改) ——
+team_work.run_idle
+harvest.complete
+task.stuck
+
+# —— install.sh / verify.sh / main_entry.sh 中文脚本落字(架构 §4.4:中文字符串
+# 保留在脚本源里作为第二参数,是设计本身;C3 检查终端输出不检查源) ——
+# 这些字符串不在 .py AST 节点里(脚本不是 .py),不会被 ast_diff 抓,无须登记。
+# 此条作为审计提示。
+# —— 预登记未接线词条 (卡 fix-console-ui-i18n, B2/G13 裁决留档) ——————
+# console.workflow.* / console.upload.* / console.workers.* /
+# console.settings.* / console.team_work.* / console.soul.read_failed:
+#   值逐字=console.py 校验消息原文 (44 键, 脚本核对全部在码)。按架构
+#   §5.2 这些是 API error message 域词条; 前端卡 t_2899c2a3 已完成
+#   ui/** i18next 词条表(539 keys)覆盖前端展示, 后端 error 值写时 t()
+#   接线属 §5.3 登记遗留, 由 final-submit/code-review 裁决统一接线,
+#   本卡不越界重排 console.py 校验函数 (零逻辑红线最小 diff)。
+# console.lang.*: GET /api/lang 与前端语言面板词条, 值预抄自架构文档;
+#   前端 SettingsView (t_2899c2a3) 用自身 i18next 表, 后端键待接线。
+# deploy.lang.*: deploy/lib/i18n.sh say/fail 双语走脚本内双参形态
+#   (架构 §4.4: C3 检终端输出不检源), JSON 键仅作审计镜像, 无调用方。
+# ui_fallback.body: 备用键, console.py / 路由现走 ui/dist 或兜底页,
+#   未引用; 保留待 final-submit 裁决 (值含 {port} 插值)。

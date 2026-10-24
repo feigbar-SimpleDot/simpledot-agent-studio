@@ -1,0 +1,8 @@
+# pytest 统一收集入口 (#67 整改, 2026-10-19)。
+# 跑法: python3 -m pytest tests/   (或仓库根直接 python3 -m pytest)
+# script-style 测试 (test_assignee_semantic / test_dedup_spawn_guard /
+# test_pipeline / test_repeat_notify_dedup / test_fs_api /
+# test_pixel_bridge_singleline) 均有 __main__ 护栏: pytest import 即跳过,
+# 真测试用 python3 tests/<file>.py 直跑。
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,31 @@
+{
+  "name": "sas-console",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node tests/test_chatlinks.mjs && node tests/test_sse_parse.mjs && node tests/test_todo_viewer_chips.mjs && node tests/test_toolgroup.mjs && node tests/test_issue58_tokens.mjs && node tests/test_issue63_stop.mjs && node tests/test_issue75_chat_asi.mjs && node tests/test_issue79_run_title.mjs && node tests/test_issue87_s1_deadbranch.mjs && node tests/test_issue86_net_cause.mjs && node tests/test_issue87_fmtapierror_coverage.mjs"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.16",
+    "i18next": "^23.16.8",
+    "js-yaml": "^5.4.2",
+    "marked": "^18.0.14",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-i18next": "^14.1.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "esbuild": "^0.21.5",
+    "jsdom": "^26.1.0",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "vite": "^5.4.11",
+    "vite-plugin-singlefile": "^2.0.3"
+  }
+}

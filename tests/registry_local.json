@@ -1,0 +1,14 @@
+{
+  "coder": {
+    "image": "worker-coder:latest",
+    "hermes_profile": "coder",
+    "runner": "local",
+    "hermes_home": "/tmp/mw_e2e/worker_home"
+  },
+  "reviewer": {
+    "image": "worker-reviewer:latest",
+    "hermes_profile": "reviewer",
+    "runner": "local",
+    "hermes_home": "/tmp/mw_e2e/worker_home"
+  }
+}

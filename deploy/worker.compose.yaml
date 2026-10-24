@@ -1,0 +1,46 @@
+# Simple-Agents-Studio - worker compose (parameterized, used by deploy/install.sh)
+# Usage (set WORKER_NAME=coder or code-reviewer in repo-root .env):
+#   WORKER_NAME=coder docker compose --project-directory . \
+#     -f deploy/worker.compose.yaml up -d
+# Variables come from repo-root .env:
+#   WORKER_NAME       - container name suffix (coder / code-reviewer)
+#   WORKER_IMAGE      - hermes image (same as main)
+#   WORKER_PORT       - host port (8643 / 8644)
+#   WORKER_API_KEY    - this worker's API key (needed in registry, independent from main)
+# See install.sh: it seeds one docker-compose.yaml + .env per worker under
+# <worker-deploy-dir>/<name>/, this template is the source.
+
+services:
+  hermes:
+    image: ${WORKER_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/nousresearch/hermes-agent:v2026.9.24}
+    container_name: hermes_${WORKER_NAME:-coder}
+    restart: unless-stopped
+    command: gateway run
+    ports:
+      - "${WORKER_PORT:-8643}:8642"
+    volumes:
+      - ./hermes:/opt/data
+      # 2026-10-01 SE card root-cause fix: worker must mount main share_workspace,
+      # otherwise launch writing TODO.md under data/share_workspace/projects/<proj>/ is invisible
+      # to worker. Likewise worker writes to deliverables / .clarify.json at wrong location,
+      # main never receives them.
+      # Earlier worker.compose.yaml wrote a machine-specific absolute share_workspace path,
+      # inconsistent with main's ./data/share_workspace, breaking entire Team Work cross-scene;
+      # SE card reported deliverables dir missing, worker reports cannot find TODO.md.
+      # Fix: use the same absolute path data/share_workspace as main.
+      - ./data/share_workspace:/share_workspace
+    environment:
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      # Recommend setting API_SERVER_KEY separately in .env, or directly replace with your fixed secret here
+      - API_SERVER_KEY=${WORKER_API_KEY:?need WORKER_API_KEY in .env}
+      - API_SERVER_CORS_ORIGINS=*
+      - HERMES_WRITE_SAFE_ROOT=/share_workspace
+      - HERMES_YOLO_MODE=1
+      # 2026-09-30: long-task LLM timeout raised to 30min, to avoid 70s default firing
+      # 'Operation interrupted: waiting for model response' killing in-flight
+      # long-context main agent turns. litellm docs confirm these two variables control
+      # stream read wait timeout (HERMES_STREAM_READ_TIMEOUT) and local stale detection
+      # (HERMES_LOCAL_STREAM_STALE_TIMEOUT).
+      - HERMES_STREAM_READ_TIMEOUT=1800
+      - HERMES_LOCAL_STREAM_STALE_TIMEOUT=1800

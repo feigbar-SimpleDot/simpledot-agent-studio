@@ -1,0 +1,121 @@
+# Simple-Agents-Studio - main agent compose (parameterized, used by deploy/install.sh)
+# Usage (from repo root): docker compose --project-directory . -f deploy/main.compose.yaml up -d
+# Variables come from repo root .env. Three-process model: gateway (foreground) + reaper + console, see main_entry.sh.
+
+# 2026-10-01: Explicit name: hermes-agents (compose project), to avoid install.sh (cwd=repo root, default
+# project=dir name) clashing with manual runs from main/ subdir (project=main) and producing
+# "container name /hermes_main is already in use". Docker container_name is globally unique,
+# cross-project same-name also conflicts.
+name: hermes-agents
+
+services:
+  # 2026-10-22 issue #82: the service name doubles as the container's DNS alias
+  # on the shared network. It must be UNIQUE — a shared alias ("hermes")
+  # resolves inside every container's own netns, so a cross-container call to
+  # it silently reaches the wrong service. Keep it equal to container_name.
+  hermes_main:
+    image: ${HERMES_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/nousresearch/hermes-agent:v2026.9.24}
+    container_name: ${MAIN_CONTAINER_NAME:-hermes_main}
+    # The service name above is what compose registers as the network alias, so
+    # it must stay unique (never the shared "hermes"). hostname pins the
+    # in-container DNS name to the same value so a container addressing itself
+    # by its own alias always lands on itself.
+    hostname: ${MAIN_CONTAINER_NAME:-hermes_main}
+    restart: unless-stopped
+    command: ["/opt/mwroot/deploy/main_entry.sh"]   # m1-impl macOS: entry arrives via the ./deploy DIRECTORY mount below (Apple container bind sources must be directories, never single files)
+    ports:
+      - "${GW_PORT:-8642}:8642"        # gateway (API server)
+      - "${CONSOLE_PORT:-8700}:8700"   # Web console
+      - "${HERMES_WEBUI_PORT:-8787}:${HERMES_WEBUI_PORT:-8787}"   # hermes-webui (optional, idle port harm-free when disabled)
+    volumes:
+      # 2026-10-22 issue #82: /opt/data is a NAMED VOLUME, not the ./data/main bind.
+      # Root cause: on a virtiofs host mount (lima/Colima on macOS) a socket inode
+      # the guest has already looked up can become unreachable — stat/unlink then
+      # fail with E95 (Operation not supported) *inside the container* while the host
+      # still sees a perfectly normal socket. The gateway startup path is:
+      #   if bind_path.exists():   -> False (Python swallows the E95 OSError)
+      #   bind_path.unlink()       -> skipped, because exists() said "no"
+      #   start_unix_server(...)   -> bind on the stale inode -> E95 -> gateway dies
+      # so every restart inherits the poison and the container loops forever.
+      # A Docker named volume lives on the VM's ext4 disk and has none of these
+      # semantics — identical to the worker volumes, which never reproduced E95.
+      # deploy/install.sh seeds the volume from ./data/main on first deploy.
+      - main_hermes_main:/opt/data               # main HERMES_HOME (kanban.db/config; skills sub-mounted below override these in-container paths; SOUL.md published as a symlink by main_entry.sh)
+      - ./data/share_workspace:/share_workspace  # main<->worker shared volume
+      - ./mw:/opt/mwroot/mw                     # middleware + console code (direct repo mount, no copy)
+      - ./deploy:/opt/mwroot/deploy:ro          # m1-impl macOS: entry + lib/i18n.sh + .runtime-* staging all arrive as ONE directory mount (supersedes the old single-file entry mount)
+      - ./data/mw_data:/mw_data                 # middleware ledger + registry
+      # ── m1-impl macOS 目录挂载 (2026-10-18): all bind sources are DIRECTORIES ──
+      # Root cause: Apple `container` bind parser hard-requires a directory source
+      # (Parser.swift `guard isDirectory`); its docker shim passes through without
+      # converting, so the s4d-fix2 FILE-level :ro mounts only ever worked on docker.
+      # New topology (identical semantics on both engines):
+      #   install.sh regenerates host-owned staging dirs (gitignored, rebuilt from
+      #   deploy/skills/<sk>/SKILL.<LANG>.md + docs/main-soul.<LANG>.md per active
+      #   LANG — no compose-side sentinel sed anymore), and each skill gets a
+      #   DIRECTORY :ro mount onto the same in-container path as before, so verify.sh
+      #   fingerprints and the agent's path expectations are unchanged.
+      # Host-owned source dirs = the BUG-53-A ownership trap stays eradicated
+      # (container never writes here; :ro).
+      - ./deploy/.runtime-skills/mw-task-dispatch:/opt/data/skills/agent-matrix/mw-task-dispatch:ro
+      - ./deploy/.runtime-skills/team-work-chain-advance:/opt/data/skills/agent-matrix/team-work-chain-advance:ro
+      - ./deploy/.runtime-skills/team-work-chain-orchestration:/opt/data/skills/agent-matrix/team-work-chain-orchestration:ro
+      - ./deploy/.runtime-skills/worker-message-relay:/opt/data/skills/agent-matrix/worker-message-relay:ro
+      # SOUL: directory mount at /opt/soul-src; main_entry.sh publishes it at the
+      # canonical /opt/data/SOUL.md via idempotent `ln -sfn` (a directory cannot be
+      # mounted directly onto /opt/data/SOUL.md, and mounting ./deploy/.runtime-soul
+      # over /opt/data would shadow kanban.db).
+      - ./deploy/.runtime-soul:/opt/soul-src:ro
+      - ${HERMES_WEBUI_DIR:-./data/webui_disabled}:/webui   # hermes-webui project (optional; mounts empty dir when unset, entry skips when no start.sh)
+      - ${PIXEL_OFFICE_DIR:-./data/pixel_office_disabled}:/pixel-office:ro   # pixel-agents compiled bundle (optional; read-only mount, runtime writes to container ~/.pixel-agents)
+    networks:
+      # 2026-10-22 issue #82: main joins the shared worker network so main<->worker
+      # API calls use container-internal addresses instead of host published ports.
+      # Published ports go through docker-proxy inside the VM, which drops
+      # connections under memory pressure — the symptom that made most workers
+      # show as "offline" in the web console even though their containers were up.
+      simple-dot:
+        aliases:
+          # Explicit and unique. The service name is already the alias, but
+          # spelling it out keeps the "one unique alias per service" rule
+          # visible at the point where it can be broken.
+          - hermes_main
+    environment:
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${API_SERVER_KEY}
+      - API_SERVER_CORS_ORIGINS=*
+      # main is also an executor: enable YOLO to skip tirith false-positives on normal ops commands
+      # (curl|python3 -m json.tool marked [HIGH] Pipe to interpreter).
+      # hardline bottom line (rm -rf / etc.) and approvals.deny still cannot be bypassed.
+      - HERMES_YOLO_MODE=1
+      - PYTHONPATH=/opt/mwroot
+      - MW_HOME=/mw_data
+      - MW_REGISTRY=/mw_data/registry.json        # in-volume ledger copy (install.sh seeds, container writable)
+      - MW_TASK_DIR_BASE=/share_workspace/tasks
+      - MW_ALLOWED_WS_PREFIX=/share_workspace
+      - MW_HERMES_HOME=/opt/data                 # ★ unify main kanban, prevent dual-db split
+      - MW_KANBAN_DB=/opt/data/kanban.db
+      - HERMES_WEBUI_HOST=0.0.0.0                # webui binds all interfaces (inside container)
+      - HERMES_WEBUI_PORT=${HERMES_WEBUI_PORT:-8787}
+      - HERMES_WEBUI_PASSWORD=${HERMES_WEBUI_PASSWORD:-}
+      - PIXEL_OFFICE_ENABLED=${PIXEL_OFFICE_ENABLED:-0}   # pixel office switch (entry conditionally launches by this)
+      # 2026-09-30: long-task LLM timeout raised to 30min, to avoid 70s default firing
+      # 'Operation interrupted: waiting for model response' killing in-flight
+      # long-context main agent turns. litellm docs confirm these two variables control
+      # stream read wait timeout (HERMES_STREAM_READ_TIMEOUT) and local stale detection
+      # (HERMES_LOCAL_STREAM_STALE_TIMEOUT).
+      - HERMES_STREAM_READ_TIMEOUT=1800
+      - HERMES_LOCAL_STREAM_STALE_TIMEOUT=1800
+
+# 2026-10-22 issue #82: the shared worker network. Created by deploy/install.sh
+# (docker network create simple-dot) before compose up — declared external here so
+# compose never tries to own its lifecycle.
+networks:
+  simple-dot:
+    external: true
+
+# 2026-10-22 issue #82: main's HERMES_HOME on ext4 (VM disk) instead of a virtiofs
+# bind mount — see the comment on the /opt/data volume above.
+volumes:
+  main_hermes_main:

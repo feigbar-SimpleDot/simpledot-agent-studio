@@ -1,0 +1,54 @@
+<!doctype html>
+<!-- [en] i18n v1.0 — ship English default lang/title; the runtime <html lang>
+     is updated to en|zh-CN by applyHtmlLang() after i18n boots.
+     Brand lockup stays bilingual in both locales (brand ≠ copy, ID §6.2). -->
+<!-- [zh-cn] i18n v1.0:静态 lang="en" 英文 title;运行时由 applyHtmlLang() 改
+     en|zh-CN。品牌 lockup 双语保留(品牌≠文案,交互设计 §6.2)。 -->
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SimpleDot Agent Studio</title>
+    <!-- 品牌静态 LOGO favicon (UIUX-DESIGN §2.4, 单文件部署故以 data URI 内联) -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230B1220'/%3E%3Ccircle cx='16' cy='16' r='10.8' fill='none' stroke='%238A93A0' stroke-width='2.7'/%3E%3Ccircle cx='7.8' cy='7.8' r='2.7' fill='%231E90FF'/%3E%3Ccircle cx='8.0' cy='24.0' r='2.4' fill='%231E90FF'/%3E%3Ccircle cx='20.0' cy='20.0' r='3.6' fill='%232196F3'/%3E%3C/svg%3E" />
+    <style>
+      /* LangUI 双色体系: slate + blue。暗色为默认。
+         语义 token 用 CSS 变量, Tailwind 通过 rgb(var() / alpha) 引用。 */
+      :root, .dark {
+        --c-canvas: 2 6 23;     /* slate-950 */
+        --c-panel: 15 23 42;    /* slate-900 */
+        --c-panel2: 30 41 59;   /* slate-800 */
+        --c-line: 51 65 85;     /* slate-700 */
+        --c-ink: 226 232 240;  /* slate-200 */
+        --c-dim: 148 163 184;  /* slate-400 */
+        --c-accent: 59 130 246; /* blue-500 */
+        --c-ok: 34 197 94;      /* green-500 */
+        --c-warn: 234 179 8;    /* yellow-500 */
+        --c-bad: 239 68 68;    /* red-500 */
+        /* 品牌色 token (仅 LOGO/favicon/品牌强调位, 不参与交互控件) */
+        --brand-ring-dark: #8A93A0;
+        --brand-dot-dark: #4DABF7;
+      }
+      .light {
+        --c-canvas: 248 250 252; /* slate-50 */
+        --c-panel: 255 255 255;
+        --c-panel2: 241 245 249; /* slate-100 */
+        --c-line: 203 213 225;   /* slate-300 */
+        --c-ink: 15 23 42;       /* slate-900 */
+        --c-dim: 100 116 139;   /* slate-500 */
+        --c-accent: 37 99 235;   /* blue-600 */
+        --c-ok: 22 163 74;
+        --c-warn: 202 138 4;
+        --c-bad: 220 38 38;
+        /* 品牌色 token (亮色主题) */
+        --brand-ring: #343A40;
+        --brand-dot: #1878D8;
+      }
+      html, body { background: rgb(var(--c-canvas)); color: rgb(var(--c-ink)); }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

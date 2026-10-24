@@ -1,0 +1,419 @@
+/* Visual tokens + utility classes used by all views.
+   CSS class names and values (px, %, var(...)) are NOT localised;
+   the file follows interaction-design §5.4 (UI strings live in JSX),
+   so the only Chinese here is module section markers (kept) + bilingual
+   sibling comments where helpful. */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { border-color: rgb(var(--c-line) / 0.6); }
+  ::selection { background: rgb(var(--c-accent) / 0.35); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--c-line));
+    border-radius: 8px;
+    border: 2px solid rgb(var(--c-canvas));
+  }
+  ::-webkit-scrollbar-thumb:hover { background: rgb(var(--c-dim) / 0.6); }
+}
+
+@layer components {
+  /* ── 按钮体系 (LangUI: rounded-lg + 明确层级) ── */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2
+           text-sm font-medium transition-all duration-150 cursor-pointer
+           select-none whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:brightness-110 active:brightness-95
+           shadow-[0_1px_0_0_rgb(255_255_255/0.1)_inset];
+  }
+  .btn-ghost {
+    @apply btn bg-panel2 text-ink border border-line hover:border-accent/60 hover:text-accent;
+  }
+  .btn-quiet {
+    @apply btn bg-transparent text-dim hover:bg-panel2 hover:text-ink;
+  }
+  .btn-danger {
+    @apply btn bg-transparent text-bad border border-bad/40 hover:bg-bad/10 hover:border-bad;
+  }
+  .btn-sm { @apply px-2.5 py-1 text-xs rounded-md gap-1.5; }
+
+  /* ── 卡片 / 面板 ── */
+  .card {
+    @apply bg-panel border border-line rounded-2xl;
+  }
+  .card-pad { @apply card p-5; }
+
+  /* ── 输入 ── */
+  .input {
+    @apply w-full rounded-lg bg-canvas border border-line px-3 py-2 text-sm text-ink
+           placeholder:text-dim/60 transition-colors
+           focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/25;
+  }
+  .label { @apply block text-xs font-semibold text-ink mb-1.5; }
+  .hint  { @apply text-[11.5px] text-dim mt-1 leading-relaxed; }
+
+  /* ── 标签 / 徽章 (LangUI badge: 圆角胶囊 + 半透明底) ── */
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5
+           text-[11px] font-semibold leading-5 whitespace-nowrap;
+  }
+  .badge-blue   { @apply badge bg-accent/15 text-accent ring-1 ring-inset ring-accent/30; }
+  .badge-green  { @apply badge bg-ok/15 text-ok ring-1 ring-inset ring-ok/30; }
+  .badge-yellow { @apply badge bg-warn/15 text-warn ring-1 ring-inset ring-warn/30; }
+  .badge-red    { @apply badge bg-bad/15 text-bad ring-1 ring-inset ring-bad/30; }
+  .badge-slate  { @apply badge bg-panel2 text-dim ring-1 ring-inset ring-line; }
+  /* F5 (2026-10-13, issue #5 状态机统一): 新增 handoff / waiting 两态徽章 —
+     紫 = 交接中(run 推进间隙), 琥珀 = 等介入(reaper 判定闲置)。 与
+     主色 accent 视觉区分, 但保持 badge 体系圆角胶囊一致。 */
+  .badge-purple { @apply badge bg-warn/10 text-warn ring-1 ring-inset ring-warn/25; }
+  .badge-amber  { @apply badge bg-warn/15 text-warn ring-1 ring-inset ring-warn/35; }
+  /* 派生态专属: 整行着底色, 让 UI 看「这是交接中」/「等介入」一眼区分 */
+  .data-state-handoff  { background: linear-gradient(90deg, rgb(var(--c-warn)/0.08) 0%, transparent 100%); }
+  .data-state-waiting  { background: linear-gradient(90deg, rgb(var(--c-warn)/0.12) 0%, transparent 100%); }
+
+  /* ── 表格 ── */
+  .tbl { @apply w-full border-collapse text-sm; }
+  .tbl thead th {
+    @apply text-left text-[11px] font-semibold uppercase tracking-wider text-dim
+           px-4 py-3 border-b border-line bg-panel2/40 whitespace-nowrap;
+  }
+  .tbl tbody td { @apply px-4 py-3 border-b border-line/50 align-middle; }
+  .tbl tbody tr { @apply transition-colors hover:bg-panel2/30; }
+
+  /* ── 状态圆点 ── */
+  .dot { @apply inline-block w-2 h-2 rounded-full; }
+  .dot-ok { @apply dot bg-ok shadow-[0_0_8px_rgb(var(--c-ok)/0.7)]; }
+  .dot-bad { @apply dot bg-bad shadow-[0_0_8px_rgb(var(--c-bad)/0.7)]; }
+  /* issue #75 §3: 顶栏三态之 unknown — 心跳未回/不可达前置灰 (NFR-4) */
+  .dot-dim { @apply dot bg-dim/40; }
+  .dot-warn { @apply dot bg-warn shadow-[0_0_8px_rgb(var(--c-warn)/0.7)]; }
+  .dot-idle { @apply dot bg-dim/50; }
+
+  /* ── 代码 / 等宽 ── */
+  .mono { @apply font-mono text-[12.5px]; }
+  .code-block {
+    @apply mono bg-canvas border border-line rounded-xl p-4 overflow-auto
+           whitespace-pre-wrap break-all leading-relaxed;
+  }
+
+  /* ── 空状态 ── */
+  .empty {
+    @apply flex flex-col items-center justify-center gap-3 py-16 text-dim text-sm;
+  }
+
+  /* ── 骨架屏加载 ── */
+  .skeleton {
+    @apply animate-pulse rounded-lg bg-panel2/60;
+  }
+
+  /* ── Markdown 渲染 (对话气泡内) ── */
+  .md-body > *:first-child { margin-top: 0; }
+  .md-body > *:last-child { margin-bottom: 0; }
+  .md-body p { @apply my-2 leading-relaxed; }
+  .md-body h1, .md-body h2, .md-body h3, .md-body h4 {
+    @apply font-bold mt-4 mb-2 text-ink;
+  }
+  .md-body h1 { @apply text-[16px]; }
+  .md-body h2 { @apply text-[15px]; }
+  .md-body h3 { @apply text-[14px]; }
+  .md-body ul { @apply list-disc pl-5 my-2 space-y-1; }
+  .md-body ol { @apply list-decimal pl-5 my-2 space-y-1; }
+  .md-body code {
+    @apply font-mono text-[12px] bg-canvas border border-line rounded px-1.5 py-0.5;
+  }
+  .md-body pre {
+    @apply bg-canvas border border-line rounded-xl p-3.5 overflow-auto my-2;
+  }
+  .md-body pre code { @apply bg-transparent border-0 p-0 text-[12px]; }
+  .md-body blockquote {
+    @apply border-l-2 border-accent/50 pl-3 my-2 text-dim italic;
+  }
+  .md-body a { @apply text-accent underline underline-offset-2 hover:opacity-80; }
+  .md-body table { @apply w-full border-collapse my-2 text-[12.5px]; }
+  .md-body th, .md-body td { @apply border border-line px-2.5 py-1.5 text-left; }
+  .md-body th { @apply bg-panel2 font-semibold; }
+  .md-body hr { @apply border-line my-3; }
+}
+
+/* ── 处理中状态条 (聊天窗口动态反馈) ── */
+@keyframes sas-dot-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: .4; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+.sas-typing-dot {
+  width: 5px; height: 5px; border-radius: 9999px;
+  background: rgb(var(--c-accent));
+  display: inline-block;
+  animation: sas-dot-bounce 1.2s infinite ease-in-out;
+}
+.sas-typing-dot:nth-child(2) { animation-delay: .15s; }
+.sas-typing-dot:nth-child(3) { animation-delay: .3s; }
+
+@keyframes sas-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.sas-status-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; margin: 2px 0;
+  border-radius: 12px;
+  border: 1px solid rgb(var(--c-line) / .8);
+  background: linear-gradient(90deg,
+    rgb(var(--c-panel) / .6) 0%,
+    rgb(var(--c-accent) / .10) 50%,
+    rgb(var(--c-panel) / .6) 100%);
+  background-size: 200% 100%;
+  animation: sas-shimmer 2.2s linear infinite;
+  font-size: 12px; color: rgb(var(--c-dim));
+}
+.sas-status-bar .spin {
+  width: 12px; height: 12px; border-radius: 9999px;
+  border: 2px solid rgb(var(--c-accent) / .25);
+  border-top-color: rgb(var(--c-accent));
+  animation: sas-rot .8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes sas-rot { to { transform: rotate(360deg); } }
+.sas-status-bar .elapsed {
+  margin-left: auto; font-variant-numeric: tabular-nums;
+  font-size: 11px; color: rgb(var(--c-dim) / .7);
+}
+
+/* ── 任务看板移动适配 (UIUX-DESIGN §3.8): 触控目标 ≥44px, 防横向溢出 ── */
+@media (max-width: 767px) {
+  .board-touch button { min-height: 44px; }
+  .board-touch input[type="checkbox"] { width: 18px; height: 18px; }
+  .board-touch label { min-height: 44px; }
+  /* 长不可断 token (编号/路径) 兜底换行, 防撑破 375px 视口 */
+  .board-touch code { overflow-wrap: anywhere; }
+}
+
+/* ── Worker 卡片墙 (WCARD-DESIGN §1-§3) ─────────────────────────── */
+/* 卡片 hover 仅描边提亮, 不做位移/阴影 (克制, 避免移动端 sticky hover) */
+.wcard { transition: border-color 150ms ease; }
+.wcard:hover { border-color: rgb(var(--c-accent) / 0.45); }
+
+/* 头像按钮: 56px 圆形, 上传入口 + hover 遮罩 (DESIGN §2.1/§2.3) */
+.wcard-avatar {
+  position: relative;
+  width: 56px; height: 56px;
+  border-radius: 9999px;
+  overflow: hidden;
+  cursor: pointer;
+  flex-shrink: 0;
+  border: none; padding: 0;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px rgb(var(--c-line));
+}
+.wcard-avatar img {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+}
+/* 默认占位符: 品牌蓝底 + 名称首字符, 双主题各取同源 token (DESIGN §2.2) */
+.wcard-avatar-ph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%; height: 100%;
+  font-weight: 700;
+  font-size: 23px;                 /* 头像边长 × 0.42 */
+  line-height: 1;
+  background: var(--brand-dot, #1878D8);
+  color: #ffffff;
+}
+.dark .wcard-avatar-ph {
+  background: var(--brand-dot-dark, #4DABF7);
+  color: #020617;
+}
+/* hover 遮罩: 半透明 + 更换文案, 150ms 淡入 */
+.wcard-avatar-mask {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgb(2 6 23 / 0.55);
+  color: #fff;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  pointer-events: none;
+}
+@media (hover: hover) {
+  .wcard-avatar:hover .wcard-avatar-mask { opacity: 1; }
+}
+/* 上传中 spinner (与 sas-status-bar .spin 同款) */
+.wcard-spin {
+  position: absolute; inset: 0; margin: auto;
+  width: 18px; height: 18px; border-radius: 9999px;
+  border: 2px solid rgb(var(--c-accent) / 0.25);
+  border-top-color: rgb(var(--c-accent));
+  animation: sas-rot 0.8s linear infinite;
+}
+
+/* ── 状态图形 (DESIGN §3.2, 12px 图形区, 纯 CSS 零图片) ── */
+.wcard-gfx {
+  position: relative;
+  display: inline-block;
+  width: 12px; height: 12px;
+  flex-shrink: 0;
+}
+/* working: 实心点 + 外扩脉冲环 (scale 0.6→1.6 淡出, 1.6s 无限) */
+.wcard-gfx-working::before {
+  content: ""; position: absolute; inset: 3px;
+  border-radius: 9999px; background: rgb(var(--c-accent));
+}
+.wcard-gfx-working::after {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 9999px;
+  border: 1.5px solid rgb(var(--c-accent) / 0.8);
+  animation: wcard-pulse 1.6s ease-out infinite;
+}
+@keyframes wcard-pulse {
+  0%   { transform: scale(0.6); opacity: 0.9; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+/* idle: 实心点 + 固定细外环 (静态) */
+.wcard-gfx-idle::before {
+  content: ""; position: absolute; inset: 3px;
+  border-radius: 9999px; background: rgb(var(--c-ok));
+}
+.wcard-gfx-idle::after {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 9999px;
+  border: 1px solid rgb(var(--c-ok) / 0.6);
+}
+/* offline: 空心灰圆 + 45° 斜线 ("不可用"通用符号) */
+.wcard-gfx-offline::before {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 9999px;
+  border: 1.5px solid rgb(var(--c-dim) / 0.7);
+}
+.wcard-gfx-offline::after {
+  content: ""; position: absolute; left: 50%; top: 1px; bottom: 1px;
+  width: 1.5px;
+  background: rgb(var(--c-dim) / 0.7);
+  transform: translateX(-50%) rotate(45deg);
+}
+/* unknown: 虚线圆 (信息不足, 绝不假在线) */
+.wcard-gfx-unknown {
+  border: 1.5px dashed rgb(var(--c-dim) / 0.6);
+  border-radius: 9999px;
+}
+/* unknown 徽章: 虚线边中性底 (DESIGN §3.2) */
+.badge-unknown {
+  @apply badge bg-transparent text-dim border border-dashed border-line;
+}
+
+/* 页面隐藏时暂停脉冲动效 (AC-09, 动效全 CSS, JS 只改一个类) */
+.anim-stopped .wcard-gfx-working::after { animation-play-state: paused; }
+.anim-stopped .wcard-spin { animation-play-state: paused; }
+
+/* 移动触控目标 (DESIGN §1.3) */
+@media (max-width: 767px) {
+  .wcard-touch button { min-height: 40px; }
+  .wcard-touch .wcard-avatar { min-width: 48px; width: 48px; height: 48px; }
+  .wcard-touch .wcard-avatar-ph { font-size: 20px; }
+}
+
+/* ── CONSOLE2 全局新增 (CONSOLE2-DESIGN §0.1) ─────────────────────── */
+
+/* ① 技术详情折叠区: 沿用看板已验收样式, 提为通用类 (§0.1-①) */
+.tech-details { @apply text-[11.5px] text-dim; }
+.tech-details summary { @apply cursor-pointer select-none hover:text-ink transition-colors; }
+
+/* ② 输入错误态 (设置页/工作流页共用, §0.1-②) */
+.input-err { @apply border-bad focus:border-bad focus:ring-2 focus:ring-bad/25; }
+.field-err { @apply text-[11.5px] text-bad mt-1; }
+
+/* ③ 设置开关行: 整行可点, 触控达标 (§0.1-③) */
+.switch-row { @apply flex items-center justify-between gap-3 min-h-[44px]
+               cursor-pointer select-none py-1; }
+.switch-row input[type="checkbox"] {
+  @apply w-[18px] h-[18px] shrink-0 accent-[rgb(var(--c-accent))];
+}
+
+/* ④ 四页触控容器: <768px 统一抬升触控目标 (§0.1-④) */
+@media (max-width: 767px) {
+  .chat-touch button, .set-touch button, .wf-touch button, .pof-touch button
+    { min-height: 40px; }
+  .chat-touch select, .set-touch select, .wf-touch select { min-height: 40px; }
+  .chat-touch input, .set-touch input, .wf-touch input { min-height: 40px; }
+  .chat-touch code, .wf-touch code, .pof-touch code { overflow-wrap: anywhere; }
+  .chat-touch details summary, .wf-touch details summary { min-height: 40px; }
+  .wf-touch .tbl tbody td { padding-top: 10px; padding-bottom: 10px; }
+}
+
+/* ⑤ 工作流画布主题变量: 替代硬编码深色画布 (§0.1-⑤ / §3.5) */
+:root, .dark {
+  --wf-canvas: #0b0f1a;        /* 深底 (近 canvas 但保留画布感) */
+  --wf-dot: #3f3f46;           /* 点阵 */
+  --wf-vignette: rgba(2, 6, 23, 0.9);
+  --wf-edge: #a1a1aa;          /* 顺序连线 */
+  --wf-loop: #f59e0b;          /* 回流连线 */
+  --wf-node: #18181b;          /* 节点底 */
+  --wf-node-ink: #e4e4e7;      /* 节点主文字 */
+  --wf-node-dim: #a1a1aa;      /* 节点次文字 */
+  /* split_policy 标题栏/徽章双主题 (§3.5 表) */
+  --wf-pol-allow-bar: linear-gradient(135deg, #334155, #475569);
+  --wf-pol-allow-ink: #f1f5f9;
+  --wf-pol-allow-chip: rgba(51, 65, 85, 0.7);
+  --wf-pol-allow-chip-ink: #e2e8f0;
+  --wf-pol-prefer-bar: linear-gradient(135deg, #1d4ed8, #2563eb);
+  --wf-pol-prefer-ink: #eff6ff;
+  --wf-pol-prefer-chip: rgba(29, 78, 216, 0.7);
+  --wf-pol-prefer-chip-ink: #dbeafe;
+  --wf-pol-must-bar: linear-gradient(135deg, #9a3412, #c2410c);
+  --wf-pol-must-ink: #fff7ed;
+  --wf-pol-must-chip: rgba(154, 52, 18, 0.7);
+  --wf-pol-must-chip-ink: #ffedd5;
+  --wf-badge-loop-bg: rgba(120, 53, 15, 0.5);
+  --wf-badge-loop-ink: #fcd34d;
+}
+.light {
+  --wf-canvas: #f8fafc;        /* slate-50 */
+  --wf-dot: #cbd5e1;           /* slate-300 (纯装饰纹理, WCAG 非文本豁免) */
+  --wf-vignette: rgba(248, 250, 252, 0);
+  --wf-edge: #475569;          /* slate-600, 对 canvas 6.9:1 */
+  --wf-loop: #b45309;          /* amber-700, 对 canvas 4.8:1 */
+  --wf-node: #ffffff;
+  --wf-node-ink: #0f172a;
+  --wf-node-dim: #475569;      /* 对 node 底 7.6:1 */
+  --wf-pol-allow-bar: #e2e8f0;
+  --wf-pol-allow-ink: #334155;
+  --wf-pol-allow-chip: #e2e8f0;
+  --wf-pol-allow-chip-ink: #334155;
+  --wf-pol-prefer-bar: #1d4ed8;
+  --wf-pol-prefer-ink: #ffffff;
+  --wf-pol-prefer-chip: #dbeafe;
+  --wf-pol-prefer-chip-ink: #1e40af;
+  --wf-pol-must-bar: #c2410c;
+  --wf-pol-must-ink: #ffffff;
+  --wf-pol-must-chip: #ffedd5;
+  --wf-pol-must-chip-ink: #9a3412;
+  --wf-badge-loop-bg: #fef3c7;
+  --wf-badge-loop-ink: #78350f;
+}
+
+/* 聊天状态条动效纳入暂停范围 (§4.8) */
+.anim-stopped .sas-status-bar { animation-play-state: paused; }
+.anim-stopped .sas-typing-dot { animation-play-state: paused; }
+
+/* 「在此处插入」按钮触屏常显 (§3.3: hover:none 下无法悬停显现, 改为常显) */
+@media (hover: none) {
+  .wf-insert { opacity: 1; }
+}
+
+/* 全局通用 spinner (CONSOLE2 §2.3 保存中态; 与 sas-status-bar .spin 同款) */
+.spin {
+  display: inline-block;
+  width: 12px; height: 12px; border-radius: 9999px;
+  border: 2px solid rgb(var(--c-accent) / .25);
+  border-top-color: rgb(var(--c-accent));
+  animation: sas-rot .8s linear infinite;
+  flex-shrink: 0;
+}
+.anim-stopped .spin { animation-play-state: paused; }

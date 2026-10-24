@@ -1,0 +1,189 @@
+workflows:
+  dev-workflow:
+    name: 标准开发流程 (含测试 loop)
+    # i18n (架构 §11.4, 2026-10-14): name_en / description_en 是「附加展示字段」,
+    # id / name 仍是匹配键(id 与前端 launch payload 按 name 字符串走, 协议不变)。
+    # 前端 WorkflowsView 按 i18n.language 选择 (name_en || name) 渲染;
+    # 后端 api_workflows 透传字段, 不做 fallback 复制 — 旧 YAML 缺 name_en 时
+    # 仍可用 zh-cn, 由前端兜底。
+    name_en: Standard dev flow (with test loop)
+    description: 需求-设计-实现-测试; 测试失败回流到设计/实现, 至少通过 3 次才算完成; 审查强制换 worker
+    description_en: Requirements → design → implement → test; test failures loop back to design/implement; code-review forces worker rotation.
+    # optional 字段语义 (2026-10-06): main / 产品经理可决策跳过标记为 optional
+    # 的步骤。跳过路径有两条,二选一 (或组合):
+    #   1. launch payload steps[].include=false → mw 物理不建卡 (零开销)
+    #   2. launch payload steps[].include=true + 在 TODO.md 写 - 跳过: 是 [原因]
+    #      → worker 起手立即 completed (留痕)
+    # 决策权在 main, mw 不评价。optional 字段只是告诉 main 哪些步骤可裁。
+    steps:
+    - id: req-analysis
+      name: 需求分析
+      name_en: Requirements analysis
+      description: 梳理需求, 明确范围、约束与验收标准, 产出可执行的需求清单。
+      description_en: Elicit requirements; nail down scope, constraints, acceptance criteria; ship an actionable requirements list.
+      default_assignee: coder
+      required_role_tags:
+      - analysis
+      input:
+      - 用户原始需求 (initial_task)
+      output:
+      - docs/requirements.md
+      # 需求永远不能跳 — 任何任务都要先有可验收的需求定义
+      optional: false
+    - id: design
+      name: 架构设计
+      name_en: Architecture design
+      description: 基于需求出技术方案, 定模块边界、接口与数据流, 供实现与测试对齐。
+      description_en: Produce a technical plan from the requirements; lock module boundaries, interfaces, and data flow for implementation and test alignment.
+      default_assignee: system_engineer
+      required_role_tags:
+      - arch
+      - design
+      input:
+      - docs/design.md
+      output:
+      - docs/design.md
+      depends_on:
+      - req-analysis
+      # 纯 hotfix / 改一行 bugfix 可跳 — 产品经理决策
+      optional: true
+      # 推荐跳过的任务类型(给 main 的提示)
+      skip_when:
+      - hotfix
+      - typo
+      - config_change
+    - id: implementation
+      name: 代码实现
+      name_en: Implementation
+      description: 按设计编码实现, 自测通过, 保持改动聚焦于本步范围。
+      description_en: Implement per design; pass self-tests; keep the diff scoped to this step.
+      default_assignee: coder
+      required_role_tags:
+      - code-write
+      input:
+      - docs/design.md
+      output:
+      - 源代码变更
+      - docs/CHANGELOG.md
+      depends_on:
+      - design
+      # 实现不能跳 — 不实现就没有交付物
+      optional: false
+    - id: testing
+      name: 测试验证
+      name_en: Testing
+      description: 编写并执行测试, 覆盖验收标准; 失败回流到设计/实现, 通过阈值后才放行。
+      description_en: Write and execute tests covering the acceptance criteria; failures loop back to design/implement until the pass threshold is met.
+      default_assignee: tester
+      required_role_tags:
+      - test
+      split_policy: prefer_split
+      input:
+      - docs/requirements.md
+      - docs/design.md
+      output:
+      - docs/test-report.md
+      loops:
+      - design
+      - implementation
+      # pass_threshold 已废弃 (2026-10-08 边界减法): mw 不再按通过次数门控结算。
+      # 「测试要跑 3 次」这类重复由 main 建 3 张测试卡实现 (每张跑一轮,
+      # main 读报告决定是否继续), 不由中间件自启 loop。
+      depends_on:
+      - implementation
+      # 测试可跳 — 仅当变更微不足道 (typo / 注释) 时
+      optional: true
+      skip_when:
+      - typo
+      - doc_only
+      - comment_only
+    - id: code-review
+      name: 代码审查
+      name_en: Code review
+      description: 审查代码质量、安全与可维护性, 打回则建修复卡回流。
+      description_en: Review code quality, security, and maintainability; bounce-backs spawn fix cards that loop back into the chain.
+      default_assignee: code-reviewer
+      required_role_tags:
+      - review
+      split_policy: must_split
+      input:
+      - 源代码变更
+      - docs/design.md
+      output:
+      - docs/review-notes.md
+      depends_on:
+      - testing
+      # 审查不能跳 — 安全相关 (即使是后端纯后台任务也要至少一人看过)
+      optional: false
+  bugfix-cycle:
+    name: Bug 修复
+    name_en: Bug fix
+    description: 单步 bug 修复,粒度最小
+    description_en: Single-step bug fix; minimum granularity.
+    steps:
+    - id: fix
+      name: 修复 bug
+      name_en: Fix bug
+      description: 定位并修复 bug, 附复现与回归说明, 改动最小化。
+      description_en: Locate and fix the bug; attach repro and regression notes; minimise the diff.
+      default_assignee: coder
+      required_role_tags:
+      - code-write
+      - debug
+      input:
+      - bug 报告 / 复现步骤
+      output:
+      - 代码修复
+      - FIX_NOTES.md
+      # bugfix 自身是单步;但纯后端 bugfix 通常不需要前端 / UI 确认环节。
+      # main 在派发给具体角色时,根据任务类型决定是否带 UI 相关角色。
+      optional: false
+  refactor-cycle:
+    name: 重构
+    name_en: Refactor
+    description: 中等规模重构(分析→实施→回归)
+    description_en: Mid-size refactor (analyse → implement → regress).
+    steps:
+    - id: analysis
+      name: 影响范围分析
+      name_en: Impact analysis
+      description: 分析重构影响范围与风险, 产出重构计划与不变式清单。
+      description_en: Analyse the refactor's blast radius and risks; ship a refactor plan plus an invariants checklist.
+      default_assignee: coder
+      required_role_tags:
+      - analysis
+      - code-read
+      input:
+      - 重构目标描述
+      output:
+      - docs/refactor-plan.md
+    - id: refactor
+      name: 重构实施
+      name_en: Refactor implementation
+      description: 按计划实施重构, 保持外部行为不变。
+      description_en: Execute the refactor per plan; preserve external behaviour.
+      default_assignee: coder
+      required_role_tags:
+      - code-write
+      - refactor
+      input:
+      - docs/refactor-plan.md
+      output:
+      - 代码变更
+      depends_on:
+      - analysis
+    - id: verification
+      name: 回归验证
+      name_en: Regression verification
+      description: 回归验证重构后行为一致, 覆盖不变式清单。
+      description_en: Regression-verify post-refactor behaviour; cover the invariants checklist.
+      default_assignee: tester
+      required_role_tags:
+      - test
+      split_policy: prefer_split
+      input:
+      - docs/refactor-plan.md
+      output:
+      - docs/regression-report.md
+      depends_on:
+      - refactor

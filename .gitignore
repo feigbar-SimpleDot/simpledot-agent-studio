@@ -1,0 +1,42 @@
+# 密钥与本地配置
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时产物
+mw_data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/
+ui/node_modules/
+_workflows_cache.json
+
+# mw 运行时临时产物 (spawn marker / manifest dump)
+manifest_t_*.json
+spawn/
+
+# m1-impl (macOS 目录挂载): install.sh 每次全量重建的宿主暂存目录 (skills/SOUL 挂载源)
+deploy/.runtime-skills/
+deploy/.runtime-soul/
+
+# hermes 运行时 home (会话/缓存/锁/state.db 等, 非仓库内容)
+.hermes/
+
+# 协调方/任务流转产生的瞬态工作流状态文件
+.card_ids_*.txt
+
+# i18n 改造期间的临时翻译/转换工具产物(卡级一次性工具,任务完成后失效)
+parts/

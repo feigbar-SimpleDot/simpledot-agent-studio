@@ -22,6 +22,11 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"   # cd to the repo root
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)/lib"
 # shellcheck source=lib/i18n.sh
 . "${LIB_DIR}/i18n.sh"
+# issue #113 (2026-10-25): 跨平台 hash helper (hash_of md5/sha256)。
+# install.sh 的 UI stamp 需要算 index.html 的 md5 —— macOS 只有 `md5 -r`,
+# Linux 只有 `md5sum`, 走 hash_of 才能两平台都拿到同一个哈希值。
+# shellcheck source=lib/hash.sh
+. "${LIB_DIR}/hash.sh"
 
 say()  {
   # After loading i18n, say/fail take two args: <en> <zh-cn>; one arg stays backward compatible (say "xxx" = plain English).
@@ -112,27 +117,75 @@ fi
 # "mw-${MAIN_CONTAINER_NAME}_main_hermes_main", not the bare name. Section 7b
 # resolves the real name from the project name instead of hard-coding it, so
 # the two can never drift apart.
+#
+# issue #105 (2026-10-25): 判空必须由部署镜像内的 root helper 执行, 绝不能用
+# 宿主用户 ls。170 实案: 宿主 data/main 属主是容器 uid 10000 且 mode 0700
+# (历史部署遗留), 宿主用户 ls -A 撞 EACCES 输出为空 ⇒ 旧实现误报「empty」
+# 静默跳过播种 ⇒ recreate 后容器挂到缺 kanban.db 的卷, 看板「清零」(数据
+# 从未丢, 权威数据就在宿主 data/main/kanban.db)。root 在 helper 里不受
+# 0700 约束, 列目录结果才是真相。另外「卷有内容」≠「播种完整」: 有内容但
+# 缺关键文件 (kanban.db) 的卷现在走补种, 不再一刀切 keep。
 MAIN_VOLUME_KEY="main_hermes_main"
+# 播种/补种共用的 root helper 调用前缀: --entrypoint sh 绕开镜像自带的
+# s6-overlay ENTRYPOINT (不绕开的话 sh -c 根本不会执行, 播种静默空转),
+# --user 0:0 让 helper 以 root 身份读 0700 源目录并改属主。
+_seed_helper() {
+  docker run --rm --entrypoint sh --user 0:0 "$@"
+}
 _seed_main_volume() {
-  local vol="$1"
-  if [ ! -d "data/main" ] || [ -z "$(ls -A data/main 2>/dev/null)" ]; then
+  local vol="$1" key_files="kanban.db" kf missing=""
+  if [ ! -d "data/main" ]; then
+    say "data/main does not exist — nothing to seed into ${vol}" \
+        "data/main 不存在 — 无需向 ${vol} 播种"
+    return 0
+  fi
+  # 源侧判空 (issue #105): root helper 里 ls /src。宿主 ls 对 0700/uid-10000
+  # 目录不可信, 这就是本 issue 的根因, 不许退回宿主 ls 判空。
+  local src_listing
+  if ! src_listing=$(_seed_helper -v "${PWD}/data/main:/src:ro" "${HERMES_IMAGE}" \
+      -c 'ls -A /src 2>/dev/null'); then
+    fail "Could not list data/main through the deploy-image helper (is docker up?)" \
+         "无法通过部署镜像 helper 读取 data/main (docker 是否正常?)"
+  fi
+  if [ -z "${src_listing}" ]; then
     say "data/main is empty — nothing to seed into ${vol}" "data/main 为空 — 无需向 ${vol} 播种"
     return 0
   fi
   # Already seeded? A non-empty volume keeps its contents across redeploys.
   # The deploy image is used as the helper (not alpine): it is already cached
   # for this deploy, so seeding never needs a registry round-trip.
-  if [ -n "$(docker run --rm --entrypoint sh -v "${vol}:/seed" "${HERMES_IMAGE}" -c 'ls -A /seed 2>/dev/null' 2>/dev/null)" ]; then
-    say "Volume ${vol} already has content — keeping it (no re-seed)" \
-        "卷 ${vol} 已有内容 — 保留现状(不重复播种)"
+  if [ -n "$(_seed_helper -v "${vol}:/seed" "${HERMES_IMAGE}" -c 'ls -A /seed 2>/dev/null' 2>/dev/null)" ]; then
+    # issue #105 补种路径: 「有内容」但缺关键文件 (正是 170 事故的卷形态)
+    # 不再 keep 原样 —— 从源里单独补齐缺失项, 已有内容永不覆盖。
+    for kf in ${key_files}; do
+      printf '%s\n' "${src_listing}" | grep -Fqx -- "${kf}" || continue
+      _seed_helper -v "${vol}:/seed" "${HERMES_IMAGE}" \
+        -c "[ -e /seed/${kf} ]" >/dev/null 2>&1 || missing="${missing} ${kf}"
+    done
+    if [ -n "${missing}" ]; then
+      say "Volume ${vol} has content but misses:${missing} — topping up from data/main" \
+          "卷 ${vol} 已有内容但缺关键文件:${missing} — 从 data/main 补种"
+      # cp -a 逐个补齐 (逐个判断, 已存在的目标跳过); 补完同样对齐
+      # 10000:10000 并保证属主可写 (issue #105 附带观察: worker uid 必须能写)。
+      docker run --rm --entrypoint sh --user 0:0 -v "${vol}:/seed" -v "${PWD}/data/main:/src:ro" "${HERMES_IMAGE}" \
+        -c 'for f in '"${missing}"'; do [ -e "/seed/$f" ] || cp -a "/src/$f" "/seed/$f" || exit 1; done; chown -R 10000:10000 /seed && chmod -R u+rwX /seed' >/dev/null 2>&1 \
+        || fail "Could not top up${missing} into ${vol} from data/main" \
+                "无法把${missing} 补种进主卷 ${vol}"
+    else
+      say "Volume ${vol} already has content — keeping it (no re-seed)" \
+          "卷 ${vol} 已有内容 — 保留现状(不重复播种)"
+    fi
     return 0
   fi
   # NOTE: --entrypoint sh is mandatory. The hermes image ships an s6-overlay
   # ENTRYPOINT; without the override, `docker run <image> sh -c ...` starts
   # the whole service stack and NEVER runs the command — the seeding would
   # silently do nothing (and the volume would stay root-owned).
+  # issue #105: root helper 读得动 0700 源 (cp -a 由容器内 root 执行, 宿主
+  # 权限不可读不再是障碍); cp -a 保留树形后 chown 对齐 10000:10000,
+  # chmod u+rwX 兜底保证 worker uid (10000) 对播种产物可写。
   docker run --rm --entrypoint sh --user 0:0 -v "${vol}:/seed" -v "${PWD}/data/main:/src:ro" "${HERMES_IMAGE}" \
-    -c 'cp -a /src/. /seed/ && chown -R 10000:10000 /seed' >/dev/null 2>&1 \
+    -c 'cp -a /src/. /seed/ && chown -R 10000:10000 /seed && chmod -R u+rwX /seed' >/dev/null 2>&1 \
     || fail "Could not seed the main volume ${vol} from data/main" \
             "无法把 data/main 播种进主卷 ${vol}"
   say "Seeded volume ${vol} from data/main" "已把 data/main 播种进卷 ${vol}"
@@ -181,12 +234,10 @@ UI_DIST_HTML="ui/dist/index.html"
 _write_ui_stamp() {
   # $1 = 目标 ui_dist 目录 (stamp 写 <dir>/.stamp.json, md5/size 实测 <dir>/index.html)
   local _dir="$1" _md5="" _size=0
-  # BSD/macOS: md5 -r; Linux coreutils: md5sum。两平台都要能跑, 取先命中的。
-  if command -v md5 >/dev/null 2>&1; then
-    _md5=$(md5 -r "${_dir}/index.html" | awk '{print $1}')
-  elif command -v md5sum >/dev/null 2>&1; then
-    _md5=$(md5sum "${_dir}/index.html" | awk '{print $1}')
-  fi
+  # issue #113 (2026-10-25): md5 走 hash_of (跨平台封装) —— BSD/macOS 是
+  # `md5 -r`, Linux coreutils 是 `md5sum`, 两者输出形态一致
+  # ("<hash> <file>"), hash_of 统一取第一列。
+  _md5=$(hash_of md5 "${_dir}/index.html" 2>/dev/null || true)
   # 大小: BSD stat -f %z 先, GNU stat -c %s 次, wc -c 兜底 (tr 去 BSD wc 的前导空格)。
   # 探测必须走「捕获输出判成功」: set -e 下裸跑失败命令会直接终止脚本。
   if _sz=$(stat -f %z "${_dir}/index.html" 2>/dev/null); then :
@@ -332,8 +383,11 @@ _seed_main_volume "${MAIN_VOLUME}"
 # silently drops bot/mailbox deliveries. Fix the ownership inside the volume
 # with the deploy image itself (already cached, no extra pull) and the same
 # uid the container uses.
+# issue #105 附带观察: 光 chown 还不够 — 从 0700 源 cp -a 带过来的 mode 会
+# 让属主之外的协作者写不进去, 顺手补 u+rwX 保证属主 (10000) 对全树可读写
+# (s4e2e 附带观察: 播种产物目录 worker uid 不可直写, 靠手工 rename 恢复)。
 docker run --rm --entrypoint sh --user 0:0 -v "${MAIN_VOLUME}:/vol" "${HERMES_IMAGE}" \
-  -c 'chown -R 10000:10000 /vol' >/dev/null 2>&1 \
+  -c 'chown -R 10000:10000 /vol && chmod -R u+rwX /vol' >/dev/null 2>&1 \
   || say "⚠ could not fix ownership inside ${MAIN_VOLUME}" \
          "⚠ 无法修正卷 ${MAIN_VOLUME} 内的属主"
 
@@ -384,8 +438,9 @@ say "✅ main agent deploy complete" "✅ main agent 部署完成"
 say '──────────────────────────────────────────────' '──────────────────────────────────────────────'
 say '  Web console:    http://'"${IP}"':'"${CONSOLE_PORT}"'/' \
     '  Web 控制台:    http://'"${IP}"':'"${CONSOLE_PORT}"'/'
-say '  gateway API:    http://'"${IP}"':'"${GW_PORT:-8642}"'/' \
-    '  gateway API:    http://'"${IP}"':'"${GW_PORT:-8642}"'/'
+# issue #109 (2026-10-26): gateway 不再发布宿主端口, 仅容器内网可达
+say '  Gateway API:    container-internal only (http://hermes_main:8642 on the simple-dot network; browsers use the console same-origin proxy)' \
+    '  Gateway API:    仅容器内网可达 (simple-dot 网络上 http://hermes_main:8642; 浏览器走控制台同源代理)'
 say '  Next: open the console → "Worker management" to add a worker (generate compose → start container → register),' \
     '  下一步: 控制台『Worker 管理』添加 worker(生成 compose → 起容器 → 注册),'
 say '         or add a worker manually per DEPLOY.md §3.' \

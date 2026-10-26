@@ -93,7 +93,7 @@ curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/cards \
 不可省略场景: 哪怕只是"动账 + 一行描述"也得补一段话（≥4 句）。
 **没有进展汇报 = 用户认为链停摆**。
 
-**协议补丁必须同时落到仓库 deploy/skills/**: main 在 `/opt/data/skills/agent-matrix/` (运行环境缓存层) patch skill 后, 必须把同补丁写入仓库 `<project>/repo/deploy/skills/<skill>/SKILL.zh-cn.md` 并 commit+push——运行环境缓存会在下次 install.sh 时被覆盖, 仓库版本才是 部署真正落地的源。补一次不补两次 = 用户下次加载 skill 时协议仍缺失。
+**协议补丁必须同时落到仓库 deploy/skills/**: main 在 `/opt/data/skills/agent-matrix/` (运行环境缓存层) patch skill 后, 必须把同补丁写入仓库 `<project>/repo/deploy/skills/<skill>/SKILL.zh-cn.md` 并 commit 落地 (本地 commit 属任务链与回溯链的一部分, 必须落地)——运行环境缓存会在下次 install.sh 时被覆盖, 仓库版本才是 部署真正落地的源。push 不在本 skill 义务内: 是否 push 由用户自行选择 (用户可用自己的 soul/skill/prompt 指定), skill 不代劳。补一次不补两次 = 用户下次加载 skill 时协议仍缺失。
 
 ## 坑
 
@@ -109,14 +109,19 @@ curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/cards \
 
 ## 修复/交付卡报告"已 push"必须 main 侧独立对账
 
-coder/reviewer 报"commit + push 到 origin/main 成功"时，main 结算前必须用
-`PROJECT-MEMORY.md` 的仓库地址自己跑一遍：
+**push 不是 skill 规定的义务, 但一旦有人报了"已 push", 对账照样要做。**
+本 skill 只要求 commit 落地; 是否 push 由用户自行选择 (用户可用自己的
+soul/skill/prompt 指定)。因此:
 
-```bash
-git rev-parse HEAD                                       # 本地
-git ls-remote <project-remote-url> HEAD                  # 远端
-# 期望两值全等；MATCH 即落账「远端 tip==HEAD push 真实落地」
-```
+- worker/协调方**若**执行了 push (用户已授权), 结算前 main 必须用
+  `PROJECT-MEMORY.md` 的仓库地址自己跑一遍:
+  ```bash
+  git rev-parse HEAD                                       # 本地
+  git ls-remote <project-remote-url> HEAD                  # 远端
+  # 期望两值全等；MATCH 即落账「远端 tip==HEAD push 真实落地」
+  ```
+- 没人报"已 push" ⇒ 不需要这段对账, 也不要把 push 写进本卡的验收口径;
+  worker 只 commit 不 push 是**正确行为, 不是缺陷**。
 
 三个常见假阳性:
 
@@ -129,6 +134,6 @@ git ls-remote <project-remote-url> HEAD                  # 远端
   以 `git ls-remote ...refs/heads/main` 拿到的远端 SHA 为准。
 - **Gitea token 解码失败**: 探测一次 401/403 立即停, 勿用空 token 连发。
 
-main 报告里 push 段必须含: 远端 commit SHA + 本地 SHA + 仓库 owner/repo 路径,
-三者贴出原文等号即 PASS。否则视为 worker 自报"push 成功"但未实测, 结算拒收,
-走 resume 补实测, 或 main 亲自 push。
+有人报"已 push"时, main 报告里 push 段必须含: 远端 commit SHA + 本地 SHA +
+仓库 owner/repo 路径, 三者贴出原文等号即 PASS。否则视为 worker 自报"push 成功"
+但未实测, 结算拒收, 走 resume 补实测, 或由用户/协调方自行 push。

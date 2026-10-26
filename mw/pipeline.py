@@ -425,9 +425,46 @@ def dispatch(payload: dict, *, registry_path: str, ledger: Ledger,
 
 # ── resume (main → worker 续作通道, 纯转发) ───────────────────────
 
+def _log_resume_state_reset(ledger: Ledger, task_id: str, state_reset: str,
+                             *, actor: str = "main") -> None:
+    """把 resume 的状态回拨结果落成可见痕迹 (2026-10-25 issue #104 根因 2)。
+
+    两件事:
+      1. harvest_log 追加一行 —— 卡片详情端点直接可读;
+      2. emit worker.state 事件 (带 state_reset / answered_by 字段) ——
+         SSE/webhook 可订阅, main 与操作员两侧都能从账本读到事实。
+
+    走 ledger 的统一状态更新器配套的 emit_event / harvest_log 通道,
+    不裸 UPDATE harvest_contracts.harvest_status。
+    """
+    try:
+        row = ledger.conn.execute(
+            "SELECT harvest_log FROM harvest_contracts WHERE task_id=?",
+            (task_id,)).fetchone()
+        if row is not None:
+            merged = row["harvest_log"] or ""
+            trail = f"[resume] state_reset={state_reset} answered_by={actor}"
+            ledger.conn.execute(
+                "UPDATE harvest_contracts SET harvest_log=? WHERE task_id=?",
+                ((f"{merged}\n{trail}" if merged else trail)[:2000], task_id))
+            ledger.conn.commit()
+    except Exception:
+        pass  # 痕迹写失败不阻断 resume 主流程
+    try:
+        ledger.emit_event("worker.state", task_id, {
+            "from": "", "to": "", "actor": "resume",
+            "reason": f"resume 注入完成, state_reset={state_reset}",
+            "state_reset": state_reset,
+            "answered_by": actor,
+        })
+    except Exception:
+        pass
+
+
 def resume_task(task_id: str, *, ledger: Ledger,
                instruction: str, timeout: int = 300,
-               hermes_home: str = None) -> dict:
+               hermes_home: str = None,
+               resume_actor: str = "main") -> dict:
     """凭 session 锚点原地恢复 worker 会话续作 (header 续接实测成立)。
 
     新回复写回同一 session (上下文完整)。这是"只差收尾 / 澄清已答"场景的
@@ -435,10 +472,48 @@ def resume_task(task_id: str, *, ledger: Ledger,
 
     resume 后把 harvest_status 拨回 PENDING, 让 reaper 按 worker 续写后的
     TODO.md 状态重新结算。
+
+    resume_actor (2026-10-25 issue #104): 答复来源标记 —— "main" (协调方
+    走 CLI) / "operator" (操作员走控制台)。随状态回拨痕迹一起落账, 让
+    双答复通道互相可读。
+
+    s6fix P1-1 (issue #104 根因 4 执行点收口): 终态卡 (ARCHIVED/
+    CANCELLED/HARVESTED) 一律拒绝注入 —— 旧版守卫只在 console API 入口,
+    「答复入队 → 卡被归档 → reaper 消费 → resume_task 直注」与 CLI 直调
+    两条路都绕过它, 唤醒即无主施工 (实案 t_a8052713 的注入形态)。本函数
+    是注入前的最后一道闸: POST 之前拒绝, 并落 harvest_log + worker.state
+    痕迹, 让「为什么没注入」在账本上有据可查。
     """
     sess = ledger.get_session(task_id)
     if not sess or not sess["session_id"]:
         raise SubmitError(404, f"task {task_id} 无 session 锚点, 无法 resume")
+    # s6fix P1-1: 终态守卫 —— 必须先于注入 POST, 命中即拒绝 + 落痕。
+    if ledger.is_terminal(task_id):
+        reason = "resume 拒绝执行: card terminal"
+        try:
+            row = ledger.conn.execute(
+                "SELECT harvest_status, harvest_log FROM harvest_contracts "
+                "WHERE task_id=?", (task_id,)).fetchone()
+            status = row["harvest_status"] if row else None
+            if row is not None:
+                merged = row["harvest_log"] or ""
+                trail = (f"[resume-terminal] 拒绝注入 "
+                         f"(harvest_status={status}) answered_by={resume_actor}")
+                ledger.conn.execute(
+                    "UPDATE harvest_contracts SET harvest_log=? "
+                    "WHERE task_id=?",
+                    ((f"{merged}\n{trail}" if merged else trail)[:2000],
+                     task_id))
+                ledger.conn.commit()
+            ledger.emit_event("worker.state", task_id, {
+                "from": status or "", "to": status or "",
+                "actor": "resume", "reason": reason,
+                "resume_rejected": "terminal", "answered_by": resume_actor,
+            })
+        except Exception:
+            pass  # 痕迹写失败不阻断拒绝本身 (拒绝优先)
+        return {"ok": False, "task_id": task_id,
+                "reason": reason, "state_reset": "refused:terminal"}
     reg = load_registry(os.environ.get("MW_REGISTRY",
                      str(Path(__file__).parent / "registry.json")))
     entry = reg[sess["profile"]]
@@ -484,8 +559,13 @@ def resume_task(task_id: str, *, ledger: Ledger,
     #      永远失败 (resume 在此场景仅唤醒语义, 跳过即合法完成)。
     #   ② 其余迁移失败 (如 WORKING→PENDING 属 handoff 形状, 白名单不收) 不再
     #      中断函数 —— 唤醒已成功, 必须继续走下方 F2 重占槽, 否则卡掉进
-    #      「唤醒成功但状态未回拨」的解耦死区 (issue #65 核实点 3)。失败信息
-    #      随返回 dict 透传 (reaper 暂未落账, 见 REVIEW-61-65 S-2)。
+    #      「唤醒成功但状态未回拨」的解耦死区 (issue #65 核实点 3)。
+    #
+    # 2026-10-25 issue #104 根因 2 (resume 注入后状态机不动作且静默):
+    #   旧版把 state_reset='skipped:...' 只塞进返回 dict, 而 console 的
+    #   后台线程拿不到返回值 ⇒ 注入成功与否无人知晓 (操作员「回复后没看到
+    #   task 恢复」的直接原因)。修法: 无论成功/跳过, 都落 harvest_log 并
+    #   emit worker.state 事件 —— 走 ledger 的统一状态更新器, 不裸 UPDATE。
     state_reset = "done"
     try:
         cur = ledger.conn.execute(
@@ -498,6 +578,10 @@ def resume_task(task_id: str, *, ledger: Ledger,
                                       reason="resume 续作, 等待重新结算")
     except (ValueError, PermissionError) as e:
         state_reset = f"skipped:{e}"
+    # issue #104: state_reset 全程可见 —— 落 harvest_log + emit worker.state。
+    # 两条路径 (done / skipped:*) 都记, 让「注入成功与否」在账本上有据可查,
+    # 而不是只活在返回值里 (console 后台线程拿不到返回值)。
+    _log_resume_state_reset(ledger, task_id, state_reset, actor=resume_actor)
     # F2 (2026-10-04): resume = main 明确要继续盯这张卡 → 把卡重占回
     # run 的 current_card_id 槽位。否则: 结算已把槽清成 NULL, resume 只
     # 把卡拨回 PENDING, 而 reaper 只结算/敲门 current_card → 卡掉进

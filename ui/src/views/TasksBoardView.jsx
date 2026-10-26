@@ -508,6 +508,14 @@ function StepTimeline({ detail, currentId, busy, onReply, onCancel, onArchive, t
               <StatusBadge cls={c.badge} wide title={c.sem}>{c.sem}</StatusBadge>
               <div className="col-start-1 row-start-2 flex items-center gap-2 min-w-0 sm:contents">
                 <AssigneeBadge name={step.assignee} t={t} />
+                {/* issue #116: 「已被 X 于 HH:MM 答复」角标 —— 双通道答复
+                    互可见 (数据源: run 详情端点注入的 answered_by/hhmm) */}
+                {step.answered_by && (
+                  <span className="badge-amber px-1.5 py-0.5 rounded text-[10px] leading-none whitespace-nowrap"
+                        title={t('tboard.answered_badge', { by: step.answered_by, time: step.answered_at_hhmm })}>
+                    {t('tboard.answered_badge', { by: step.answered_by, time: step.answered_at_hhmm })}
+                  </span>
+                )}
                 {/* issue #58 (AC-U2): 步骤行 token 段, 读 card.worker_report.tokens
                     (main 裁决 1 已由 server 注入); 历史卡缺失 → "—" */}
                 <TokenSummary
@@ -1525,9 +1533,13 @@ export default function TasksBoardView({ onChanged }) {
     if (!dlg?.answer?.trim() || dlg.sending) return
     setDlg((d) => ({ ...d, sending: true }))
     try {
-      await api.resume(dlg.task.id, dlg.answer.trim())
+      const r = await api.resume(dlg.task.id, dlg.answer.trim())
       setDlg(null)
-      setToast({ msg: t('tboard.finish_success'), type: 'ok' })
+      // issue #116: 后到答复不再一律成功文案 —— 后端 conflict 非空时
+      // 用警示条呈现「已被 X 于 HH:MM 答复」, 消除操作员盲注体感。
+      setToast(r?.conflict
+        ? { msg: t('tboard.reply_conflict', { conflict: r.conflict }), type: 'warn' }
+        : { msg: t('tboard.finish_success'), type: 'ok' })
       onChanged?.()
       await Promise.all([loadActive(), loadRuns()])
       Object.keys(expanded).forEach((rid) => {

@@ -527,126 +527,181 @@ def test_r3_rejects_long_bare_filename(tmp_path):
 # ── s3b-fix R-6 + s3d-fix N-1 回归测试 (2026-10-17) ──────────────
 # s3b-fix 修复前实证: §8.5 host 侧直用 sha256sum, macOS 缺此命令 → set -e + pipefail 中止
 # s3b-fix 修复后: hash_of 泛化封装 sha256 (sha256sum | shasum -a 256 探测)。
-# s3d-fix N-1 (2026-10-17): §8.5 管道尾用 `done | hash_of sha256 -)` (修复前写成了
+# s3d-fix N-1 (2026-10-17): 管道尾用 `done | hash_of sha256 -)` (修复前写成了
 # `done | hash_of sha256)`, 把 'sha256' 当文件名传, 触发 `[ -n "$f" ]` 短路)。
 # 修复方式: hash_of 在 filename='-' 时走 sha256sum/shasum -a 256 stdin 语义。
-# 测试策略: 从真实 install.sh 抽取 hash_of 函数体, 用 bash -c 真跑。
-def _extract_hash_of_from_install_sh() -> str:
-    """从 deploy/install.sh 抽取 hash_of 函数体 (含 s3d-fix N-1 的 '-' 分支)。
+# 测试策略: 从真实 hash.sh 抽取 hash_of 函数体, 用 bash -c 真跑。
+#
+# issue #113 (2026-10-25) 归因: hash_of 原先是 deploy/install.sh 里的内联
+# 函数, 被 f908906 (issue #53 C, install.sh 精简) 连同 §8.5 一起删掉 ——
+# 这两条测试从此永远 RED (守护的代码已不存在)。本卡把 helper 迁到
+# deploy/lib/hash.sh (与 deploy/lib/i18n.sh 同 house style, install.sh /
+# verify.sh / main_entry.sh 共用), 并让测试改指新位置。顺带修掉一个
+# 同类真 bug: verify.sh 宿主侧指纹用裸 sha256sum, macOS/BSD 没有这条命令
+# ⇒ 指纹算成空串 ⇒ 误报「SOUL/SKILL 内容陈旧」。
+HASH_SH = Path(__file__).resolve().parent.parent / "deploy" / "lib" / "hash.sh"
+
+
+def _extract_hash_of_from_hash_sh() -> str:
+    """从 deploy/lib/hash.sh 抽取 hash_of 函数体 (含 '-' stdin 分支)。
 
     失败时 (例如源码被重构) 让测试明确失败, 而不是悄悄退化成旧内嵌副本。
     """
-    install_sh = (Path(__file__).resolve().parent.parent
-                  / "deploy" / "install.sh").read_text()
+    hash_sh = HASH_SH.read_text()
     # 找 `hash_of() {` 起点和函数结束符 `}`。函数体内有 `awk '{print $1}'`
-    # 这类含 {} 的字符串, 用简单 brace-counting 不行 — 转用 '# }' 注释做锚。
-    # 函数结尾惯例是: 缩进后的 `}` 单独一行 (本仓 install.sh 的统一风格)。
-    lines = install_sh.splitlines(keepends=True)
+    # 这类含 {} 的字符串, 用简单 brace-counting 不行 — 转用 '}' 单独成行做锚。
+    # 函数结尾惯例是: 缩进后的 `}` 单独一行 (本仓 shell 脚本的统一风格)。
+    lines = hash_sh.splitlines(keepends=True)
     start_idx = None
     for i, line in enumerate(lines):
         if line.startswith("hash_of() {"):
             start_idx = i
             break
-    assert start_idx is not None, "install.sh 找不到 `hash_of() {` 起点"
+    assert start_idx is not None, "hash.sh 找不到 `hash_of() {` 起点"
     # 从函数首行后往下扫, 找到第一个 '}' 单独成行的位置。
     end_idx = None
     for j in range(start_idx + 1, len(lines)):
         if lines[j].rstrip() == "}":
             end_idx = j
             break
-    assert end_idx is not None, "install.sh hash_of 函数体未闭合 (无 '}' 单行)"
+    assert end_idx is not None, "hash.sh hash_of 函数体未闭合 (无 '}' 单行)"
     body = "".join(lines[start_idx:end_idx + 1])
     # 关键守卫: 抽取的源码必须含 s3d-fix N-1 的 '-' 分支, 否则就是源码漂移。
     assert '"${f}" = "-"' in body, \
-        "install.sh hash_of 已不再含 '${f} = \"-\"' (s3d-fix N-1 撤回? 测试需同步)"
+        "hash.sh hash_of 已不再含 '${f} = \"-\"' (s3d-fix N-1 撤回? 测试需同步)"
     return body
 
 
 def test_r6_hash_of_via_bash(tmp_path):
-    """R-6 + N-1: 跑真 bash 测 hash_of 函数 (md5 + sha256 + '-' stdin)。"""
+    """R-6 + N-1: 跑真 bash 测 hash_of 函数 (md5 + sha256 + '-' stdin)。
+
+    issue #113 (2026-10-25): 本用例原先用文件内自造的软断言 PASS() 记分
+    (只往 FAIL_LIST 追加, 从不抛) —— 在 pytest 下**永远不会失败**。
+    也就是说「hash_of 算错了」这类真回归对 pytest 是隐形的 (该文件 23 例
+    全是这种形态)。本卡把 R-6 这条改成真 assert, 让它真能红。
+    """
     import subprocess
-    hash_func_src = _extract_hash_of_from_install_sh()
+    hash_func_src = _extract_hash_of_from_hash_sh()
     # 写一个文件测各分支
     f = tmp_path / "sample.txt"
     f.write_text("hello\n")
+
+    def _run(cmd: str) -> subprocess.CompletedProcess:
+        # 前置 hash_of 函数体 —— 测的就是从真实 hash.sh 抽出来的那份实现
+        return subprocess.run(["bash", "-c", hash_func_src + cmd],
+                              capture_output=True, text=True)
+
     # md5 默认 (1-arg) → b1946ac92492d2347c6235b4d2611184 (md5("hello\n"))
-    r1 = subprocess.run(
-        ["bash", "-c", hash_func_src + f'echo "$(hash_of {f})"'],
-        capture_output=True, text=True)
-    PASS("R-6 hash_of <file> default md5",
-         "b1946ac92492d2347c6235b4d2611184" in r1.stdout, r1.stdout.strip())
+    r1 = _run(f'echo "$(hash_of {f})"')
+    assert "b1946ac92492d2347c6235b4d2611184" in r1.stdout, \
+        f"R-6 hash_of <file> default md5: {r1.stdout.strip()!r} {r1.stderr.strip()!r}"
     # md5 explicit (2-arg) → 同上
-    r2 = subprocess.run(
-        ["bash", "-c", hash_func_src + f'echo "$(hash_of md5 {f})"'],
-        capture_output=True, text=True)
-    PASS("R-6 hash_of md5 <file>",
-         "b1946ac92492d2347c6235b4d2611184" in r2.stdout, r2.stdout.strip())
+    r2 = _run(f'echo "$(hash_of md5 {f})"')
+    assert "b1946ac92492d2347c6235b4d2611184" in r2.stdout, \
+        f"R-6 hash_of md5 <file>: {r2.stdout.strip()!r} {r2.stderr.strip()!r}"
     # sha256 → 5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03
-    r3 = subprocess.run(
-        ["bash", "-c", hash_func_src + f'echo "$(hash_of sha256 {f})"'],
-        capture_output=True, text=True)
-    PASS("R-6 hash_of sha256 <file>",
-         "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03" in r3.stdout,
-         r3.stdout.strip())
-    # N-1: sha256 读 stdin ('-' 形态) — 对 §8.5 `done | hash_of sha256 -` 至关重要。
+    r3 = _run(f'echo "$(hash_of sha256 {f})"')
+    assert "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03" in r3.stdout, \
+        f"R-6 hash_of sha256 <file>: {r3.stdout.strip()!r} {r3.stderr.strip()!r}"
+    # N-1: sha256 读 stdin ('-' 形态) — 对 `done | hash_of sha256 -` 至关重要。
     # 复审验证: sha256sum/shasum -a 256 直接吃 stdin, 输出 <hash>\n, awk '$1' 取哈希。
     # 期望: 与 `echo -n "hello" | sha256sum | awk '{print $1}'` 等价。
-    expected = subprocess.run(
-        ["bash", "-c", 'echo -n "hello" | sha256sum | awk \'{print $1}\''],
-        capture_output=True, text=True).stdout.strip()
-    r4 = subprocess.run(
-        ["bash", "-c", hash_func_src + f'echo -n "hello" | hash_of sha256 -'],
-        capture_output=True, text=True)
-    PASS("N-1 hash_of sha256 - reads stdin",
-         expected in r4.stdout and expected != "",
-         f"got={r4.stdout.strip()!r} expected={expected!r}")
+    expected = _run('echo -n "hello" | sha256sum | awk \'{print $1}\'').stdout.strip()
+    r4 = _run('echo -n "hello" | hash_of sha256 -')
+    assert expected and expected in r4.stdout, \
+        f"N-1 hash_of sha256 - reads stdin: got={r4.stdout.strip()!r} expected={expected!r}"
     # N-1 负样本: 缺 '-' (回归保护: 退回 s3b 之前的 broken `done | hash_of sha256)`)
     # — 单参 `hash_of sha256` 走 1-arg 分支, f=sha256, 被当成文件名, md5sum 报
     # 'No such file or directory'。回 0 是因为是 stderr, 但 stdout 是空, 不产出
     # 哈希。等价语义: '拿到 HOST_HASH 是空串或 md5(sha256) 的 8d10b4b... 文件名哈希',
     # 都不是 12 文件 sha256 之哈希。简化: 断言 stdout 为空 + 哈希输出不等价 stdin 的
     # 真实 sha256 (上游 N-1 测试已验证 '- 形态能拿到正确哈希, 这里只需证伪旧的形态)。
-    r5 = subprocess.run(
-        ["bash", "-c", hash_func_src + f'echo -n "hello" | hash_of sha256'],
-        capture_output=True, text=True)
+    r5 = _run('echo -n "hello" | hash_of sha256')
     # 期望: stdout 不含真实 sha256('hello') = 2cf24dba...
-    wrong = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" \
-        not in r5.stdout
+    wrong = ("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+             not in r5.stdout)
     # 同时: bash 应在某种失败下退出 — md5sum 找不到 'sha256' 文件 → rc=1
     # (stderr 必有 'No such file' 或 'missing argument' 或类似错误字串)
-    PASS("N-1 hash_of sha256 without '-' does NOT produce stdin hash (regression guard)",
-         wrong and (r5.returncode != 0 or "missing argument" in r5.stderr
-                    or "No such file" in r5.stderr or "cannot open" in r5.stderr),
+    assert wrong and (r5.returncode != 0 or "missing argument" in r5.stderr
+                       or "No such file" in r5.stderr or "cannot open" in r5.stderr), \
+        (f"N-1 hash_of sha256 without '-' must NOT produce the stdin hash: "
          f"stdout={r5.stdout.strip()!r} stderr={r5.stderr.strip()!r} rc={r5.returncode}")
     # 不存在的 algo
-    r6 = subprocess.run(
-        ["bash", "-c", hash_func_src + f'hash_of blake3 {f}'],
-        capture_output=True, text=True)
-    PASS("R-6 hash_of rejects unknown algo",
-         "unsupported algo" in r6.stderr, r6.stderr.strip())
+    r6 = _run(f'hash_of blake3 {f}')
+    assert "unsupported algo" in r6.stderr, \
+        f"R-6 hash_of rejects unknown algo: {r6.stderr.strip()!r}"
 
 
-def test_r6_install_sh_section_85_uses_hash_of(tmp_path):
-    """R-6: §8.5 host 侧已替换 sha256sum 为 hash_of sha256。"""
-    install_sh = (Path(__file__).resolve().parent.parent
-                  / "deploy" / "install.sh").read_text()
-    # §8.5 region (between "8.5 Code version check" and "9. Wait for health")
-    sec_start = install_sh.find("# ── 8.5 Code version check")
-    sec_end = install_sh.find("# ── 9. Wait for health")
-    assert sec_start != -1 and sec_end != -1, "section markers missing"
-    section = install_sh[sec_start:sec_end]
-    # host 侧 HOST_HASH 行应使用 hash_of sha256
-    PASS("R-6 §8.5 host uses hash_of sha256",
-         "hash_of sha256" in section, section[:300])
-    # s3d-fix N-1: §8.5 管道尾必须是 `hash_of sha256 -)` 形态, 不能漏 '-'.
-    # 旧 broken 形态: `done | hash_of sha256)` (sha256 当文件名)。
-    has_correct_tail = "done | hash_of sha256 -)" in section
-    has_broken_tail = re.search(r"done \| hash_of sha256\)(?! -)", section)
-    PASS("N-1 §8.5 pipe tail is `hash_of sha256 -)`",
-         has_correct_tail and not has_broken_tail,
-         f"correct={has_correct_tail} broken={bool(has_broken_tail)}")
-    # 旧 sha256sum 字面量在 §8.5 容器侧仍在 (容器是 Linux, OK)
-    # 不强制
+def test_r6_deploy_scripts_use_hash_of():
+    """R-6: 宿主侧哈希一律走 hash_of (跨平台), 不再用裸 sha256sum。
+
+    issue #113 (2026-10-25) 归因: 原 R-6 两条测试守护的是 install.sh
+    §8.5「host 侧已替换 sha256sum 为 hash_of sha256」+ 管道尾
+    `hash_of sha256 -` 形态。但 §8.5 与内联 hash_of 一起被 f908906
+    (issue #53 C, install.sh 精简) 删除 ⇒ 这两条测试永远 RED, 守护的
+    代码已不存在。
+
+    本卡把 helper 迁到 deploy/lib/hash.sh 后, 真正的跨平台契约变成:
+      (a) deploy/lib/hash.sh 提供 hash_of (含 '-' stdin 分支);
+      (b) install.sh / verify.sh 装载它;
+      (c) 宿主侧指纹不再用裸 sha256sum (macOS/BSD 没这条命令 ⇒
+          指纹算成空串 ⇒ verify.sh 误报「SOUL/SKILL 内容陈旧」)。
+    容器侧那行 `docker exec ... sha256sum` 是容器内 Linux, 保持不变。
+    """
+    root = Path(__file__).resolve().parent.parent
+    hash_sh = (root / "deploy" / "lib" / "hash.sh").read_text()
+    # (a) helper 本体: 抽出函数体 (复用同文件的抽取口径, 不手抄副本)
+    body = _extract_hash_of_from_hash_sh()
+    assert "md5" in body and "sha256" in body, (
+        "hash_of 必须同时支持 md5 与 sha256")
+    assert '"${f}" = "-"' in body, (
+        "hash_of 必须保留 '-' stdin 分支 (s3d-fix N-1)")
+
+    # (b) 三个 deploy 脚本都装载 helper
+    for script in ("install.sh", "verify.sh"):
+        src = (root / "deploy" / script).read_text()
+        assert "hash.sh" in src, f"deploy/{script} 未装载 deploy/lib/hash.sh"
+
+    # (c) 宿主侧不再出现裸 sha256sum 调用。
+    #     允许的例外: 容器侧 docker exec 里的 sha256sum (容器是 Linux)。
+    #     两个口径要点:
+    #       - 只扫可执行代码 (整行注释剔除) —— 注释里提到 sha256sum 是正常的
+    #         (说明为何不能裸调用), 不能算红线命中;
+    #       - 按「逻辑行」判定 (反斜杠续行拼回一行) —— 容器侧那条
+    #         `docker exec ... sh -c 'sha256sum ...'` 的 sha256sum 落在
+    #         续行上, 逐行扫会把它误判成宿主侧裸调用。
+    verify_src = (root / "deploy" / "verify.sh").read_text()
+    code_lines = [ln for ln in verify_src.splitlines()
+                  if ln.strip() and not ln.lstrip().startswith("#")]
+    logical: list[str] = []
+    buf = ""
+    for raw in code_lines:
+        stripped = raw.rstrip()
+        buf = f"{buf} {stripped}".strip() if buf else stripped
+        if buf.endswith("\\"):
+            buf = buf[:-1].rstrip()
+            continue
+        logical.append(buf)
+        buf = ""
+    if buf:
+        logical.append(buf)
+    for ln in logical:
+        if "sha256sum" not in ln:
+            continue
+        assert "docker exec" in ln, (
+            f"verify.sh 宿主侧出现裸 sha256sum (macOS/BSD 无此命令): {ln.strip()}")
+    assert "hash_of sha256" in verify_src, (
+        "verify.sh 宿主侧指纹必须走 hash_of sha256")
+    # 管道尾形态: `hash_of sha256 -` (不是 `hash_of sha256)` —— 后者把
+    # 'sha256' 当文件名传, 触发短路)。s3d-fix N-1 的原教训在 verify.sh
+    # 的宿主侧指纹链路上重新适用。
+    assert re.search(r"hash_of sha256 -", verify_src), (
+        "verify.sh 指纹管道尾必须是 `hash_of sha256 -` 形态")
+
+    # install.sh 的 UI stamp 同样走 hash_of md5 (macOS 只有 `md5 -r`)
+    install_src = (root / "deploy" / "install.sh").read_text()
+    assert "hash_of md5" in install_src, (
+        "install.sh 的 UI stamp md5 必须走 hash_of (跨平台)")
 
 
 if __name__ == "__main__":
@@ -672,7 +727,7 @@ if __name__ == "__main__":
            test_r2_webp_rejects_avi,
            test_r3_rejects_long_bare_filename,
            test_r6_hash_of_via_bash,
-           test_r6_install_sh_section_85_uses_hash_of]
+           test_r6_deploy_scripts_use_hash_of]
     for fn in fns:
         with tempfile.TemporaryDirectory() as td:
             try:

@@ -266,8 +266,9 @@ COMPOSE_TEMPLATE = """services:
     container_name: hermes_{name}
     restart: unless-stopped
     command: gateway run
-    ports:
-      - "{port}:8642"
+    # issue #109 (2026-10-26): 模版不再含 ports: 宿主映射。worker 的 gateway
+    # 只经容器内网别名 http://hermes_<name>:8642 被访问 (simple-dot 网络),
+    # 宿主发布端口自 issue #82 起即为冗余, 且经 docker-proxy 反而更易掉线。
     networks:
       # 2026-10-22 issue #82: every worker joins the shared "simple-dot" network
       # and gets its OWN unique alias. main and the workers then talk over
@@ -307,9 +308,9 @@ def api_compose_generate(payload: dict) -> dict:
     name = (payload.get("name") or "").strip()
     if not name or not name.replace("_", "").replace("-", "").isalnum():
         raise ValueError("worker 名称只允许字母数字和 -_")
-    port = str(payload.get("port") or "").strip()
-    if not (port.isdigit() and 1024 <= int(port) <= 65535):
-        raise ValueError("端口需为 1024-65535 的数字")
+    # issue #109 (2026-10-26): port 不再必填 —— 模版已删宿主端口映射,
+    # worker 走容器内网别名 http://hermes_<name>:8642。传入的 port 一律忽略,
+    # 保持对旧前端调用的向后兼容 (不报错)。
     api_key = (payload.get("api_key") or "").strip()
     if len(api_key) < 16:
         raise ValueError("api_key 至少 16 位")
@@ -320,7 +321,7 @@ def api_compose_generate(payload: dict) -> dict:
     cfg = dict(SETTINGS_DEFAULTS)
     cfg.update({k: v for k, v in s.items() if k in SETTINGS_DEFAULTS})
     yaml_text = COMPOSE_TEMPLATE.format(
-        name=name, port=port, api_key=api_key,
+        name=name, api_key=api_key,
         image=payload.get("image") or cfg["default_image"],
         shared_host=payload.get("shared_host") or cfg["shared_workspace_host"])
     return {"yaml": yaml_text,
@@ -628,6 +629,45 @@ def api_workflow_delete(wf_id: str) -> dict:
     return {"ok": True, "deleted": wf_id}
 
 
+def _reconcile_archived_orphans(led) -> list:
+    """issue #106 方案 (a): kanban 已归档卡的孤儿契约行联动推终态。
+
+    滞留链路: main 用 `hermes kanban archive` 直建/直归档的卡不经过 mw
+    任何端点 (reaper T3 只结算 ACTIVE run 的 current_card), 其契约行
+    永远滞留 PENDING —— launch 护栏因此 409 (orphan_pending_cards),
+    「无 PENDING 孤儿」巡检口径也被污染 (170 实测: s4 两张测试卡)。
+
+    本函数在「孤儿面被消费的时刻」(launch 护栏 / 任务列表巡检) 做一次
+    对账: 孤儿 task_id ∩ kanban status='archived' → 走正规状态机入口
+    Ledger.sync_archived_contract_states 推到 ARCHIVED (带事件与审计,
+    非裸 UPDATE)。kanban.db 不可读 / 无孤儿 / 单卡异常都安全降级为
+    no-op —— 联动是增益路径, 绝不允许把消费方拖崩。
+    返回实际被推入 ARCHIVED 的 task_id 列表。
+    """
+    try:
+        orphans = led.list_pending_orphan_cards(limit=200)
+    except Exception:
+        return []
+    if not orphans:
+        return []
+    ids = [o["task_id"] for o in orphans]
+    placeholders = ",".join("?" * len(ids))
+    try:
+        rows = _ro_query(
+            KANBAN_DB,
+            "SELECT id FROM tasks WHERE status='archived' "
+            f"AND id IN ({placeholders})", tuple(ids))
+    except Exception:
+        return []
+    archived_ids = [r["id"] for r in rows]
+    if not archived_ids:
+        return []
+    try:
+        return led.sync_archived_contract_states(archived_ids)
+    except Exception:
+        return []
+
+
 def api_team_work_launch(payload: dict) -> dict:
     """Team Work 启动器 (1A 边界, 2026-10-03 减法重构 + T2 顶层对象化)。
 
@@ -743,6 +783,11 @@ def api_team_work_launch(payload: dict) -> dict:
         # 是人工遗留,直接开新 run 会同时派同 task 制造混乱。
         # 操作员走 /api/team-work/<run_id>/close 关闭活跃 run 后,
         # 还要手工清孤儿(目前没有批量清端点 — 故意保留,免误删)。
+        # issue #106: 先做一次「kanban 已归档」联动对账 —— 直建直归档的
+        # 测试卡 (main `hermes kanban archive`, 不经 mw) 契约行滞留
+        # PENDING, 正是本护栏最常见的假阳性阻塞源; 对账后仍留下的
+        # 才是真孤儿, 继续拦。
+        _reconcile_archived_orphans(led)
         blockers = []
         existing = led.get_active_team_work()
         if existing:
@@ -1562,6 +1607,34 @@ def api_team_work_get(run_id: str) -> dict:
         if led is not None:
             led.close()
 
+    # issue #116: 卡片行「已被 X 于 HH:MM 答复」—— 批量注入答复事实。
+    # 与 api_task_detail 的 answered_by 同源 (task_resume_requests 每卡
+    # 最近一条含 actor), 但走 run 级单条批量查询 (IN 子句), 避免逐卡
+    # 开 Ledger 的 N 次连接。fail-open: 注入失败不阻断详情返回。
+    if task_ids:
+        try:
+            _ans_led = Ledger(LEDGER_DB)
+            try:
+                _ph = ",".join("?" * len(task_ids))
+                _arows = _ans_led.conn.execute(
+                    f"SELECT task_id, actor, requested_at "
+                    f"FROM task_resume_requests WHERE task_id IN ({_ph}) "
+                    f"ORDER BY requested_at DESC", tuple(task_ids)).fetchall()
+                _latest = {}
+                for _ar in _arows:  # DESC: 首见即该卡最新一条
+                    _latest.setdefault(_ar["task_id"], _ar)
+                for c in cards:
+                    _a = _latest.get(c.get("id"))
+                    if _a and _a["actor"]:
+                        c["answered_by"] = _a["actor"]
+                        c["answered_at"] = _a["requested_at"]
+                        c["answered_at_hhmm"] = time.strftime(
+                            "%H:%M", time.localtime(_a["requested_at"]))
+            finally:
+                _ans_led.close()
+        except Exception:
+            pass
+
     # F5 (2026-10-13, issue #5 状态机统一): 给 run 与每张 card 注入
     # `state` 字段, 单一派生态的真理来源。 三处 UI (TasksBoardView /
     # WorkersView / ChatView) 只需消费这里的 `state`, 不再各自拍脑
@@ -2100,6 +2173,29 @@ def _project_task_row(t: dict) -> dict:
     return out
 
 
+def led_resume_actor(db_path: str, task_id: str) -> dict | None:
+    """读该卡最近一次答复的事实 (issue #104 期望 2)。
+
+    返回 {actor, requested_at, answered_at_hhmm} 或 None。只读连接,
+    详情端点用; 失败一律 None (fail-open, 不阻断详情渲染)。
+    """
+    try:
+        from .ledger import Ledger
+        led = Ledger(db_path)
+        try:
+            r = led.last_resume_actor(task_id)
+        finally:
+            led.close()
+        if not r:
+            return None
+        out = dict(r)
+        out["answered_at_hhmm"] = time.strftime(
+            "%H:%M", time.localtime(r["requested_at"]))
+        return out
+    except Exception:
+        return None
+
+
 def api_task_detail(task_id: str) -> dict:
     """issue #75 R1: 单任务全字段详情 (列表投影后的补全通道)。
 
@@ -2136,6 +2232,17 @@ def api_task_detail(task_id: str) -> dict:
     t["runner_kind"] = s.get("runner_kind")
     t["workspace"] = s.get("workspace")
     t["team_work_run_id"] = h.get("team_work_run_id")
+    # issue #104 期望 2: 卡片上要能看出「已被 X 于 HH:MM 答复」。
+    # 从账本的 resume 请求历史读最近一条 (含 actor), 双通道 (main 走 CLI /
+    # operator 走 console) 共用这张表 ⇒ 两侧都能从详情端点读到对方已答复。
+    try:
+        _last = led_resume_actor(LEDGER_DB, task_id)
+        if _last:
+            t["answered_by"] = _last["actor"]
+            t["answered_at"] = _last["requested_at"]
+            t["answered_at_hhmm"] = _last["answered_at_hhmm"]
+    except Exception:
+        pass
     t["liveness"] = None
     try:
         from . import sse_bridge
@@ -2237,6 +2344,18 @@ def api_tasks(fields: str = "") -> dict:
     """
     if (fields or "").strip().lower() == "active":
         return _api_tasks_active()
+    # issue #106 巡检联动: 任务列表是「无 PENDING 孤儿」巡检的读面 ——
+    # 读之前先把「kanban 已归档但契约行滞留 PENDING」的卡对账掉
+    # (走正规状态机, 见 _reconcile_archived_orphans), 巡检信号不再被
+    # 直建直归档的测试卡污染。任何异常降级 no-op, 列表照常返回。
+    try:
+        _led_rec = Ledger(LEDGER_DB)
+        try:
+            _reconcile_archived_orphans(_led_rec)
+        finally:
+            _led_rec.close()
+    except Exception:
+        pass
     tasks = _ro_query(KANBAN_DB,
                       "SELECT id,title,assignee,status,block_kind,result,"
                       "created_at,started_at,completed_at "
@@ -3365,40 +3484,74 @@ def _post_webhook(url: str, secret: str, event: dict, wid: str):
         print(f"[webhook] {wid} {url} 异常: {e!r}")
 
 
-def api_resume(task_id: str, instruction: str) -> dict:
-    """控制台直接回答/续作: 后台线程执行 resume_task, 立即返回受理。
+def api_resume(task_id: str, instruction: str,
+               actor: str = "operator",
+               actor_claimed: str | None = None) -> dict:
+    """控制台直接回答/续作: **入队** resume 请求, 立即返回受理。
 
-    resume 可能耗时数分钟(worker 干活), 不能阻塞 HTTP 请求。
-    结果由 5s 自动刷新的看板呈现(转 done 或再次 blocked)。
+    2026-10-25 issue #104 根因 1 (console resume 不进账本、零簿记):
+      旧版直接起后台线程调 pipeline.resume_task, **不写 task_resume_requests**;
+      只有 CLI 路径 (mw/cli.py) 才入队, reaper 只消费该队列 ⇒ console 的
+      人工答复对 reaper 完全不可见 (实案 t_a8052713: 账本上该卡 0 行)。
+      修法: console 路径改为入队同一张表 (ledger.enqueue_resume), 由
+      reaper 消费 —— 两条答复通道共用一条队列、一份账本。
+
+    2026-10-25 issue #104 期望 2 (双答复通道互相不可见):
+      入队前先读 ledger.last_resume_actor —— 若另一方已答过, 返回
+      conflict 提示 (卡片上可见「已被 X 于 HH:MM 答复」), 不是盲注。
+
+    2026-10-25 issue #104 期望 4 (api_resume 不校验卡片终态):
+      入口加 is_terminal() 守卫 —— 已 ARCHIVED/CANCELLED/HARVESTED 的卡
+      直接拒 (409), 不再往终态卡注入新指令。
+
+    2026-10-25 issue #115 (actor 由客户端自称 ⇒ 答复归属可伪造):
+      actor 是**服务端决定的**, 不是入参可信面。HTTP 路由层 (/api/resume)
+      不再把请求体的 actor 传进来, 而是固定传 "operator" + 把自称值放
+      actor_claimed。actor_claimed 只落审计痕迹 (harvest_log / 事件),
+      绝不参与归属判定, 也绝不参与冲突比较 —— 否则「冒充成对方」仍能
+      让两条答复看起来同 actor, 把 #104 期望 2 的冲突提示绕掉。
+      main 的答复走 CLI 路径 (mw/cli.py cmd_resume → actor="main"),
+      不经本端点, 归属不受影响。
+
+    resume 可能耗时数分钟(worker 干活), 不能阻塞 HTTP 请求 —— 入队后
+    由 reaper 消费, 语义与 CLI 路径完全一致。
     """
-    import threading
-    from .pipeline import resume_task, SubmitError
     from .ledger import Ledger
     if not task_id or not instruction.strip():
         raise ValueError("task_id 与 instruction 必填")
     led = Ledger(LEDGER_DB)
-    sess = led.get_session(task_id)
-    if not sess or not sess["session_id"]:
-        raise ValueError(f"task {task_id} 无 session 锚点, 无法 resume")
-    led.close()  # 连接不能跨线程, 校验完即关; 后台线程自建新连接
-
-    def _run():
-        # issue #61 顺带审: 后台线程自建 Ledger 用完必须 close, 否则每次
-        # resume 泄漏一个 sqlite fd。
-        _led = Ledger(LEDGER_DB)
-        try:
-            resume_task(task_id, ledger=_led,
-                       hermes_home=os.environ.get("MW_HERMES_HOME", "/opt/data"),
-                       instruction=instruction)
-        except Exception as e:
-            print(f"[console] resume {task_id} failed: {e}")
-        finally:
-            _led.close()
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return {"ok": True, "task_id": task_id,
-            "note": _t("console.note.resume_accepted")}
+    try:
+        sess = led.get_session(task_id)
+        if not sess or not sess["session_id"]:
+            raise ValueError(f"task {task_id} 无 session 锚点, 无法 resume")
+        # issue #104 期望 4: 终态守卫 —— 终态卡不接受新指令。
+        if led.is_terminal(task_id):
+            return {"ok": False, "code": 409,
+                    "error": f"task {task_id} 已终态, 不可 resume",
+                    "harvest_status": led.get_contract(task_id)["harvest_status"]
+                    if led.get_contract(task_id) else None}
+        # issue #104 期望 2: 冲突检测 —— 另一方已答过就提示, 不盲注。
+        prior = led.last_resume_actor(task_id)
+        conflict = None
+        if prior and prior.get("actor") and prior["actor"] != actor:
+            hhmm = time.strftime("%H:%M", time.localtime(prior["requested_at"]))
+            conflict = (f"已被 {prior['actor']} 于 {hhmm} 答复 "
+                        f"(status={prior['status']})")
+        # 入队 —— 同一张 task_resume_requests 表, reaper 消费。
+        req_id = led.enqueue_resume(task_id, instruction, actor=actor)
+        # 答复事实落痕: harvest_log + worker.state 事件 (双通道互读)。
+        # actor_claimed 一并传入, 仅在 ≠ actor 时留「自称值被规范化」痕迹。
+        stamp = led.record_resume_answer(task_id, actor, instruction,
+                                        actor_claimed=actor_claimed)
+    finally:
+        led.close()
+    out = {"ok": True, "task_id": task_id, "request_id": req_id,
+           "actor": actor,
+           "answered_at_hhmm": stamp["answered_at_hhmm"],
+           "note": _t("console.note.resume_accepted")}
+    if conflict:
+        out["conflict"] = conflict
+    return out
 
 
 def _kill_spawn_bg(task_id: str) -> int:
@@ -3553,17 +3706,26 @@ def api_task_cancel(task_id: str) -> dict:
 
 
 def api_task_archive(task_id: str) -> dict:
-    """归档残留/历史任务: 标 ledger ARCHIVED。
+    """归档残留/历史任务: 标 ledger ARCHIVED + 联动停掉 spawn wrapper。
 
     1A 边界: mw 不碰 kanban。kanban 卡归档由 main 自己完成。
+
+    2026-10-25 issue #104 根因 4 (归档不停 worker):
+      ledger.set_terminal 只标终态让 reaper 跳过, **不调用** _kill_spawn_bg
+      (有杀进程能力的只有 task_cancel 路径) ⇒ 卡归档后 worker 仍继续施工
+      产出 commit (实案 t_a8052713: 归档后 3+ 分钟 worker 仍在改文件)。
+      修法: archive 路径至少联动 _kill_spawn_bg 停掉 spawn wrapper,
+      与 api_task_cancel 对齐。
     """
     from .ledger import Ledger
     if not task_id:
         raise ValueError("task_id 必填")
     led = Ledger(LEDGER_DB)
+    # issue #104: 归档前先杀 mw 侧驱动 (spawn wrapper), 与 cancel 对齐。
+    killed = _kill_spawn_bg(task_id)
     led.set_terminal(task_id, "ARCHIVED", _t("console.archive_by_user"))
     led.close()
-    return {"ok": True, "task_id": task_id,
+    return {"ok": True, "task_id": task_id, "killed_procs": killed,
             "note": _t("console.note.task_archive")}
 
 
@@ -4142,8 +4304,19 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/resume":
-                return self._send(200, api_resume(
-                    payload.get("task_id", ""), payload.get("instruction", "")))
+                # issue #104: 答复来源 (operator = 控制台人工答复; main 走
+                # CLI 路径不入这个端点)。终态卡返回 409, 路由层透传。
+                # issue #115: actor **不再取自请求体** —— 客户端自称的 actor
+                # 原样进账本三处审计面, 操作员可把答复伪造成 main, 且
+                # 「两条答复同 actor ⇒ 冲突提示互不可见」。本端点是操作员通道,
+                # 生效 actor 由服务端钉死 "operator"; 自称值只作审计留痕
+                # (actor_claimed), 不参与归属判定, 也不参与冲突比较。
+                _res = api_resume(payload.get("task_id", ""),
+                                  payload.get("instruction", ""),
+                                  actor="operator",
+                                  actor_claimed=payload.get("actor"))
+                _code = _res.pop("code", 200)
+                return self._send(_code, _res)
             if p == "/api/compose/generate":
                 return self._send(200, api_compose_generate(payload))
             if p == "/api/upload":

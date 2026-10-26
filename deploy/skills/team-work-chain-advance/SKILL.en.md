@@ -102,9 +102,12 @@ you must add a short paragraph (≥4 sentences). **No progress report = user per
 
 **Protocol patches must also land in the repo's `deploy/skills/`**: when main patches a skill
 under `/opt/data/skills/agent-matrix/` (the runtime cache layer), the same patch must be written
-into the repo's `<project>/repo/deploy/skills/<skill>/SKILL.<lang>.md` and committed + pushed —
-the runtime cache is overwritten by the next `install.sh`, so the repo copy is the source that
-actually reaches the deployment. Patching once but not twice = the protocol is still missing
+into the repo's `<project>/repo/deploy/skills/<skill>/SKILL.<lang>.md` and committed to land
+(the local commit is part of the task chain and the audit trail, so it must land) — the runtime
+cache is overwritten by the next `install.sh`, so the repo copy is the source that
+actually reaches the deployment. Push is not this skill's duty: whether to push is the user's own
+choice (the user can specify it via their own soul/skill/prompt), the skill does not do it for
+them. Patching once but not twice = the protocol is still missing
 the next time the user loads the skill.
 
 ## Pitfalls
@@ -121,14 +124,20 @@ the next time the user loads the skill.
 
 ## Fix/delivery cards claiming "pushed" must be main-side verified
 
-When a coder/reviewer claims "commit + push to origin/main succeeded", main must run the verification
-itself using the repo URL from `PROJECT-MEMORY.md` before settling:
+**Push is not an obligation this skill imposes, but once someone claims "pushed", the
+reconciliation still applies.** This skill only requires the commit to land; whether to push is
+the user's own choice (the user can specify it via their own soul/skill/prompt). Therefore:
 
-```bash
-git rev-parse HEAD                                       # local
-git ls-remote <project-remote-url> HEAD                  # remote
-# Expected: equal. MATCH → record "remote tip == HEAD, push truly landed"
-```
+- If a worker/coordinator **did** push (the user authorized it), main must run the
+  verification itself using the repo URL from `PROJECT-MEMORY.md` before settling:
+  ```bash
+  git rev-parse HEAD                                       # local
+  git ls-remote <project-remote-url> HEAD                  # remote
+  # Expected: equal. MATCH → record "remote tip == HEAD, push truly landed"
+  ```
+- If nobody claims "pushed" ⇒ this reconciliation is not needed, and push must not be
+  written into that card's acceptance criteria; a worker that only commits and does not
+  push is **correct behavior, not a defect**.
 
 Three common false positives:
 
@@ -141,7 +150,8 @@ Three common false positives:
   the local one. The remote SHA from `git ls-remote ...refs/heads/main` is the source of truth.
 - **Gitea token decode failure**: stop at the first 401/403, never retry with empty token.
 
-The push paragraph in main's progress report must contain: remote commit SHA + local SHA + repo
-owner/repo path, all three displayed verbatim with equality signs = PASS. Otherwise treat it as
-worker self-claimed but unverified; refuse settlement, resume to ask the worker to actually verify,
-or main pushes themselves.
+When someone does claim "pushed", the push paragraph in main's progress report must contain:
+remote commit SHA + local SHA + repo owner/repo path, all three displayed verbatim with
+equality signs = PASS. Otherwise treat it as worker self-claimed but unverified; refuse
+settlement, resume to ask the worker to actually verify, or let the user/coordinator push
+themselves.

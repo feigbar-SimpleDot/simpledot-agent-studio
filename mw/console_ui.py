@@ -343,8 +343,6 @@ function openCompose(){
     <div class="dlg-meta" style="margin:8px 18px 12px">⟪CONSOLE_FALLBACK_TIP_COMPOSE⟫</div>
     <div style="margin:0 18px 10px"><label class="dlg-lbl"⟪CONSOLE_FALLBACK_LBL_WORKER_NAME⟫
       <input id="cName" ⟪CONSOLE_FALLBACK_PH_REVIEWER⟫ style="width:100%"></div>
-    <div style="margin:0 18px 10px"><label class="dlg-lbl"⟪CONSOLE_FALLBACK_LBL_PORT⟫
-      <input id="cPort" ⟪CONSOLE_FALLBACK_PH_PORT⟫ style="width:100%"></div>
     <div style="margin:0 18px 10px"><label class="dlg-lbl">api_key * <span class="muted" style="font-weight:400">⟪CONSOLE_FALLBACK_LBL_API_KEY_AT_LEAST_16⟫</span></label>
       <input id="cKey" ⟪CONSOLE_FALLBACK_PH_COMPOSE_API_KEY⟫ style="width:100%"></div>
     <pre id="cOut" class="mono" style="margin:10px 18px 0;background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:12px;white-space:pre-wrap;overflow-wrap:break-word;display:none;max-height:40vh;overflow:auto"></pre>
@@ -370,7 +368,7 @@ async function dlgAAction(){
     try{
       const r=await fetch('/api/compose/generate',{method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({name:$('#cName').value.trim(),port:$('#cPort').value.trim(),api_key:$('#cKey').value.trim()})});
+        body:JSON.stringify({name:$('#cName').value.trim(),api_key:$('#cKey').value.trim()})});
       const d=await r.json();
       if(!r.ok) throw new Error(⟪CONSOLE_FALLBACK_ERR_GENERATE_FAIL_EXPR⟫);
       out.style.display='block';
@@ -423,7 +421,8 @@ function openDialog(id){
     .then(d=>{
       const f=(d&&d.task)||{};
       // 详情字段覆盖列表缓存 (list 只剩白名单; 失败则保留现值不阻断弹窗)
-      ['question','options','harvest_log','result','session_id'].forEach(k=>{
+      // issue #116: answered_by/answered_at_hhmm 一并合并, 弹窗里可见「已被 X 答复」
+      ['question','options','harvest_log','result','session_id','answered_by','answered_at_hhmm'].forEach(k=>{
         if(f[k]!==undefined) dlgTask[k]=f[k];
       });
       renderDialog();
@@ -447,6 +446,7 @@ function renderDialog(){
     ${head}
     <div class="dlg-title">${esc(t.title)}</div>
     <div class="dlg-meta"><span class="mono">${esc(t.id)}</span> · <span class="tag">${esc(t.assignee||'-')}</span> · session <span class="mono">${esc(t.session_id||'-')}</span></div>
+    ${t.answered_by?⟪CONSOLE_FALLBACK_ANSWERED_LINE_EXPR⟫:''}
     <div class="dlg-q">${esc(q)}</div>
     ${optsHtml}
     <textarea id="dlgAns" rows="4" ⟪CONSOLE_FALLBACK_PH_ANSWER⟫></textarea>
@@ -470,6 +470,14 @@ async function submitAnswer(){
       body:JSON.stringify({task_id:dlgTask.id,instruction:ans})});
     const d=await r.json();
     if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+    // issue #116: 后到答复的冲突提示 —— conflict 非空时写进提示位并保持
+    // 弹窗打开 (答复已入队, 但操作员必须看见「已被 X 答复」再自行决定),
+    // 不再静默 close() 让界面与盲注无异。
+    if(d.conflict){
+      document.getElementById('dlgErr').textContent=⟪CONSOLE_FALLBACK_CONFLICT_NOTICE_EXPR⟫;
+      btn.disabled=false; ⟪CONSOLE_FALLBACK_BTN_RESTORE_SUBMIT_EXPR⟫;
+      return;
+    }
     document.getElementById('dlg').close();
     load();
   }catch(e){
@@ -560,6 +568,8 @@ _LANG_TABLES: dict = {
         'console.fallback.all_verdicts': '>全部结算态</option>',
         'console.fallback.all_workers': '>全部 Worker</option>',
         'console.fallback.answer_continue': '💬 回答 / 续作</span>',
+        # issue #116: 弹窗「已被 X 于 HH:MM 答复」行 + 后到冲突提示位文案
+        'console.fallback.answered_line_expr': '\'<div class="dlg-meta" style="color:var(--yellow)">💬 已被 \'+esc(t.answered_by)+\' 于 \'+esc(t.answered_at_hhmm)+\' 答复</div>\'',
         'console.fallback.btn_answer': '>💬 回答/续作</button>',
         'console.fallback.btn_copy_close_expr': "$('#dlgAOk').textContent='复制并关闭';",
         'console.fallback.btn_generate_expr': "$('#dlgAOk').textContent='生成';",
@@ -580,6 +590,8 @@ _LANG_TABLES: dict = {
         'console.fallback.col_task': '<th>任务</th>',
         'console.fallback.col_time': '<th>时间</th>',
         'console.fallback.confirm_delete_expr': "'删除 worker '+name+'?'",
+        # issue #116: 后到答复冲突提示 (写进 dlgErr 提示位)
+        'console.fallback.conflict_notice_expr': "'⚠ 冲突: '+d.conflict+' (你的答复已入队, 但对方已先答复, 请确认后再操作)'",
         'console.fallback.delete': '>删除</button>',
         'console.fallback.dlg_kind_blocked': '\'<div class="dlg-kind blocked">⛔ 验收未通过, 等待裁决</div>\'',
         'console.fallback.dlg_kind_clarify': '\'<div class="dlg-kind clarify">🤖 WORKER 请求澄清</div>\'',
@@ -608,7 +620,6 @@ _LANG_TABLES: dict = {
         'console.fallback.lbl_api_models': 'API 模型别名',
         'console.fallback.lbl_api_url': '>api_url *</label>',
         'console.fallback.lbl_name_required': '>名称 *</label>',
-        'console.fallback.lbl_port': '>对外端口 *</label>',
         'console.fallback.lbl_registry': '注册表(registry.json)',
         'console.fallback.lbl_toolsets': '启用的工具集',
         'console.fallback.lbl_worker_name': '>worker 名称 *</label>',
@@ -625,9 +636,8 @@ _LANG_TABLES: dict = {
         'console.fallback.ph_answer': 'placeholder="输入你的回答 / 指令, 将以新上下文 resume 该 worker 会话..."',
         'console.fallback.ph_api_key': 'placeholder="worker gateway 的 API key"',
         'console.fallback.ph_compose_api_key': 'placeholder="给这个 worker 设一个 API key"',
-        'console.fallback.ph_port': 'placeholder="如 8644"',
         'console.fallback.ph_reviewer': 'placeholder="如 reviewer"',
-        'console.fallback.ph_url': 'placeholder="http://<host>:8643"',
+        'console.fallback.ph_url': 'placeholder="http://hermes_<name>:8642"',
         'console.fallback.refresh': 'onclick="load()">刷新</button>',
         'console.fallback.save': '>保存</button>',
         'console.fallback.search_placeholder': 'placeholder="🔍 搜索任务标题 / ID"',
@@ -675,6 +685,8 @@ _LANG_TABLES: dict = {
         'console.fallback.all_verdicts': '>All verdicts</option>',
         'console.fallback.all_workers': '>All workers</option>',
         'console.fallback.answer_continue': '💬 Answer / resume</span>',
+        # issue #116: dialog "answered by X at HH:MM" line + late-conflict notice
+        'console.fallback.answered_line_expr': '\'<div class="dlg-meta" style="color:var(--yellow)">💬 Answered by \'+esc(t.answered_by)+\' at \'+esc(t.answered_at_hhmm)+\'</div>\'',
         'console.fallback.btn_answer': '>💬 Answer/resume</button>',
         'console.fallback.btn_copy_close_expr': "$('#dlgAOk').textContent='Copy & close';",
         'console.fallback.btn_generate_expr': "$('#dlgAOk').textContent='Generate';",
@@ -695,6 +707,8 @@ _LANG_TABLES: dict = {
         'console.fallback.col_task': '<th>Task</th>',
         'console.fallback.col_time': '<th>Time</th>',
         'console.fallback.confirm_delete_expr': "'Delete worker '+name+'?'",
+        # issue #116: late-answer conflict notice (written into dlgErr)
+        'console.fallback.conflict_notice_expr': "'⚠ Conflict: '+d.conflict+' (your reply was queued, but the other side already answered — confirm before acting)'",
         'console.fallback.delete': '>Delete</button>',
         'console.fallback.dlg_kind_blocked': '\'<div class="dlg-kind blocked">⛔ Review failed, awaiting decision</div>\'',
         'console.fallback.dlg_kind_clarify': '\'<div class="dlg-kind clarify">🤖 WORKER requests clarification</div>\'',
@@ -723,7 +737,6 @@ _LANG_TABLES: dict = {
         'console.fallback.lbl_api_models': 'API model aliases',
         'console.fallback.lbl_api_url': '>api_url *</label>',
         'console.fallback.lbl_name_required': '>Name *</label>',
-        'console.fallback.lbl_port': '>External port *</label>',
         'console.fallback.lbl_registry': 'Registry (registry.json)',
         'console.fallback.lbl_toolsets': 'Enabled toolsets',
         'console.fallback.lbl_worker_name': '>Worker name *</label>',
@@ -740,9 +753,8 @@ _LANG_TABLES: dict = {
         'console.fallback.ph_answer': 'placeholder="Type your answer / instruction; the worker session resumes with fresh context..."',
         'console.fallback.ph_api_key': 'placeholder="API key of the worker gateway"',
         'console.fallback.ph_compose_api_key': 'placeholder="Set an API key for this worker"',
-        'console.fallback.ph_port': 'placeholder="e.g. 8644"',
         'console.fallback.ph_reviewer': 'placeholder="e.g. reviewer"',
-        'console.fallback.ph_url': 'placeholder="http://<host>:8643"',
+        'console.fallback.ph_url': 'placeholder="http://hermes_<name>:8642"',
         'console.fallback.refresh': 'onclick="load()">Refresh</button>',
         'console.fallback.save': '>Save</button>',
         'console.fallback.search_placeholder': 'placeholder="🔍 Search task title / ID"',

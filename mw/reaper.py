@@ -520,6 +520,53 @@ def _should_deliver(notify_task: str | None, db_path: str,
             pass
 
 
+def _relay_send_timeout_s() -> float:
+    """relay 发送线程的单次 HTTP 超时 (秒)。
+
+    2026-10-25 issue #83: 这是「退避封顶必须 >= 发送 timeout」的锚 ——
+    退避到期时若上一个线程仍阻塞在这个 timeout 里, claim_for_relay 会
+    放行 ⇒ 同一份报告多线程并发在途。默认 2400s (与 _send_to_main 里的
+    urlopen timeout 一致); env MW_RELAY_SEND_TIMEOUT_S 可覆写。
+
+    2026-10-25 默认 600 → 2400 (170 E2E 实测): gateway 的 POST /chat 全同步
+    (等 session turn lease + 跑完整回合才返回), 而 lease 等待硬编码 1800s
+    (agent/turn_facade_lease.py LEASE_WAIT_SECONDS; 生产 agent.log 实测该
+    POST 阻塞 p50=1801s / p90=1859s / max=2040s)。旧默认 600s 几乎必然先
+    超时 ⇒ 本模块误判「投递失败」走退避重投, 而服务端那份仍在排队、lease
+    释放后照常投递 (客户端超时不取消投递, 170 探针实证) ⇒ 重投撞上「第一份
+    已处理完」时 main 被同一报告叫起两遍 (#83 风暴的残余通道)。抬到
+    2400s (1800 lease + 600 turn 余量) 让首投拿到确定性 200 →
+    confirm_delivered, 误判→重投路径失去触发条件。送达延迟由 lease 决定
+    (mw 无法单方面消除), 本修复消灭的是误判失败 + 重复处理。
+    """
+    try:
+        return float(os.environ.get("MW_RELAY_SEND_TIMEOUT_S", "2400"))
+    except ValueError:
+        return 2400.0
+
+
+def _relay_backoff_cap_s() -> float:
+    """relay 失败退避的封顶 (秒) —— issue #83 B 项。
+
+    旧版封顶 300s < 发送 timeout 600s ⇒ 退避到期时上一个发送线程可能
+    仍阻塞在 600s 里, claim_for_relay 放行 ⇒ 同一份报告多个线程并发
+    在途 (实测 20 分钟内 6 条重复转发, 每条消耗 main 一个完整 turn)。
+
+    修法: 封顶默认 = 发送 timeout + 60s 余量, 保证「退避到期」永远晚于
+    「上一个发送线程返回」。env MW_RELAY_BACKOFF_CAP_S 可覆写, 但显式
+    设得比发送 timeout 小时会被抬到 timeout+1 (只允许更保守)。
+    """
+    timeout_s = _relay_send_timeout_s()
+    try:
+        cap = float(os.environ.get("MW_RELAY_BACKOFF_CAP_S", ""))
+    except ValueError:
+        cap = 0.0
+    if cap <= 0:
+        cap = timeout_s + 60.0
+    # 只允许比发送 timeout 更保守 (封顶 >= timeout+1), 否则并发窗口回来
+    return max(cap, timeout_s + 1.0)
+
+
 def _send_to_main(sid: str, msg: str, gw: str, key: str, db_path: str,
                  registry: dict | None = None,
                  notify_task: str | None = None):
@@ -536,16 +583,43 @@ def _send_to_main(sid: str, msg: str, gw: str, key: str, db_path: str,
     若其间被 kill reaper / archive 操作静音, 主动回滚 last_notified_at
     让下一次事件重新派发。这条边检修"标后被静音"这条 race window。
 
-    退避逻辑 (2026-10-02 qq-login 实测, 保留):
+    退避逻辑 (2026-10-02 qq-login 实测, 封顶口径 2026-10-25 issue #83 B 项更新):
       1) 失败不立刻清 NULL, 而是 +1 notify_attempts 并设 notify_dead_until
-         = now + 30s * 2^attempts (指数退避, max 300s = 5min)
+         = now + 30s * 2^attempts (指数退避, 封顶 RELAY_BACKOFF_CAP_S,
+         默认 660s —— 旧版 300s 已被 #83 抬升, 见下方 B 项)
       2) 超过 8 次还失败 → 通知"死信", 永远不再尝试
       3) 退避期内 should_notify 直接返回 False
+
+    2026-10-25 issue #83 A 案 + issue #103 (投递层去重 + 失败留痕):
+      1) **POST 前二次核状态** (A 案核心): 发送线程真正 POST 之前重读
+         该卡 —— confirmed_at 已非 NULL (并发的另一个线程赢了) 或 run
+         已非 ACTIVE ⇒ 直接放弃不 POST。旧版只靠 claim_for_relay 的
+         原子占位, 但失败退避封顶 300s < 发送 timeout 600s ⇒ 退避到期
+         时上一个线程可能仍阻塞在 600s 里, claim_for_relay 会放行 ⇒
+         同一份报告多个线程并发在途 (实测: 20 分钟内 6 条重复转发)。
+      2) **退避封顶 >= 发送 timeout** (B 项): 300s → RELAY_BACKOFF_CAP_S
+         (默认 660s > timeout 600s), 保证「退避到期」永远晚于「上一个
+         发送线程返回」。
+      3) **失败不再清 last_notified_at=NULL** (B 项): 失败路径保持
+         last_notified_at 置位 (在途态覆盖整个在途窗口), 让 claim_for_relay
+         在 inflight_s 内不再放行第二个线程。旧版清 NULL 是「重试并发
+         窗口」的直接成因。
+      4) **失败留痕** (issue #103): notify_last_failed_at / notify_last_error
+         两列 + relay.notify_failed 事件, 让账本看得出「失败过、什么时候
+         失败、为什么失败」。
     """
     import urllib.request
     # 入口闸门: 只查 notify_dead_until (死信退避), 不再查 last_notified_at
     # (120s 闸门已废, relay 去重由 notify_confirmed_at 承担 — confirmed_at
     #  非 NULL 表示已确认送达, relay 扫描 WHERE confirmed_at IS NULL)
+    #
+    # 2026-10-25 issue #83: 发送权 (单飞) 的 claim 下沉到**发送层** ——
+    # 在起线程之前原子抢 relay 发送权 (claim_for_relay)。旧版 claim 在
+    # 扫描层 (relay 扫描 → claim → 起线程), 扫描层与发送层之间隔着一次
+    # 函数调用, 且失败路径会清 last_notified_at ⇒ 退避到期时第二个线程
+    # 抢到发送权, 而第一个线程可能仍阻塞在 600s 的 POST 里 ⇒ 同一份报告
+    # 多个线程并发在途。发送层 claim 把「同一 task 至多一个在途投递」
+    # 收成一条原子 UPDATE。
     if notify_task:
         try:
             led = Ledger(db_path)
@@ -555,9 +629,21 @@ def _send_to_main(sid: str, msg: str, gw: str, key: str, db_path: str,
                     "WHERE task_id=?", (notify_task,)).fetchone()
                 if dead_row and dead_row["notify_dead_until"] and \
                    time.time() < dead_row["notify_dead_until"]:
+                    led.close()
                     return False  # 死信退避期, 不投递
+                # 原子抢发送权 (单飞): 抢不到 = 已有在途投递, 不重复发。
+                # 2026-10-25: inflight 窗口与发送 timeout 同源 (+60)。旧默认
+                # 660s < 发送 timeout 2400s ⇒ 第一个线程还阻塞在 POST 里
+                # claim 就放行第二线程, 正是 #83 并发在途的复发窗口。
+                claimed = led.claim_for_relay(
+                    notify_task, inflight_s=_relay_send_timeout_s() + 60.0)
             finally:
-                led.close()
+                try:
+                    led.close()
+                except Exception:
+                    pass
+            if not claimed:
+                return False  # 已有在途投递, 不重复发
         except Exception:
             pass  # 闸门失败兜底放行, 让实际 POST 自验
 
@@ -569,8 +655,38 @@ def _send_to_main(sid: str, msg: str, gw: str, key: str, db_path: str,
 
     def _send(rq=req, t=notify_task):
         sent_ok = False
+        # ── issue #83 A 案: POST 前二次核状态 ──────────────────────
+        # 真正 POST 之前重读该卡: confirmed_at 非 NULL (并发的另一个
+        # 线程赢了) / 卡已终态 / run 已非 ACTIVE ⇒ 直接放弃不 POST。
+        # 这一步是「同一份报告多个线程并发在途」的直接止血点。
+        if t:
+            try:
+                led = Ledger(db_path)
+                try:
+                    _chk = led.relay_precheck(t)
+                finally:
+                    led.close()
+                if not _chk.get("go"):
+                    try:
+                        led2 = Ledger(db_path)
+                        try:
+                            led2.emit_event("relay.skipped", t, {
+                                "reason": _chk.get("reason"),
+                                "phase": "pre_post",
+                            })
+                        finally:
+                            led2.close()
+                    except Exception:
+                        pass
+                    return  # 放弃投递, 不 POST
+            except Exception:
+                pass  # 闸门失败兜底放行, 让实际 POST 自验
         try:
-            with urllib.request.urlopen(rq, timeout=600) as r:
+            # s6fix P2-1: 发送 timeout 与退避封顶同源 (_relay_send_timeout_s),
+            # 消除「env 调小 MW_RELAY_SEND_TIMEOUT_S 但 socket 仍 600s」对
+            # 「封顶 >= 发送 timeout」不变量的静默击穿。
+            with urllib.request.urlopen(
+                    rq, timeout=_relay_send_timeout_s()) as r:
                 # 二次 edge check (2026-10-04): 收到响应后再核 should_notify
                 # 若其间被静音 (kill reaper / archive / close_team_work),
                 # 回滚 last_notified_at 让下一次 fsnotify 重派
@@ -646,25 +762,31 @@ def _send_to_main(sid: str, msg: str, gw: str, key: str, db_path: str,
                             "WHERE task_id=?", (t,)).fetchone()
                         attempts = (cur["notify_attempts"] if cur else 0) + 1
                         if attempts >= 8:
-                            led.conn.execute(
-                                "UPDATE harvest_contracts SET notify_attempts=?, "
-                                "last_notified_at=?, notify_dead_until=? "
-                                "WHERE task_id=?",
-                                (attempts, time.time(),
-                                 time.time() + 86400 * 365, t))
+                            # 死信: 保留 last_notified_at 置位 (永不再投)。
+                            # issue #103: 失败留痕 —— 失败时刻 + 失败原因
+                            # 落两列, 账本看得出「失败过、什么时候、为什么」。
+                            led.record_notify_failure(
+                                t, str(e), attempts,
+                                time.time() + 86400 * 365,
+                                last_notified_at=time.time())
                         else:
-                            backoff_s = min(30 * (2 ** (attempts - 1)), 300)
-                            # 清 last_notified_at: claim_for_relay 在起线程前
-                            # 已置位, 发送失败必须回滚 NULL, 否则退避期过后
-                            # relay 扫描 (WHERE last_notified_at IS NULL) 再也
-                            # 扫不到这行, 报告永久丢失。死信分支 (>=8) 保留
-                            # 置位是故意的 (永不再投)。
-                            led.conn.execute(
-                                "UPDATE harvest_contracts SET notify_attempts=?, "
-                                "notify_dead_until=?, last_notified_at=NULL "
-                                "WHERE task_id=?",
-                                (attempts, time.time() + backoff_s, t))
-                        led.conn.commit()
+                            # issue #83 B 项: 退避封顶提到 >= 发送 timeout
+                            # (默认 660s > 600s), 保证「退避到期」永远晚于
+                            # 「上一个发送线程返回」, 不给并发在途留窗口。
+                            backoff_s = min(30 * (2 ** (attempts - 1)),
+                                            _relay_backoff_cap_s())
+                            # issue #83 B 项: 失败路径**不再**清
+                            # last_notified_at —— 保持置位, 让 claim_for_relay
+                            # 在 inflight_s 窗口内不再放行第二个线程。
+                            # 旧版清 NULL 是「退避到期时上一个线程仍在
+                            # 600s 阻塞 → claim 放行 → 多线程并发在途」的
+                            # 直接成因 (实测 20 分钟 6 条重复转发)。
+                            # 报告重投由 notify_dead_until 退避 + inflight_s
+                            # 超时兜底保证, 不靠清 NULL。
+                            led.record_notify_failure(
+                                t, str(e), attempts,
+                                time.time() + backoff_s,
+                                last_notified_at=time.time())
                     finally:
                         led.close()
                 except Exception:
@@ -745,14 +867,10 @@ def _notify_main_of_reports(ledger, results, registry: dict | None = None):
             report = json.loads(row["worker_report"])
         except (json.JSONDecodeError, TypeError):
             continue
-        # ★ 起发送线程前原子抢发送权 (claim_for_relay)。抢不到说明
-        # 已有别的轮次/fsnotify 线程在发同一份报告, 直接跳过, 杜绝
-        # 重复起线程堆满 gateway run 上限 (429 雪崩根因)。
-        if not ledger.claim_for_relay(tid):
-            results.append({"task_id": tid, "trigger": "relay",
-                           "verdict": "SUPPRESSED",
-                           "note": "已被其他轮次/线程 claim, 不重复发"})
-            continue
+        # 发送权 (单飞) 已下沉到发送层 _send_to_main (issue #83, 2026-10-25):
+        # 起线程前原子 claim_for_relay。扫描层不再抢 claim —— 双层 claim
+        # 会让发送层永远抢不到 (扫描刚置 last_notified_at, 发送层再 claim
+        # 必失败), 报告永远投不出去。
         verdict = report.get("verdict", row["harvest_status"])
         msg = (f"【mw 报告转发】任务 {tid} 结算落账: verdict={verdict}。"
                f" 产物目录: {report.get('product_workspace') or '(见 ledger)'}。"
@@ -1447,6 +1565,245 @@ def _notify_null_slot(ledger, active_run, results, registry=None,
                        "verdict": "ERROR", "error": str(e)[:150]})
 
 
+def _notify_undelivered_harvest(ledger, active_run, results, registry=None,
+                                stuck_after_min=30, base="."):
+    """F4 补档 (2026-10-25 issue #103): 「已收割未送达 main」空窗敲门。
+
+    形状: run ACTIVE + current_card_id=NULL (槽位空) + 名下存在
+    HARVESTED 且 notify_confirmed_at IS NULL 的卡 + 闲置 > stuck 窗口。
+
+    为什么原 F4 覆盖不到 (issue #103 实案 t_dc11c891):
+      原 F4 的锚点是「run 派发/等待」—— 名下有未结算卡 (PENDING/ERROR/
+      BLOCKED) 才敲。而「已收割未送达」的卡既不未结算 (HARVESTED), 槽位
+      又已清空 (结算时清槽), 原 F4 直接 return ⇒ 8 次投递全失败后 main
+      侧 23+ 分钟零信号, 靠人工追问才发现交付已落袋。
+
+    去重: 复用 run 级 last_null_slot_knock_at (同一窗口至多敲一次),
+    避免与原 F4 互相刷屏。
+    """
+    if not active_run:
+        return
+    if active_run.get("current_card_id") is not None:
+        return  # 有当前卡, 走正常结算/stuck 路径
+    run_id = active_run["run_id"]
+    # 「已收割未送达」候选卡
+    try:
+        undelivered = ledger.harvested_undelivered(run_id)
+    except Exception:
+        return
+    if not undelivered:
+        return  # 名下没有已收割未送达卡 = 不是这个空窗
+    threshold = stuck_after_min * 60
+    now = time.time()
+    last_knock = active_run.get("last_null_slot_knock_at")
+    if last_knock and (now - last_knock) < threshold:
+        return  # 本窗口已敲过 (与原 F4 共用去重戳)
+    # 闲置基准: 这些卡最后一次有动静的时刻 (结算/投递尝试) —— 用最早
+    # 的那个, 保证「最久没送达的那张」决定闲置时长。
+    stamps = []
+    for r in undelivered:
+        for col in ("notify_last_failed_at", "last_notified_at",
+                    "last_progress_at", "updated_at"):
+            v = _row_get(r, col)
+            if v:
+                stamps.append(float(v))
+    if not stamps:
+        return
+    idle = now - min(stamps)
+    if idle <= threshold:
+        return  # 还在 stuck 窗口内, 不敲
+    ids = ", ".join(r["task_id"] for r in undelivered[:5])
+    n = len(undelivered)
+    # 投递失败留痕信息 (issue #103): 让敲门文案带上失败次数/原因, main
+    # 一眼看出「不是没收到, 是投递一直失败」。
+    detail = ""
+    try:
+        r0 = undelivered[0]
+        att = _row_get(r0, "notify_attempts") or 0
+        err = (_row_get(r0, "notify_last_error") or "")[:80]
+        detail = f" (relay 投递已失败 {att} 次" + (f": {err}" if err else "") + ")"
+    except Exception:
+        pass
+    sid = ledger.get_initiator(undelivered[0]["task_id"])
+    if not sid:
+        return
+    gw = os.environ.get("MW_GATEWAY_URL", "http://127.0.0.1:8642")
+    key = os.environ.get("API_SERVER_KEY", "")
+    if not key:
+        return
+    mins = round(idle / 60, 1)
+    msg = (f"【mw 兜底敲门】run {run_id[:12]} 有 {n} 张已结算卡未送达 main"
+           f"{detail}。闲置 {mins} 分钟。卡: {ids}。"
+           f" 请 GET /api/tasks 读报告后裁决, 或确认已处理。")
+    try:
+        ledger.conn.execute(
+            "UPDATE team_work_runs SET last_null_slot_knock_at=? "
+            "WHERE run_id=?", (now, run_id))
+        ledger.conn.commit()
+        _send_to_main(sid, msg, gw, key, ledger.path,
+                     registry=registry, notify_task=None)
+        ledger.emit_event("team_work.undelivered_knock", run_id,
+                         {"idle_minutes": mins, "cards": ids, "count": n})
+        results.append({"task_id": run_id, "trigger": "undelivered_knock",
+                        "verdict": "NOTIFIED"})
+    except Exception as e:
+        results.append({"task_id": run_id, "trigger": "undelivered_knock",
+                        "verdict": "ERROR", "error": str(e)[:150]})
+
+
+# ── issue #114: 终态卡新产出告警 (post-terminal output alert) ──────
+# #104 期望 3 后半句: 「reaper 检测到终态卡新产出 (commit/文件写) 时
+# 告警 main」。终态卡 (HARVESTED/CANCELLED/ARCHIVED) 结算后本应静默,
+# 若其工作区在结算之后仍出现新写入 (含 git commit/checkout —— 它们都会
+# 刷新工作树文件与 .git/index 的 mtime), 说明存在「无主施工」残留:
+# 已交卷的 worker 还在动盘, 或有人拿终态卡的身份继续改代码。P1-1
+# 执行点守卫已掐断主要注入通道, 本检测是纵深防御的补哨。
+#
+# 口径 (issue #114 卡面):
+#   - 窗口: MW_REAPER_POST_TERMINAL_WINDOW_MIN, 默认 30 分钟; 只盯
+#     结算(updated_at)落在窗口内的终态卡, 老账不翻。
+#   - 宽限: MW_REAPER_POST_TERMINAL_GRACE_S, 默认 120s; 结算过程自身
+#     会写 transcript/报告, mtime 落在结算+宽限内不算新产出 (防误报)。
+#   - 每 task 只告警一次: 以 mw_events 里已落的 worker.state
+#     (reason=post_terminal_output) 事件为去重戳, 不新增列。
+#   - 开关: MW_REAPER_POST_TERMINAL_ALERT, 默认开; 显式 0/false/off/no 关。
+#   - 检测失败静默跳过: 整段 try/except, 任何异常只落一条 SKIP 结果,
+#     绝不影响 reap_once 其余步骤。
+#   - 扫描有界: 跳过 .git/node_modules/venv 等重目录, 最多扫
+#     MW_REAPER_POST_TERMINAL_SCAN_MAX (默认 5000) 个文件, 命中即停。
+
+
+def _post_terminal_alert_enabled() -> bool:
+    """开关: 默认开, 显式 0/false/off/no 才关 (与 MW_* 惯例一致)。"""
+    return os.environ.get("MW_REAPER_POST_TERMINAL_ALERT", "1").lower() \
+        not in ("0", "false", "off", "no")
+
+
+def _post_terminal_window_s() -> float:
+    """检测窗口 (分钟→秒), 默认 30; 非法值回退默认。"""
+    try:
+        return float(os.environ.get("MW_REAPER_POST_TERMINAL_WINDOW_MIN", "30")) * 60.0
+    except (TypeError, ValueError):
+        return 30.0 * 60.0
+
+
+def _post_terminal_grace_s() -> float:
+    """结算自身写盘的宽限期 (秒), 默认 120; 非法值回退默认。"""
+    try:
+        return float(os.environ.get("MW_REAPER_POST_TERMINAL_GRACE_S", "120"))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _find_new_output(root: Path, after_ts: float, cap: int) -> "tuple[str, float] | None":
+    """有界扫描: 返回 root 树下 mtime > after_ts 的第一个 (路径, mtime)。
+
+    跳过重目录 (.git 自身不扫, 但其 mtime 变化经父目录可见; 工作树
+    文件被 git checkout/commit 触碰时 mtime 必然刷新, 故一次遍历同时
+    覆盖「文件写」与「git 活动」两种新产出形态)。cap 限制 stat 次数,
+    命中即停 —— 巡检路径绝不允许在大仓上无界遍历。
+    """
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                      if d not in (".git", "node_modules", "__pycache__",
+                                  ".venv", "venv")]
+        for fn in filenames:
+            n += 1
+            if n > cap:
+                return None
+            try:
+                m = os.stat(os.path.join(dirpath, fn)).st_mtime
+            except OSError:
+                continue  # 竞态删除/权限: 跳过该文件, 不算失败
+            if m > after_ts:
+                return (os.path.join(dirpath, fn), m)
+    return None
+
+
+def _notify_post_terminal_output(ledger, active_run, results, registry=None,
+                               window_s=None, base="."):
+    """issue #114: 终态卡结算后工作区仍有新产出 ⇒ 告警 main, 每 task 一次。
+
+    形状: harvest_status ∈ 真终态三态 + updated_at 落在检测窗口内 +
+    task_sessions.workspace 存在 mtime > updated_at+宽限 的文件。
+    告警 = emit worker.state(reason=post_terminal_output) + _send_to_main;
+    事件本身即去重戳, 下轮扫到同一 task 直接 SKIP。
+    """
+    if not _post_terminal_alert_enabled():
+        return
+    if window_s is None:
+        window_s = _post_terminal_window_s()
+    grace = _post_terminal_grace_s()
+    now = time.time()
+    try:
+        rows = ledger.conn.execute(
+            "SELECT task_id, harvest_status, updated_at FROM harvest_contracts "
+            "WHERE harvest_status IN ('HARVESTED','CANCELLED','ARCHIVED') "
+            "AND updated_at >= ? ORDER BY updated_at DESC LIMIT 20",
+            (now - window_s,)).fetchall()
+    except Exception as e:
+        results.append({"task_id": "_meta", "trigger": "post_terminal_output",
+                       "verdict": "SKIP", "note": f"query failed: {str(e)[:120]}"})
+        return
+    for r in rows:
+        tid = r["task_id"]
+        settled = float(r["updated_at"])
+        try:
+            # 去重: 本 task 已告警过 (worker.state 事件带 post_terminal_output)
+            dup = ledger.conn.execute(
+                "SELECT 1 FROM mw_events WHERE event_type='worker.state' "
+                "AND task_id=? AND payload LIKE '%post_terminal_output%' LIMIT 1",
+                (tid,)).fetchone()
+            if dup:
+                results.append({"task_id": tid, "trigger": "post_terminal_output",
+                              "verdict": "SKIP",
+                              "note": "已告警过 (worker.state 去重戳), 不重复"})
+                continue
+            sess = ledger.get_session(tid)
+            ws = _row_get(sess, "workspace")
+            if not ws:
+                continue  # 无工作区记录, 无从检测
+            root = Path(ws)
+            if not root.is_dir():
+                continue
+            hit = _find_new_output(root, settled + grace,
+                                  int(os.environ.get(
+                                      "MW_REAPER_POST_TERMINAL_SCAN_MAX", "5000")))
+            if not hit:
+                continue
+            path, m = hit
+            mins = round((m - settled) / 60, 1)
+            # 先落事件 (去重戳), 再敲门 —— 顺序保证: 即便投递失败,
+            # 也不会每 15s 重复刷屏; 漏报风险由事件留痕兜底可查。
+            ledger.emit_event("worker.state", tid, {
+                "from": r["harvest_status"], "to": r["harvest_status"],
+                "actor": "reaper",
+                "reason": "post_terminal_output",
+                "post_terminal_file": path,
+                "post_terminal_mtime": m,
+                "settled_at": settled,
+                "minutes_after_settled": mins,
+            })
+            sid = ledger.get_initiator(tid)
+            gw = os.environ.get("MW_GATEWAY_URL", "http://127.0.0.1:8642")
+            key = os.environ.get("API_SERVER_KEY", "")
+            if sid and key:
+                msg = (f"【mw 终态卡新产出告警】task {tid} 已结算"
+                       f"({r['harvest_status']}), 但结算后 {mins} 分钟其工作区"
+                       f"仍有新产出: {path}。可能是已交卷 worker 仍在动盘 "
+                       f"(无主施工残留), 请核查该卡是否被继续施工。")
+                _send_to_main(sid, msg, gw, key, ledger.path,
+                             registry=registry, notify_task=None)
+            results.append({"task_id": tid, "trigger": "post_terminal_output",
+                          "verdict": "NOTIFIED",
+                          "note": f"{path} mtime=+{mins}min"})
+        except Exception as e:
+            # 检测失败静默跳过 (卡面铁律): 单卡异常不阻断其余卡与主流程
+            results.append({"task_id": tid, "trigger": "post_terminal_output",
+                          "verdict": "SKIP", "note": str(e)[:120]})
+
+
 def reap_once(*, ledger: Ledger, hermes_home: str, base: str,
              grace_seconds: int = 120, registry: dict | None = None) -> list[dict]:
     """扫一轮 ACTIVE team work 下的 PENDING 契约, 对可结算的触发 harvest。
@@ -1555,6 +1912,27 @@ def reap_once(*, ledger: Ledger, hermes_home: str, base: str,
     except Exception as e:
         results.append({"task_id": "_meta", "trigger": "null_slot_knock",
                        "verdict": "ERROR", "error": str(e)[:200]})
+    # 3.6) F4 补档 (2026-10-25 issue #103): 「已收割未送达 main」空窗
+    # 敲门。原 F4 锚在「名下有未结算卡」, 收割后槽清空的卡不在其中 ⇒
+    # 投递全失败时 main 侧零信号 (issue #103 实案 23+ 分钟)。放在原 F4
+    # 之后: 两者共用 last_null_slot_knock_at 去重戳, 同窗口至多敲一次。
+    try:
+        _notify_undelivered_harvest(ledger, active_run, results,
+                                    registry=registry,
+                                    stuck_after_min=stuck_after_min, base=base)
+    except Exception as e:
+        results.append({"task_id": "_meta", "trigger": "undelivered_knock",
+                       "verdict": "ERROR", "error": str(e)[:200]})
+    # 3.7) issue #114: 终态卡新产出告警 —— 已结算 (终态) 的卡在工作区
+    # 仍有结算后的新文件写入/git 活动时, 敲一次 main (每 task 只一次,
+    # 事件即去重戳)。开关 MW_REAPER_POST_TERMINAL_ALERT 默认开, 检测
+    # 失败静默跳过, 不影响后续步骤。
+    try:
+        _notify_post_terminal_output(ledger, active_run, results,
+                                     registry=registry, base=base)
+    except Exception as e:
+        results.append({"task_id": "_meta", "trigger": "post_terminal_output",
+                        "verdict": "ERROR", "error": str(e)[:200]})
     # 4) resume 请求消费 (main→worker 续作通道)
     from .pipeline import resume_task
     max_resumes_per_round = int(os.environ.get("MW_REAPER_MAX_RESUMES", 10))
@@ -1563,14 +1941,42 @@ def reap_once(*, ledger: Ledger, hermes_home: str, base: str,
         req = ledger.claim_pending_resume()
         if not req:
             break
+        # s6fix P1-1 (issue #104 根因 4 执行点收口): 消费前终态守卫 ——
+        # 「答复入队 → 卡被归档/收割 → reaper 消费」的时间差里, 队列里
+        # 的旧答复不得再注入 worker session 唤醒 (无主施工注入形态)。
+        # 命中走正规 finish_resume 收口 (不留 PROCESSING 孤儿行), 并落
+        # worker.state 痕迹让「为什么没注入」可追溯。
+        if ledger.is_terminal(req["task_id"]):
+            try:
+                ledger.emit_event("worker.state", req["task_id"], {
+                    "from": "", "to": "", "actor": "resume",
+                    "reason": "resume 拒绝执行: card terminal (消费点守卫)",
+                    "resume_rejected": "terminal",
+                })
+            except Exception:
+                pass  # 痕迹失败不阻断拒绝
+            ledger.finish_resume(req["id"], ok=False,
+                                 error="terminal card")
+            results.append({"task_id": req["task_id"], "trigger": "resume",
+                            "verdict": "RESUME_REFUSED",
+                            "note": "terminal card"})
+            continue
         try:
             r = resume_task(req["task_id"], ledger=ledger,
                            hermes_home=hermes_home,
                            instruction=req["instruction"],
-                           timeout=resume_timeout)
+                           timeout=resume_timeout,
+                           # issue #104: 答复来源随请求行带下来 (main /
+                           # operator), 让状态回拨痕迹带上「谁答的」。
+                           resume_actor=(req["actor"] if "actor" in req.keys()
+                                         else "main"))
             ledger.finish_resume(req["id"], ok=bool(r.get("ok")),
                                 result={"ok": r.get("ok"),
                                         "task_id": req["task_id"],
+                                        "actor": (req["actor"]
+                                                  if "actor" in req.keys()
+                                                  else None),
+                                        "state_reset": r.get("state_reset"),
                                         "resumed_same_session": r.get("resumed_same_session"),
                                         "harvest_verdict": (r.get("harvest") or {}).get("verdict")})
             results.append({"task_id": req["task_id"], "trigger": "resume",

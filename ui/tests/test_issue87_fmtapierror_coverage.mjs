@@ -60,7 +60,7 @@ function assert(c, m) { if (!c) throw new Error(m) }
 test('S2-a WorkersView 无裸 e.message||e 残留 (issue #84 全覆盖口径)', () => {
   assert(RW === 0, `期望 0, 实际 ${RW}`)
 })
-test('S2-b TasksBoardView 残留恰为 2 (B 批裁决保留的 fail-soft: [1402,1413])', () => {
+test('S2-b TasksBoardView 残留恰为 2 (B 批裁决保留的 fail-soft: [1410,1421])', () => {
   assert(RB === 2, `期望 2, 实际 ${RB}`)
 })
 test('S2-c 调用点合计 >= 13 (issue #87 原文阈值)', () => {
@@ -124,9 +124,10 @@ test('S2-h 两计数器注释排除口径对称 (issue #92, 示例注释不再�
   ].join('\n')
   assert(countResidual(synth) === 1, `残留应计 1, 实际 ${countResidual(synth)}`)
   assert(countCalls(synth) === 1, `调用点应计 1, 实际 ${countCalls(synth)}`)
-  // 现网两残留锚 [1402,1413] 复核非注释形态 (#92 要求同步核对): 剥注释后仍在 ⇒ 非注释
+  // 现网两残留锚 [1410,1421] 复核非注释形态 (#92 要求同步核对; #116 在
+  // 文件前部插入 8 行角标 JSX, 锚随漂移): 剥注释后仍在 ⇒ 非注释
   const boardLines = board.split('\n')
-  for (const ln of [1402, 1413])
+  for (const ln of [1410, 1421])
     assert(RESIDUAL.test(squash(stripLineComments(board)[ln - 1])),
       `锚 :${ln} 剥注释后不再是残留 ⇒ 该行号断言需更新 (现 ${JSON.stringify(boardLines[ln - 1].trim().slice(0, 60))})`)
 })

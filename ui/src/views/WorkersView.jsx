@@ -429,7 +429,7 @@ export default function WorkersView({ onChanged, onChat }) {
     try {
       const f = dlg.f || {}
       const d = await api.genCompose({
-        name: (f.name || '').trim(), port: (f.port || '').trim(), api_key: (f.api_key || '').trim(),
+        name: (f.name || '').trim(), api_key: (f.api_key || '').trim(),
       })
       setDlg((d2) => ({ ...d2, yaml: d.yaml, steps: d.next_steps }))
       navigator.clipboard?.writeText(d.yaml).catch(() => {})
@@ -586,7 +586,7 @@ export default function WorkersView({ onChanged, onChat }) {
             </div>
             <div>
               <label className="label">{t('workers.field.api_url')} *</label>
-              <input className="input" placeholder="http://<host>:8643"
+              <input className="input" placeholder="http://hermes_<name>:8642"
                 defaultValue={dlg.f.api_url || ''}
                 onChange={(e) => setDlg((d) => ({ ...d, f: { ...d.f, api_url: e.target.value } }))} />
               <div className="hint">{t('workers.field.api_url_hint')}</div>
@@ -637,16 +637,11 @@ export default function WorkersView({ onChanged, onChat }) {
         {dlg?.mode === 'compose' && (
           <div className="px-5 py-3 space-y-3.5">
             <p className="hint !mt-0">{t('workers.compose_subtitle')}</p>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label className="label">{t('workers.field.name')} *</label>
                 <input className="input" placeholder="e.g. reviewer"
                   onChange={(e) => setDlg((d) => ({ ...d, f: { ...d.f, name: e.target.value } }))} />
-              </div>
-              <div>
-                <label className="label">{t('workers.compose_port_label')} *</label>
-                <input className="input" placeholder="e.g. 8644"
-                  onChange={(e) => setDlg((d) => ({ ...d, f: { ...d.f, port: e.target.value } }))} />
               </div>
               <div>
                 <label className="label">{t('workers.field.api_key')} *</label>

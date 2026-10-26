@@ -61,7 +61,13 @@ CREATE TABLE IF NOT EXISTS harvest_contracts (
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
     worker_report   TEXT,
-    seq             INTEGER
+    seq             INTEGER,
+    -- 2026-10-25 issue #103: relay 投递失败留痕 —— 最后一次失败的
+    -- 时刻与失败原因。notify_attempts 只是一个计数, 配 notify_dead_until
+    -- 看不出「什么时候开始坏的」; 这两列让账本直接回答「失败过没有、
+    -- 什么时候失败、为什么失败」(issue #103 期望: 过程有痕)。
+    notify_last_failed_at REAL,
+    notify_last_error    TEXT
 );CREATE TABLE IF NOT EXISTS mw_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type  TEXT NOT NULL,
@@ -97,7 +103,12 @@ CREATE TABLE IF NOT EXISTS task_resume_requests (
     requested_at REAL NOT NULL,
     finished_at  REAL,
     result_json  TEXT,
-    error        TEXT
+    error        TEXT,
+    -- 2026-10-25 issue #104: 答复来源 (main / operator)。加这列前
+    -- 「谁答的」在账本上完全不可见 —— main 走 CLI 入队、操作员走
+    -- console 注入, 两条通道的行长得一模一样, 事后审计只能去翻
+    -- worker session transcript。actor 让双通道互相可读。
+    actor        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_resume_pending
     ON task_resume_requests(status, requested_at);
@@ -175,6 +186,17 @@ class Ledger:
                 self.conn.execute(
                     "ALTER TABLE harvest_contracts "
                     "ADD COLUMN notify_dead_until REAL")
+            # 2026-10-25 issue #103: relay 投递失败留痕两列 ——
+            # 最后失败时刻 + 最后失败原因。旧库自动迁移 (纯加列,
+            # PRAGMA table_info 检查后再 ADD, 迁移幂等)。
+            if "notify_last_failed_at" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE harvest_contracts "
+                    "ADD COLUMN notify_last_failed_at REAL")
+            if "notify_last_error" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE harvest_contracts "
+                    "ADD COLUMN notify_last_error TEXT")
             # 2026-10-03 反向校验通道: task_sessions 加 4 列,reaper 每轮
             # 从 ~/.hermes/state.db 读 session 真实状态后回灌。纯加列,
             # 旧 db 迁移幂等 (PRAGMA table_info 检查后再 ADD)。
@@ -196,6 +218,15 @@ class Ledger:
                 self.conn.execute(
                     "ALTER TABLE task_sessions "
                     "ADD COLUMN session_health_check_at REAL")
+            # 2026-10-25 issue #104: task_resume_requests 加 actor 列 ——
+            # 区分「main 走 CLI 答复」与「操作员走 console 答复」。
+            # 纯加列, 旧库自动迁移 (PRAGMA 检查后再 ADD, 幂等)。
+            trr_cols = [r["name"] for r in self.conn.execute(
+                "PRAGMA table_info(task_resume_requests)").fetchall()]
+            if "actor" not in trr_cols:
+                self.conn.execute(
+                    "ALTER TABLE task_resume_requests "
+                    "ADD COLUMN actor TEXT")
             # 2026-10-03 Team Work 顶层对象化:harvest_contracts 加
             # team_work_run_id 列(可选 NULL;legacy 旧数据不带 run_id,reaper
             # 见到 NULL 直接 SKIP)。迁移幂等:PRAGMA table_info 检查后再 ADD。
@@ -858,10 +889,11 @@ class Ledger:
             except Exception:
                 pass  # run 关联缺失不阻塞状态落库
         try:
-            self.emit_event("worker.state", task_id, {
+            payload = {
                 "from": old, "to": new_status,
                 "actor": actor, "reason": reason,
-            })
+            }
+            self.emit_event("worker.state", task_id, payload)
         except Exception:
             pass  # 事件失败不阻断状态落库
         return new_status
@@ -935,9 +967,10 @@ class Ledger:
         后续轮次扫到「等待确认」直接跳过, 杜绝重复起线程。
 
         inflight_s 兜底进程崩溃: 若发送线程被 kill (reaper 重启) 没来得及
-        confirm 也没 rollback, 超过 inflight_s (略大于发送 timeout=600s) 后
-        视为失败, 允许重新 claim。发送失败由 _send_to_main rollback 立即清
-        last_notified_at=NULL 回到待发送, 不等 inflight_s。
+        confirm 也没 rollback, 超过 inflight_s (略大于发送 timeout) 后
+        视为失败, 允许重新 claim。发送失败保持 last_notified_at 置位
+        (2026-10-25 issue #83 B 项: 旧版立即清 NULL 是「重试并发窗口」的
+        直接成因, 已改), 由退避封顶 RELAY_BACKOFF_CAP_S 决定何时重试。
         """
         now = time.time()
         cur = self.conn.execute(
@@ -957,9 +990,58 @@ class Ledger:
         """
         self.conn.execute(
             "UPDATE harvest_contracts SET notify_confirmed_at=?, "
-            "notify_attempts=0, notify_dead_until=NULL WHERE task_id=?",
+            "notify_attempts=0, notify_dead_until=NULL, "
+            "notify_last_failed_at=NULL, notify_last_error=NULL "
+            "WHERE task_id=?",
             (time.time(), task_id))
         self.conn.commit()
+
+    def relay_precheck(self, task_id: str) -> dict:
+        """投递前二次核状态 (issue #83 A 案 / issue #103)。
+
+        _send_to_main 的发送线程在真正 POST 之前调用本方法重读该卡:
+          - notify_confirmed_at 非 NULL → 已被别的线程确认送达, 放弃;
+          - 卡已终态 (ARCHIVED/CANCELLED) → 放弃。HARVESTED 不拦 ——
+            「已收割未送达」的卡 (issue #103 F4 补档) 正是 relay 的投递
+            对象, 拦了空窗报告就永远投不出去 (s6fix P2-3: 旧 doc 误列
+            HARVESTED, 以实现为准);
+          - run 已非 ACTIVE → 放弃 (F7 语义, close 后不再投)。
+
+        返回 {"go": bool, "reason": str}。go=False 时发送线程直接放弃,
+        不 POST —— 这从根上消灭「同一份报告多个线程并发在途」。
+        """
+        row = self.conn.execute(
+            "SELECT hc.harvest_status, hc.notify_confirmed_at, "
+            "hc.team_work_run_id, twr.status AS run_status "
+            "FROM harvest_contracts hc "
+            "LEFT JOIN team_work_runs twr ON hc.team_work_run_id = twr.run_id "
+            "WHERE hc.task_id=?", (task_id,)).fetchone()
+        if row is None:
+            return {"go": False, "reason": "no_contract"}
+        if row["notify_confirmed_at"] is not None:
+            return {"go": False, "reason": "already_confirmed"}
+        if row["harvest_status"] in ("ARCHIVED", "CANCELLED"):
+            return {"go": False, "reason": f"terminal:{row['harvest_status']}"}
+        if row["team_work_run_id"] and row["run_status"] != "ACTIVE":
+            return {"go": False, "reason": f"run_not_active:{row['run_status']}"}
+        return {"go": True, "reason": "ok"}
+
+    def harvested_undelivered(self, run_id: str) -> list:
+        """取 run 名下「已收割但未确认送达 main」的卡 (issue #103 F4 补档)。
+
+        形状: harvest_status='HARVESTED' AND notify_confirmed_at IS NULL。
+        这正是 issue #103 的空窗 —— 卡已结算、槽位已清, 但报告一次都没
+        送达 main; run 的计时锚点把这种形状判成「不需敲」, main 侧
+        23+ 分钟零信号。
+        """
+        return self.conn.execute(
+            "SELECT task_id, harvest_status, worker_report, "
+            "notify_confirmed_at, notify_attempts, notify_dead_until, "
+            "notify_last_failed_at, notify_last_error, last_notified_at, "
+            "last_progress_at, updated_at "
+            "FROM harvest_contracts "
+            "WHERE team_work_run_id=? AND harvest_status='HARVESTED' "
+            "AND notify_confirmed_at IS NULL", (run_id,)).fetchall()
 
     def set_worker_report(self, task_id: str, report: dict, *, force: bool = False):
         """写入 worker 报告 — 给 main 看的结构化产物/状态摘要。
@@ -1005,7 +1087,8 @@ class Ledger:
                 "UPDATE harvest_contracts SET worker_report=?, updated_at=?, "
                 "last_progress_at=?, last_notified_at=NULL, "
                 "notify_confirmed_at=NULL, notify_dead_until=NULL, "
-                "notify_attempts=0 WHERE task_id=?",
+                "notify_attempts=0, notify_last_failed_at=NULL, "
+                "notify_last_error=NULL WHERE task_id=?",
                 (new_blob, time.time(), time.time(), task_id))
         self.conn.commit()
 
@@ -1052,14 +1135,64 @@ class Ledger:
                                 reason=log, create_missing=True)
 
     def is_terminal(self, task_id: str) -> bool:
-        """task 是否已终态 (CANCELLED/ARCHIVED)。无契约视为非终态。"""
+        """task 是否已终态 (HARVESTED/CANCELLED/ARCHIVED)。无契约视为非终态。
+
+        2026-10-25 issue #104 期望 4: resume 入口要挡终态卡。HARVESTED
+        也算真终态 —— 状态机里 _STATE_TRANSITIONS["HARVESTED"] 只允许
+        {ARCHIVED, CANCELLED}, 不可回退; derive_worker_state 的 terminal
+        tier 同样含 HARVESTED。口径统一到「真终态三态」。
+        """
         r = self.conn.execute(
             "SELECT harvest_status FROM harvest_contracts WHERE task_id=?",
             (task_id,)).fetchone()
-        return bool(r) and r["harvest_status"] in ("CANCELLED", "ARCHIVED")
+        return bool(r) and r["harvest_status"] in (
+            "HARVESTED", "CANCELLED", "ARCHIVED")
+
+    def sync_archived_contract_states(self, task_ids, *,
+                                      reason: str = "kanban 卡已归档, "
+                                      "契约行联动推终态 (issue #106)") -> list:
+        """issue #106: 把「kanban 侧已归档」卡的契约行推到 ARCHIVED。
+
+        背景: 不经 Team Work run 直建的卡由 main 用 `hermes kanban
+        archive` 归档, mw 账本里没有 run 也没有任何路径联动它 —— reaper
+        T3 铁律只结算 ACTIVE run 的 current_card, 无 run 的卡永不进入
+        结算面 ⇒ 契约行滞留 PENDING, 既拦 launch 护栏
+        (orphan_pending_cards) 又污染「无 PENDING 孤儿」巡检口径。
+
+        本方法是 archive 联动的账本入口: 逐个走 update_worker_state
+        正规状态机 (带 worker.state 事件 + progress bump + actor/reason
+        审计轨迹), 绝不裸 UPDATE harvest_status。
+
+        幂等与边界: 无契约行跳过 (无行即无滞留); 已 ARCHIVED 跳过;
+        CANCELLED 是终态且状态机禁 CANCELLED→ARCHIVED, 跳过不动
+        (归档语义早已达成)。HARVESTED→ARCHIVED 是 operator 合法边,
+        放行 (kanban 归档即生命周期收口)。
+        s6fix P2-7: 逐行 try/except —— 并发双列表竞对同一卡时, 后者
+        update_worker_state 抛 ValueError (ARCHIVED→ARCHIVED 非法) 不得
+        中断整批; 失败行降级跳过, 部分成功语义照常返回。
+        返回实际被推入 ARCHIVED 的 task_id 列表。
+        """
+        synced = []
+        for tid in (task_ids or ()):
+            try:
+                row = self.conn.execute(
+                    "SELECT harvest_status FROM harvest_contracts "
+                    "WHERE task_id=?", (tid,)).fetchone()
+                if row is None or row["harvest_status"] in ("ARCHIVED",
+                                                            "CANCELLED"):
+                    continue
+                self.update_worker_state(tid, "ARCHIVED", actor="operator",
+                                         reason=reason)
+                synced.append(tid)
+            except (ValueError, PermissionError):
+                # s6fix P2-7: 单行失败 (并发对手已抢先推成 ARCHIVED 等)
+                # 只跳过该行, 不拖垮批内剩余卡。
+                continue
+        return synced
 
     # ---- resume 请求队列 (问题6A: resume 异步化) ----
-    def enqueue_resume(self, task_id: str, instruction: str) -> int:
+    def enqueue_resume(self, task_id: str, instruction: str,
+                       actor: str = "main") -> int:
         """入队一个 resume 请求。返回 request id。
 
         语义: reaper 在下轮扫描时执行 resume_task,本函数立即返回。
@@ -1067,6 +1200,10 @@ class Ledger:
         旧的那条如果 PROCESSING,reaper 完成时会 finish_resume 但 result 与新指令无关,
         但其 result_json 仍记录此次执行结果(供审计)。
         简化:此处只删 PENDING,不去抢 PROCESSING 行的所有权(reaper 自己 finish)。
+
+        actor (2026-10-25 issue #104): 答复来源标记 —— "main" = 协调方
+        走 CLI 答复, "operator" = 操作员走控制台答复。加这列之前两条通道
+        在账本上完全同形, 谁答了只能去翻 worker session transcript。
         """
         # 删旧 PENDING(同 task 多个 PENDING 没意义,后者覆盖前者指令)
         self.conn.execute(
@@ -1074,14 +1211,15 @@ class Ledger:
             "WHERE task_id=? AND status='PENDING'", (task_id,))
         cur = self.conn.execute(
             "INSERT INTO task_resume_requests "
-            "(task_id, instruction, status, requested_at) "
-            "VALUES (?, ?, 'PENDING', ?)",
-            (task_id, instruction, time.time()))
+            "(task_id, instruction, status, requested_at, actor) "
+            "VALUES (?, ?, 'PENDING', ?, ?)",
+            (task_id, instruction, time.time(), actor))
         self.conn.commit()
         # 问题7D: 事件 emit(让 SSE/webhook 知道有 resume 请求入队)
         try:
             self.emit_event("resume.enqueued", task_id, {
                 "request_id": cur.lastrowid,
+                "actor": actor,
                 "instruction_preview": instruction[:80],
             })
         except Exception:
@@ -1130,6 +1268,123 @@ class Ledger:
              json.dumps(result, ensure_ascii=False) if result else None,
              error, request_id))
         self.conn.commit()
+
+    def list_resume_requests(self, task_id: str, limit: int = 20) -> list:
+        """取某张卡的 resume 请求历史 (新→旧), 供双通道互读「谁答过」。
+
+        2026-10-25 issue #104: console 与 CLI 两条答复通道以前互相不可见 ——
+        main 不知道操作员答了, 操作员也不知道 main 答了。这个读口让两侧
+        都能从账本读到对方的答复事实 (含 actor 与时刻)。
+        """
+        return self.conn.execute(
+            "SELECT id, task_id, instruction, status, requested_at, "
+            "finished_at, result_json, error, actor "
+            "FROM task_resume_requests WHERE task_id=? "
+            "ORDER BY requested_at DESC LIMIT ?",
+            (task_id, limit)).fetchall()
+
+    def last_resume_actor(self, task_id: str) -> dict | None:
+        """取该卡最近一条 resume 请求 (已入队的答复事实), 无则 None。
+
+        返回 {actor, requested_at, status, instruction_preview}。
+        用途: 答复冲突检测 —— 后到的答复方先看这里, 已知另一方已答就
+        提示冲突, 而不是盲注 (issue #104 期望 2)。
+        """
+        rows = self.list_resume_requests(task_id, limit=1)
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "actor": r["actor"],
+            "requested_at": r["requested_at"],
+            "status": r["status"],
+            "instruction_preview": (r["instruction"] or "")[:120],
+        }
+
+    def record_resume_answer(self, task_id: str, actor: str,
+                              instruction: str,
+                              actor_claimed: str | None = None) -> dict:
+        """落一条「已被 X 答复」的痕迹 (issue #104 期望 2)。
+
+        写两处:
+          1. harvest_log 追加一行 —— 卡片详情端点直接可见;
+          2. mw_events 一条 resume.answered 事件 —— SSE/webhook 可订阅。
+
+        不改 harvest_status (状态回拨由 pipeline.resume_task 走统一状态
+        更新器负责), 这里只记「答复事实」。
+
+        actor_claimed (issue #115): 客户端**自称**但未被采信的 actor。与
+        生效 actor 不同时在痕迹里留 `claimed=<X> normalized` —— 规范化
+        这件事本身要可审计, 否则「谁冒充了谁」只存在于请求日志里。
+        """
+        now = time.time()
+        stamp = time.strftime("%H:%M", time.localtime(now))
+        trail = f"[resume-answer] actor={actor} at={stamp}"
+        # 审查阻塞-1 (#115 收口): 自称值先净化换行/回车再截断。harvest_log
+        # 是被 console._extract_question 按行前缀解析的结构化审计面, 未净化
+        # 的 \n 可注入 "clarify:" 行伪造 worker 的提问。净化 + 截 32 字符。
+        _claimed = (str(actor_claimed).replace("\r", " ").replace("\n", " ")
+                   [:32] if actor_claimed else "")
+        spoofed = bool(_claimed) and _claimed != actor
+        if spoofed:
+            trail += f" (claimed={_claimed} normalized)"
+        try:
+            row = self.conn.execute(
+                "SELECT harvest_log FROM harvest_contracts WHERE task_id=?",
+                (task_id,)).fetchone()
+            if row is not None:
+                merged = (row["harvest_log"] or "")
+                self.conn.execute(
+                    "UPDATE harvest_contracts SET harvest_log=?, updated_at=? "
+                    "WHERE task_id=?",
+                    ((f"{merged}\n{trail}" if merged else trail)[:2000],
+                     now, task_id))
+                self.conn.commit()
+        except Exception:
+            pass  # 痕迹写失败不阻断答复主流程
+        try:
+            ev = {
+                "actor": actor,
+                "answered_at": now,
+                "answered_at_hhmm": stamp,
+                "instruction_preview": instruction[:120],
+            }
+            if spoofed:
+                ev["actor_claimed"] = _claimed  # 净化后的值, 与 trail 同源
+            self.emit_event("resume.answered", task_id, ev)
+        except Exception:
+            pass
+        return {"actor": actor, "answered_at": now, "answered_at_hhmm": stamp}
+
+    def record_notify_failure(self, task_id: str, error: str,
+                              attempts: int, dead_until: float,
+                              last_notified_at: float | None = None) -> None:
+        """relay 投递失败留痕 (issue #103 期望 1)。
+
+        notify_attempts 只是计数, 配 notify_dead_until 看不出「什么时候
+        开始坏的、为什么坏」。这两列 + 一条 mw_events 事件让账本直接
+        回答「失败过没有 / 何时失败 / 为何失败」。
+        """
+        now = time.time()
+        try:
+            self.conn.execute(
+                "UPDATE harvest_contracts SET notify_attempts=?, "
+                "notify_dead_until=?, notify_last_failed_at=?, "
+                "notify_last_error=?, last_notified_at=? WHERE task_id=?",
+                (attempts, dead_until, now, (error or "")[:500],
+                 last_notified_at, task_id))
+            self.conn.commit()
+        except Exception:
+            pass
+        try:
+            self.emit_event("relay.notify_failed", task_id, {
+                "attempts": attempts,
+                "error": (error or "")[:300],
+                "dead_until": dead_until,
+                "failed_at": now,
+            })
+        except Exception:
+            pass
 
     # ===== 问题7D: 事件总线 + webhook 订阅 =====
     def emit_event(self, event_type: str, task_id: str = "", payload: dict = None) -> int:

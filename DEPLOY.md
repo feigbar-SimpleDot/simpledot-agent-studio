@@ -164,8 +164,10 @@ rows. Refer to the **Troubleshooting** table for:
 ## 2. Add your first worker (in the console, no command line)
 
 1. Open the console -> **Worker management** -> Add worker
-2. Fill in the profile name (e.g. `coder`) and the gateway address (for
-   same-host deployment fill `http://<host-ip>:8643`). The model field is
+2. Fill in the profile name (e.g. `coder`) and the gateway address —
+   since issue #109 the worker publishes **no host port**; register the
+   container-internal address `http://hermes_<name>:8642` (the
+   `simple-dot` network alias). The model field is
    only a **request alias** (default `hermes-agent` is fine); the real
    model is decided by the worker's own Hermes config, no need to fill it
    here
@@ -275,7 +277,7 @@ Add to `mw/registry.json`:
 {
   "<profile_name>": {
     "runner":  "api",
-    "api_url": "http://<host>:8644",
+    "api_url": "http://hermes_<name>:8642",
     "api_key": "<hermes gateway api_key>",
     "scope": {
       "tags":     ["review", "code-quality", "code-read"],
@@ -328,7 +330,7 @@ ssh <host> 'docker cp /tmp/registry.json hermes_main:/opt/mwroot/mw/registry.jso
 
 | Need | Where to change |
 |---|---|
-| Change ports | `.env` -> `GW_PORT` / `CONSOLE_PORT` |
+| Change ports | `.env` -> `CONSOLE_PORT` (issue #109: the gateway no longer publishes a host port — it is container-internal `:8642` only) |
 | Change Hermes image | `.env` -> `HERMES_IMAGE` (must be >= v2026.9.24, includes Kanban) |
 | Change container name | `.env` -> `MAIN_CONTAINER_NAME` |
 | Force container CLI (skip auto-detect) | n/a — install.sh calls `docker` directly. On macOS the docker-for-apple-container shim exposes the same `docker` surface; pick a different binary by editing `deploy/install.sh` only if your host does not have `docker` on PATH |
@@ -639,7 +641,8 @@ docker exec "$MAIN_CONTAINER_NAME" sh -c '
 
 # 4) functional: live socket file + api_server answering
 docker exec "$MAIN_CONTAINER_NAME" sh -c 'ls -l /opt/data/gateway.sock'   # expect srw-------
-curl -sS -o /dev/null -w 'http=%{http_code}\n' --max-time 8 http://127.0.0.1:8642/api/sessions   # expect 401
+# issue #109: gateway 8642 无宿主映射, 探测在容器内进行 (verify.sh 同口径)
+docker exec "$MAIN_CONTAINER_NAME" python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8642/api/sessions", timeout=8).status)'   # expect 401 (no key) or 200 with key
 ```
 
 **D-2 upstream dependency.** The upstream image should give

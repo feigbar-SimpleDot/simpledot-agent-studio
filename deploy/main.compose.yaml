@@ -24,7 +24,9 @@ services:
     restart: unless-stopped
     command: ["/opt/mwroot/deploy/main_entry.sh"]   # m1-impl macOS: entry arrives via the ./deploy DIRECTORY mount below (Apple container bind sources must be directories, never single files)
     ports:
-      - "${GW_PORT:-8642}:8642"        # gateway (API server)
+      # issue #109 (2026-10-26): gateway 8642 不再发布宿主端口。
+      # main<->worker 自 issue #82 起全部走容器内网别名 (http://hermes_<name>:8642),
+      # 宿主映射属冗余; 浏览器/宿主侧一律经 console(:8700) 同源代理访问 gateway。
       - "${CONSOLE_PORT:-8700}:8700"   # Web console
       - "${HERMES_WEBUI_PORT:-8787}:${HERMES_WEBUI_PORT:-8787}"   # hermes-webui (optional, idle port harm-free when disabled)
     volumes:

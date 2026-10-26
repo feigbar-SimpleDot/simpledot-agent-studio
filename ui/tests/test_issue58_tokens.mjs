@@ -103,18 +103,23 @@ test('i18n: 顶层全量 flatten 键集合 en == zh (基线 639 → 643 → 644)
   // issue #81-2 新增 err.client —— 一增一减, 键数锚净数不变仍 650。
   // 650 → 651: issue #79 新增 tboard.todo_viewer_title_toggle_show
   // (弹窗长标题折叠开关, 双语同 commit, INV-09 先例口径)。
-  assert(fe.size === 651 && fz.size === 651,
-    `期望 650+1=651 键, 实际 en=${fe.size} zh=${fz.size}`)
+  // 651 → 653: issue #116 新增 tboard.reply_conflict (后到答复冲突警示)
+  // + tboard.answered_badge (卡片「已被 X 于 HH:MM 答复」角标), 双语同 commit。
+  // 653 → 652: issue #109 删除 workers.compose_port_label (创建 Worker 不再
+  // 填宿主端口), 双语同 commit —— 键数锚随合法删除同步下调。
+  assert(fe.size === 652 && fz.size === 652,
+    `期望 653-1=652 键, 实际 en=${fe.size} zh=${fz.size}`)
 })
 
-test('i18n: tboard 子 dict 键集合差集为空 (120+1=121)', () => {
+test('i18n: tboard 子 dict 键集合差集为空 (121+2=123)', () => {
   const te = en.tboard, tz = zh.tboard
   const ke = new Set(Object.keys(te)), kz = new Set(Object.keys(tz))
   eq([...ke].filter((k) => !kz.has(k)), [], 'tboard only-in-en')
   eq([...kz].filter((k) => !ke.has(k)), [], 'tboard only-in-zh')
   // 120 → 121: issue #79 新增 todo_viewer_title_toggle_show (双语同 commit)。
-  assert(ke.size === 121 && kz.size === 121,
-    `期望 tboard 121 键, 实际 en=${ke.size} zh=${kz.size}`)
+  // 121 → 123: issue #116 新增 reply_conflict + answered_badge (双语同 commit)。
+  assert(ke.size === 123 && kz.size === 123,
+    `期望 tboard 123 键, 实际 en=${ke.size} zh=${kz.size}`)
 })
 
 test('i18n: 4 个 token 新键双边存在且在 tboard.* 下', () => {

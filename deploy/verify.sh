@@ -7,10 +7,16 @@
 set -uo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-# ── i18n v1.0: load bilingual helpers + LANG validation ──
+# ── i18n v1.0: load bilingual helpers + LANG validation (arch §3.2/§4.4) ──
 LIB_DIR="$(cd "$(dirname "$0")" && pwd)/lib"
 # shellcheck source=lib/i18n.sh
 . "${LIB_DIR}/i18n.sh"
+# issue #113 (2026-10-25): 跨平台 hash helper (hash_of md5/sha256)。
+# 宿主侧指纹必须走 hash_of 而不是裸 sha256sum —— macOS/BSD 没有
+# sha256sum (只有 shasum -a 256), 裸调用会让宿主侧指纹算成空串,
+# verify.sh 误报「SOUL/SKILL 内容陈旧」(issue #113 归因到的真 bug)。
+# shellcheck source=lib/hash.sh
+. "${LIB_DIR}/hash.sh"
 
 [ -f .env ] && { set -a; . ./.env; set +a; }
 # i18n (arch §3.2 / AC C1): validate LANG=en|zh-cn; empty = en; invalid -> bad line (no exit,
@@ -24,7 +30,8 @@ fi
 export SAS_LANG
 MAIN_CONTAINER_NAME="${MAIN_CONTAINER_NAME:-hermes_main}"
 CONSOLE_PORT="${CONSOLE_PORT:-8700}"
-GW_PORT="${GW_PORT:-8642}"
+# issue #109 (2026-10-26): GW_PORT 宿主映射已删, gateway 只在容器内 :8642;
+# 检查改走 `docker exec` 容器内探测 (见下方 gateway 段)。
 
 PASS=0; FAIL=0
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
@@ -64,18 +71,25 @@ section_banner "reaper" "reaper"
 curl -sf --max-time 5 "http://127.0.0.1:${CONSOLE_PORT}/api/workers" | grep -q reaper_alive \
   && ok "reaper heartbeat visible" "reaper 心跳可见" || bad "reaper not reporting" "reaper 未上报"
 
-section_banner "gateway (:${GW_PORT})" "gateway (:${GW_PORT})"
-KEY="${API_SERVER_KEY:-}"
+section_banner "gateway (container-internal :8642)" "gateway (容器内网 :8642)"
+# issue #109 (2026-10-26): gateway 不再发布宿主端口 (原 GW_PORT:8642 已删),
+# 宿主侧 curl 127.0.0.1:8642 必然 connection refused。检查改为容器内探测:
+# gateway 在容器内仍监听 0.0.0.0:8642, 与 main<->worker 实际通信路径同构。
+# 容器内无 curl 依赖保证, 用镜像自带的 python3 urllib。
 GW_OK=0
 for i in 1 2 3 4 5; do
-  # 2026-10-03: read API_SERVER_KEY from .env (fixes the old bug — hardcoding 'Bearer ***' made
-  # the gateway check always fail, hiding real problems even on a successful deploy)
-  curl -sf --max-time 5 -X POST "http://127.0.0.1:${GW_PORT}/api/sessions" \
-    -H "Authorization: Bearer ${KEY}" -H "Content-Type: application/json" -d '{}' | grep -q '"id"' \
+  docker exec -e GWKEY="${API_SERVER_KEY:-}" "${MAIN_CONTAINER_NAME}" python3 -c '
+import os, urllib.request
+req = urllib.request.Request(
+    "http://127.0.0.1:8642/api/sessions", data=b"{}", method="POST",
+    headers={"Authorization": "Bearer " + os.environ.get("GWKEY", ""),
+             "Content-Type": "application/json"})
+print(urllib.request.urlopen(req, timeout=5).read().decode())
+' 2>/dev/null | grep -q '"id"' \
     && { GW_OK=1; break; }
   sleep 2   # gateway may become ready a few seconds after the console
 done
-[ "$GW_OK" = 1 ] && ok "gateway session creation OK" "gateway 会话创建 OK" || bad "gateway unreachable or key mismatch (check .env API_SERVER_KEY matches container env)" "gateway 不可达或密钥不符 (检查 .env API_SERVER_KEY 是否跟容器 env 一致)"
+[ "$GW_OK" = 1 ] && ok "gateway session creation OK (probed inside ${MAIN_CONTAINER_NAME})" "gateway 会话创建 OK (在 ${MAIN_CONTAINER_NAME} 容器内探测)" || bad "gateway unreachable inside container or key mismatch (check .env API_SERVER_KEY matches container env)" "容器内 gateway 不可达或密钥不符 (检查 .env API_SERVER_KEY 是否跟容器 env 一致)"
 
 section_banner "kanban" "kanban"
 docker exec "${MAIN_CONTAINER_NAME}" sh -c \
@@ -109,15 +123,14 @@ done
 # they match, the bind mount picked up the right file. A mismatch indicates either
 # a wrong LANG in .env or a stale container (didn't pick up the latest repo source).
 SKILL_FINGERPRINT_HOST=$( \
-  { sha256sum "deploy/skills/mw-task-dispatch/SKILL.${SAS_LANG}.md"; \
-    sha256sum "deploy/skills/team-work-chain-advance/SKILL.${SAS_LANG}.md"; \
-    sha256sum "deploy/skills/team-work-chain-orchestration/SKILL.${SAS_LANG}.md"; \
-    sha256sum "deploy/skills/worker-message-relay/SKILL.${SAS_LANG}.md"; \
-    sha256sum "docs/main-soul.${SAS_LANG}.md"; } 2>/dev/null \
-  | awk '{print $1}' \
+  { hash_of sha256 "deploy/skills/mw-task-dispatch/SKILL.${SAS_LANG}.md"; \
+    hash_of sha256 "deploy/skills/team-work-chain-advance/SKILL.${SAS_LANG}.md"; \
+    hash_of sha256 "deploy/skills/team-work-chain-orchestration/SKILL.${SAS_LANG}.md"; \
+    hash_of sha256 "deploy/skills/worker-message-relay/SKILL.${SAS_LANG}.md"; \
+    hash_of sha256 "docs/main-soul.${SAS_LANG}.md"; } 2>/dev/null \
   | tr -d '\n' \
-  | sha256sum \
-  | awk '{print $1}')
+  | hash_of sha256 - \
+  )
 # deployed fingerprint: sha256 each file inside the container, concatenated host-side in the same order.
 # s4d-fix2 + m1-impl: the in-container /opt/data/skills/agent-matrix/<sk>/SKILL.md and
 # /opt/data/SOUL.md come from directory-level read-only bind mounts of the host staging
@@ -136,8 +149,8 @@ SKILL_FINGERPRINT_DEPLOYED=$(set +e; \
     'sha256sum /opt/data/skills/agent-matrix/mw-task-dispatch/SKILL.md /opt/data/skills/agent-matrix/team-work-chain-advance/SKILL.md /opt/data/skills/agent-matrix/team-work-chain-orchestration/SKILL.md /opt/data/skills/agent-matrix/worker-message-relay/SKILL.md /opt/data/SOUL.md 2>/dev/null' \
     | awk '{print $1}' \
     | tr -d '\n' \
-    | sha256sum \
-    | awk '{print $1}')
+    | hash_of sha256 - \
+  )
 # sha256 of empty input (fallback: don't falsely report a match when the container is down / files absent)
 EMPTY_SHA="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 if [ -z "${SKILL_FINGERPRINT_DEPLOYED}" ]; then

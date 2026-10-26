@@ -39,7 +39,7 @@ secrets. Gitea fetch:
 `GET /api/v1/repos/<owner>/<repo>/git/trees/<branch>?recursive=1`
 lists files, filter for docs, then
 `GET .../raw/<branch>/<path>` per file with
-`Authorization: token ***`. When constructing tokens
+`Authorization: token <token>`. When constructing tokens
 in shell, use variable concatenation
 (`TOKEN="${P1}${P2}"`) to avoid redaction. Anonymous
 raw returning 404 proves the repo is private, must
@@ -654,6 +654,26 @@ Concrete failure modes covered:
 - advance-dispatched worker writing code to
   /share_workspace/tasks/<id>/
 - **worker dead-letter echo (advance wrote card but input_spec dropped + no new submit_log row + container never started)**: all three signals present → the card is truly dead-lettered, not a slow reaper. Fix (confirmed in round d2): main directly self-produces the review deliverable (`docs/REVIEW-*.md`) — resume also fails: the file-source queue was eaten by the previous dead reaper, the new reaper never receives it. After the deliverable lands, `hermes kanban complete --force` (force bypasses live-claim guard), mute by pushing `notify_dead_until`, `POST /api/team-work/<run>/close` (close lands ABORTED not CLOSED, because the unclosed slot gets archived — a hard-evidenced record must not be disguised as CLOSED). **Forbid** silent-skip swallowing the card (violates the division where main never decides a worker's deliverable for it) — the self-made review deliverable must declare "main self-review, due to dX worker dead-letter" in its header, leaving the truth inside the artifact. **Lesson**: after advance writes a card, GET once to verify manifest field integrity; if input_spec is empty, refuse advance and rewrite — never let an empty card enter the run.
+- **terminal cards (ARCHIVED/CANCELLED/HARVESTED) can no longer be
+  resumed for rework — resume on a terminal card is refused
+  everywhere as of 2026-10-25**: this entry used to read "an already
+  settled (HARVESTED) card can still be resumed for rework (proven
+  across several cards on 2026-10-19)" — that recipe was **retired on
+  2026-10-25**. Cause: issue #104 widened `is_terminal` to the three
+  real terminal states (HARVESTED/CANCELLED/ARCHIVED) and put the same
+  guard at four points, all of them **before** the side effect: the
+  CLI entry (`mw/cli.py` cmd_resume) exits non-zero and does not
+  enqueue; the console API entry (`mw/console.py` api_resume) returns
+  409; the injection site (`mw/pipeline.py` resume_task) returns
+  `state_reset="refused:terminal"` without any POST; and the reaper's
+  queue consumer (`mw/reaper.py` reap_once) closes the row through
+  `finish_resume(ok=False, error="terminal card")`. Following the old
+  recipe now hits `[mw] task … 已终态 (HARVESTED), 拒绝 resume 入队`.
+  See the s6fix P1-1 section of CHANGELOG. **Replacement path = open a
+  new fix-up card** — do not try to push a settled card back to PENDING,
+  the state machine's `_STATE_TRANSITIONS["HARVESTED"]` only allows
+  {ARCHIVED, CANCELLED}. The three-way verification before settling
+  ("check the artifacts, the TODO, and the repo commit") is unchanged.
 - chain-end must manually close (2026-10-08 boundary
   reduction)
 - PHYSICAL_ERROR deprecated (2026-10-08)

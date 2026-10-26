@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import time
+from unittest import mock
 
 # 测试期间 reaper 应能假装锁住无 API_SERVER_KEY 也能跑
 os.environ.setdefault("API_SERVER_KEY", "test-key")
@@ -163,7 +164,86 @@ def test_f8_4b_touch_progress_advances_monotonically():
 
 # ============================================================
 # F8.1: 双闸抑制改单闸 (event timestamp 即活体信号)
-# ============================================================
+#
+# issue #113 (2026-10-25) 归因: 本组 4 例此前直接读 sse_bridge._worker_live,
+# 而那条读法在 SSE-FIX-F3 (0fa0f40, 2026-10-08) 之后已是死代码 ——
+# reaper 与 SSE 桥不同进程, 内存不共享, 活体真源改为 console 端点
+# /api/workers/live (reaper._query_console_liveness)。
+# 旧写法造成两处失真:
+#   - F8.1 恒红: 替身缺 ledger.path → 落 ERROR 而非 SUPPRESSED_ALIVE;
+#   - F8.1b/1c/1d 恒绿: console 不可达 ⇒ fail-open 不抑制 ⇒ 「不抑制」
+#     这条断言与被测行为脱钩 (空洞绿灯, 恰恰是 issue 要消灭的污染)。
+# 本组改为 mock 当前真源 _query_console_liveness, 并断言真实判定结果
+# (抑制 ⇒ SUPPRESSED_ALIVE; 不抑制 ⇒ NOTIFIED 且确实发了敲门),
+# 让每个用例都能真绿也能真红。
+
+def _live_entry(session_id, *, thinking, last_event_ts,
+                event_type="tool.completed"):
+    """构造 console /api/workers/live 的一条条目 (真源格式)。"""
+    return {"profile": "coder", "session_id": session_id,
+            "thinking": thinking, "last_event_ts": last_event_ts,
+            "last_event_type": event_type, "event_count": 5}
+
+
+def _stuck_knock_stub(now, *, task_id, session_id):
+    """构造 _notify_main_of_stuck 用的 ledger 替身。
+
+    替身必须补齐被测路径真正用到的方法 —— 旧版只给了 4 个, 缺
+    path / mark_notified / emit_event, 于是「不抑制 → 走敲门」那条路径
+    必落 AttributeError (F8.1 恒红的直接原因)。
+    """
+    class _L:
+        path = "/tmp/mw_f8_stub_ledger.db"
+
+        def current_card_contract(self, run_id, card_id):
+            return {"task_id": task_id, "harvest_status": "PENDING",
+                    "last_progress_at": now - 3600, "updated_at": now - 3600}
+        def should_notify(self, tid, *, min_interval_s):
+            return True
+        def get_session(self, tid):
+            return {"session_id": session_id, "profile": "coder"}
+        def get_initiator(self, tid):
+            return "sid_main"
+        # D1 桩 (VERIFY-20261013 §2.3): F5-4 敲门前先标 WAITING, 替身须有该方法
+        def update_worker_state(self, tid, new_status, *, actor,
+                                reason="", log=""):
+            pass
+        # issue #113: 敲门成功后 reaper 会 mark_notified + emit task.stuck,
+        # 替身缺这两个方法会让「不抑制」路径必落 ERROR (空断言的温床)。
+        def mark_notified(self, tid):
+            pass
+        def emit_event(self, ev_type, tid, payload):
+            pass
+    return _L()
+
+
+def _run_stuck_knock(stub, results, *, live_entry, expected_call_args=None):
+    """跑一次敲门, mock 掉活体查询与实际发送, 返回 (results, sent)。"""
+    from mw import reaper as reaper_mod
+    sent = []
+
+    def _fake_send(sid, msg, gw, key, db_path, registry=None,
+                   notify_task=None):
+        sent.append({"sid": sid, "msg": msg, "task_id": notify_task})
+
+    with mock.patch.object(reaper_mod, "_query_console_liveness",
+                           return_value=live_entry) as live_q:
+        with mock.patch.object(reaper_mod, "_send_to_main", _fake_send):
+            reaper_mod._notify_main_of_stuck(
+                stub, "/tmp", results,
+                registry=None,
+                stuck_after_min=1,
+                active_run_id="run_a",
+                current_card_id="card_c",
+            )
+    if expected_call_args is not None:
+        assert live_q.call_args is not None, (
+            "活体查询压根没被调用 —— 断言方向与被测行为脱钩 (空洞绿灯)")
+        assert live_q.call_args[0] == expected_call_args, (
+            f"活体查询参数错位: 期望 {expected_call_args}, "
+            f"实际 {live_q.call_args[0]}")
+    return sent
+
 
 def test_f8_1_single_gate_suppresses_on_recent_event():
     """回归 test_reaper_sse_stuck 旧行为: thinking=False + 最近 event
@@ -172,50 +252,22 @@ def test_f8_1_single_gate_suppresses_on_recent_event():
     旧版要求 is_thinking()==True AND last_event_ts 在窗口内.
     新版只看 last_event_ts 在窗口内, 不区分 event 类型.
     """
-    from mw import reaper as reaper_mod
-    from mw import sse_bridge
-    sse_bridge._subscriptions.clear()
-    sse_bridge._worker_live.clear()
-
     now = time.time()
     # run.completed → thinking=False (旧版闸 1 失败), 但 last_event_ts=now
-    sse_bridge._worker_live[("coder", "sid_x")] = {
-        "session_id": "sid_x",
-        "last_run_id": "run_x",
-        "last_event_ts": now,
-        "last_event_type": "run.completed",
-        "thinking": False,
-        "event_count": 5,
-    }
-
-    class _L:
-        def current_card_contract(self, run_id, card_id):
-            return {"task_id": "T-1", "harvest_status": "PENDING",
-                    "last_progress_at": now - 3600, "updated_at": now - 3600}
-        def should_notify(self, tid, *, min_interval_s):
-            return True
-        def get_session(self, tid):
-            return {"session_id": "sid_x", "profile": "coder"}
-        def get_initiator(self, tid):
-            return "sid_main"
-        # D1 桩 (VERIFY-20261013 §2.3): F5-4 敲门前先标 WAITING, 替身须有该方法
-        def update_worker_state(self, tid, new_status, *, actor,
-                                reason="", log=""):
-            pass
+    live = _live_entry("sid_x", thinking=False, last_event_ts=now,
+                       event_type="run.completed")
+    stub = _stuck_knock_stub(now, task_id="T-1", session_id="sid_x")
 
     results_list = []
-    reaper_mod._notify_main_of_stuck(
-        _L(), "/tmp", results_list,
-        registry=None,
-        stuck_after_min=1,
-        active_run_id="run_a",
-        current_card_id="card_c",
-    )
+    sent = _run_stuck_knock(stub, results_list, live_entry=live,
+                             expected_call_args=("coder", "sid_x"))
 
     suppressed = [r for r in results_list
                   if r.get("verdict") == "SUPPRESSED_ALIVE"]
     assert len(suppressed) == 1, \
         f"应被抑制 (last_event_ts=now), got {results_list}"
+    # 抑制 ⇒ 绝不能真发敲门 (否则是「抑制了但还是吵醒了 main」)
+    assert not sent, f"抑制后不应真发敲门, got {sent}"
     _assert("f8.1 thinking=False 但 last_event_ts 新 → 抑制 (单闸)", True)
 
 
@@ -223,134 +275,95 @@ def test_f8_1b_old_event_does_not_suppress():
     """反向: last_event_ts 很久以前 (旧 60s 窗口外) → 应敲门。
 
     锁住新行为, 防止有人误把窗口又改回 30min。
-    """
-    from mw import reaper as reaper_mod
-    from mw import sse_bridge
-    sse_bridge._subscriptions.clear()
-    sse_bridge._worker_live.clear()
 
+    issue #113: thinking 置 False —— 本例要隔离验证的是「窗口」这一条
+    闸。thinking 是与窗口并列的独立活体闸 (thinking==True 时粘滞到
+    终态, 覆盖单个长工具调用中间无事件的空窗), 置 True 会让 thinking
+    闸把窗口闸遮住, 断言就变成在测另一条规则。
+    """
     now = time.time()
     # last_event_ts 5 分钟前, 远超默认 60s 窗口
-    sse_bridge._worker_live[("coder", "sid_y")] = {
-        "session_id": "sid_y",
-        "last_run_id": "run_y",
-        "last_event_ts": now - 300,  # 5 min 前
-        "last_event_type": "message.delta",
-        "thinking": True,
-        "event_count": 10,
-    }
-
-    class _L:
-        def current_card_contract(self, run_id, card_id):
-            return {"task_id": "T-2", "harvest_status": "PENDING",
-                    "last_progress_at": now - 3600, "updated_at": now - 3600}
-        def should_notify(self, tid, *, min_interval_s):
-            return True
-        def get_session(self, tid):
-            return {"session_id": "sid_y", "profile": "coder"}
-        def get_initiator(self, tid):
-            return "sid_main"
-        # D1 桩 (VERIFY-20261013 §2.3): F5-4 敲门前先标 WAITING, 替身须有该方法
-        def update_worker_state(self, tid, new_status, *, actor,
-                                reason="", log=""):
-            pass
+    live = _live_entry("sid_y", thinking=False, last_event_ts=now - 300,
+                       event_type="message.delta")
+    stub = _stuck_knock_stub(now, task_id="T-2", session_id="sid_y")
 
     results_list = []
-    reaper_mod._notify_main_of_stuck(
-        _L(), "/tmp", results_list,
-        registry=None,
-        stuck_after_min=1,
-        active_run_id="run_a",
-        current_card_id="card_c",
-    )
+    sent = _run_stuck_knock(stub, results_list, live_entry=live)
 
     suppressed = [r for r in results_list
                   if r.get("verdict") == "SUPPRESSED_ALIVE"]
     # 不抑制 (5min 太旧)
     assert not suppressed, \
         f"5 分钟前的事件不应抑制, got {results_list}"
-    _assert("f8.1b 窗口外的旧 event 不抑制", True)
+    # 「不抑制」必须真的敲了门 —— 否则这条断言是空洞绿灯
+    notified = [r for r in results_list if r.get("verdict") == "NOTIFIED"]
+    assert len(notified) == 1, \
+        f"窗口外的旧 event 应真敲门 (NOTIFIED), got {results_list}"
+    assert len(sent) == 1, f"应真发出一次敲门, got {sent}"
+    _assert("f8.1b 窗口外的旧 event 不抑制 (且真敲)", True)
+
+
+def test_f8_1b2_thinking_true_is_independent_live_gate():
+    """issue #113 新增: thinking==True 是与窗口并列的独立活体闸。
+
+    SSE-FIX-F3 (0fa0f40) 把活体判定从「thinking AND 窗口」改成
+    「thinking OR 窗口」—— thinking 粘滞到终态, 覆盖单个长工具调用
+    中间没有事件的空窗。本例锁住这条语义, 防止有人把 thinking 闸
+    误删或误改成 AND (那会让长工具调用期间被当成挂死而误敲 main)。
+    """
+    now = time.time()
+    # last_event_ts 5 分钟前 (窗口外), 但 thinking=True ⇒ 仍判活
+    live = _live_entry("sid_y2", thinking=True, last_event_ts=now - 300,
+                       event_type="tool.completed")
+    stub = _stuck_knock_stub(now, task_id="T-2b", session_id="sid_y2")
+
+    results_list = []
+    sent = _run_stuck_knock(stub, results_list, live_entry=live)
+
+    suppressed = [r for r in results_list
+                  if r.get("verdict") == "SUPPRESSED_ALIVE"]
+    assert len(suppressed) == 1, \
+        f"thinking=True 应独立判活 (窗口外也抑制), got {results_list}"
+    assert not sent, f"thinking=True 判活后不应真发敲门, got {sent}"
+    _assert("f8.1b2 thinking=True 是独立活体闸 (窗口外也抑制)", True)
 
 
 def test_f8_1c_no_live_entry_does_not_suppress():
-    """空 _worker_live → 不抑制, 照敲 (探测失败不挡)。"""
-    from mw import reaper as reaper_mod
-    from mw import sse_bridge
-    sse_bridge._subscriptions.clear()
-    sse_bridge._worker_live.clear()
-
-    class _L:
-        def current_card_contract(self, run_id, card_id):
-            return {"task_id": "T-3", "harvest_status": "PENDING",
-                    "last_progress_at": time.time() - 3600,
-                    "updated_at": time.time() - 3600}
-        def should_notify(self, tid, *, min_interval_s):
-            return True
-        def get_session(self, tid):
-            return {"session_id": "sid_z", "profile": "coder"}
-        def get_initiator(self, tid):
-            return "sid_main"
-        # D1 桩 (VERIFY-20261013 §2.3): F5-4 敲门前先标 WAITING, 替身须有该方法
-        def update_worker_state(self, tid, new_status, *, actor,
-                                reason="", log=""):
-            pass
+    """空 live 条目 → 不抑制, 照敲 (探测失败不挡)。"""
+    now = time.time()
+    stub = _stuck_knock_stub(now, task_id="T-3", session_id="sid_z")
 
     results_list = []
-    reaper_mod._notify_main_of_stuck(
-        _L(), "/tmp", results_list,
-        registry=None, stuck_after_min=1,
-        active_run_id="run_a", current_card_id="card_c",
-    )
+    sent = _run_stuck_knock(stub, results_list, live_entry=None)
 
     suppressed = [r for r in results_list
                   if r.get("verdict") == "SUPPRESSED_ALIVE"]
     assert not suppressed, \
         f"无 live entry 不应抑制, got {results_list}"
+    # 「探测失败 → 照敲」是 fail-open 的核心语义: 必须真敲
+    notified = [r for r in results_list if r.get("verdict") == "NOTIFIED"]
+    assert len(notified) == 1, \
+        f"无 live entry 应真敲门 (fail-open), got {results_list}"
+    assert len(sent) == 1, f"应真发出一次敲门, got {sent}"
     _assert("f8.1c 无 live entry 不抑制 (照敲)", True)
 
 
 def test_f8_1d_default_window_is_60s_not_30min():
     """锁住默认窗口: 60s 而非 stuck_after_min * 60 (= 30min 旧值)。
 
-    测试方法: _worker_live 有 last_event_ts=now-120s, 旧默认 30min
+    测试方法: live 条目 last_event_ts=now-120s, 旧默认 30min
     会抑制, 新默认 60s 不抑制。
+
+    issue #113: thinking 置 False —— 与 1b 同理, 本例要隔离验证的是
+    「默认窗口 60s」这一条闸, 不能被 thinking 闸遮住。
     """
-    from mw import reaper as reaper_mod
-    from mw import sse_bridge
-    sse_bridge._subscriptions.clear()
-    sse_bridge._worker_live.clear()
-
     now = time.time()
-    sse_bridge._worker_live[("coder", "sid_w")] = {
-        "session_id": "sid_w",
-        "last_run_id": "run_w",
-        "last_event_ts": now - 120,  # 2 分钟前
-        "last_event_type": "tool.completed",
-        "thinking": True,
-        "event_count": 8,
-    }
-
-    class _L:
-        def current_card_contract(self, run_id, card_id):
-            return {"task_id": "T-4", "harvest_status": "PENDING",
-                    "last_progress_at": now - 3600, "updated_at": now - 3600}
-        def should_notify(self, tid, *, min_interval_s):
-            return True
-        def get_session(self, tid):
-            return {"session_id": "sid_w", "profile": "coder"}
-        def get_initiator(self, tid):
-            return "sid_main"
-        # D1 桩 (VERIFY-20261013 §2.3): F5-4 敲门前先标 WAITING, 替身须有该方法
-        def update_worker_state(self, tid, new_status, *, actor,
-                                reason="", log=""):
-            pass
+    live = _live_entry("sid_w", thinking=False, last_event_ts=now - 120,
+                       event_type="tool.completed")
+    stub = _stuck_knock_stub(now, task_id="T-4", session_id="sid_w")
 
     results_list = []
-    reaper_mod._notify_main_of_stuck(
-        _L(), "/tmp", results_list,
-        registry=None, stuck_after_min=1,  # 旧窗口 = 1*60 = 60s
-        active_run_id="run_a", current_card_id="card_c",
-    )
+    sent = _run_stuck_knock(stub, results_list, live_entry=live)
 
     suppressed = [r for r in results_list
                   if r.get("verdict") == "SUPPRESSED_ALIVE"]
@@ -358,6 +371,10 @@ def test_f8_1d_default_window_is_60s_not_30min():
     # 但抑制条件只卡 age < 60s, 120s > 60s → 不抑制 → 应敲
     assert not suppressed, \
         f"2 分钟前的 event 应敲门 (新窗口 60s), got {results_list}"
+    notified = [r for r in results_list if r.get("verdict") == "NOTIFIED"]
+    assert len(notified) == 1, \
+        f"2 分钟前的 event 应真敲门, got {results_list}"
+    assert len(sent) == 1, f"应真发出一次敲门, got {sent}"
     _assert("f8.1d 默认窗口 60s 而非 stuck_after_min*60=30min", True)
 
 
@@ -412,6 +429,7 @@ def main():
         test_f8_4b_touch_progress_advances_monotonically,
         test_f8_1_single_gate_suppresses_on_recent_event,
         test_f8_1b_old_event_does_not_suppress,
+        test_f8_1b2_thinking_true_is_independent_live_gate,
         test_f8_1c_no_live_entry_does_not_suppress,
         test_f8_1d_default_window_is_60s_not_30min,
         test_integration_advance_then_complete_does_not_close_run,

@@ -300,6 +300,7 @@
   },
   "tboard": {
     "already_archived": "✓ Archived",
+    "answered_badge": "Answered by {by} at {time}",
     "archive_btn": "Archive",
     "archive_busy": "Archiving…",
     "archive_failed": "Archive failed: {err}",
@@ -353,6 +354,7 @@
     "reply_modal_title": "Reply and continue",
     "reply_submit": "Submit and continue",
     "reply_submit_busy": "Sending…",
+    "reply_conflict": "Reply accepted, but ⚠ {conflict}",
     "retry": "Retry",
     "run_status_aborted": "Aborted",
     "run_status_active": "Active",
@@ -433,7 +435,6 @@
     "backend_unreachable_prefix": "Backend unreachable: ",
     "chat_btn": "Chat",
     "compose_api_key_hint": "Set an API key for this worker",
-    "compose_port_label": "External port",
     "compose_subtitle": "Generate a compose file from the template; running the container is an explicit host action — the platform does not run it for you.",
     "confirm_delete_text": "This stops the worker and removes it from the directory. Compose files on disk are not auto-deleted.",
     "confirm_delete_title": "Delete this Worker?",

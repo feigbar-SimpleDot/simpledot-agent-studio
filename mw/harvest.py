@@ -56,24 +56,36 @@ def export_transcript(session_id: str, hermes_home: str, out_dir: str,
     out.parent.mkdir(parents=True, exist_ok=True)
     prefix = os.environ.get("MW_EXPORT_PREFIX", "hermes").split()
     pre = ["-p", profile] if profile else []
+    # issue #113 (2026-10-25): transcript 采集是「数据收集」, 不是决策。
+    # CLI 二进制不在 PATH (容器装了 hermes 但没挂 PATH / 宿主裸跑 pytest /
+    # MW_EXPORT_PREFIX 指向已卸载的镜像) 时, subprocess 抛 OSError
+    # (FileNotFoundError 是其子类) 会把整条结算链路炸掉 —— 卡永远落不了账,
+    # reaper 只能记一条 ERROR。既有降级口径 (doc=None → 「纯物理验收」)
+    # 本就允许没有 transcript, 故这里把「命令不存在」也归入降级而非异常。
     if prefix and prefix[0] == "docker":
         container = prefix[prefix.index("exec") + 1]
         inner = f"/tmp/mw_{session_id}.jsonl"
-        r = subprocess.run(
-            prefix + ["sessions", "export", "--format", "jsonl",
-                     "--session-id", session_id, "-y", inner],
-            capture_output=True, text=True, env=_env(hermes_home))
-        if r.returncode != 0:
+        try:
+            r = subprocess.run(
+                prefix + ["sessions", "export", "--format", "jsonl",
+                         "--session-id", session_id, "-y", inner],
+                capture_output=True, text=True, env=_env(hermes_home))
+            if r.returncode != 0:
+                return None
+            subprocess.run(["docker", "cp", f"{container}:{inner}", str(out)],
+                           capture_output=True, text=True)
+        except OSError:
             return None
-        subprocess.run(["docker", "cp", f"{container}:{inner}", str(out)],
-                       capture_output=True, text=True)
         if not out.exists():
             return None
     else:
-        r = subprocess.run(
-            prefix + pre + ["sessions", "export", "--format", "jsonl",
-                           "--session-id", session_id, "-y", str(out)],
-            capture_output=True, text=True, env=_env(hermes_home))
+        try:
+            r = subprocess.run(
+                prefix + pre + ["sessions", "export", "--format", "jsonl",
+                               "--session-id", session_id, "-y", str(out)],
+                capture_output=True, text=True, env=_env(hermes_home))
+        except OSError:
+            return None
         if r.returncode != 0 or not out.exists():
             return None
     try:

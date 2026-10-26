@@ -84,6 +84,25 @@ def cmd_resume(args):
     if not sess or not sess["session_id"]:
         print(f"[mw] task {args.task} 无 session 锚点, 无法 resume", file=sys.stderr)
         return 1
+    # s6fix P1-1 (issue #104 根因 4 执行点收口): CLI 入口终态守卫 ——
+    # 终态卡 (ARCHIVED/CANCELLED/HARVESTED) 不入队, 免得答复躺在队列里
+    # 等 reaper 唤醒一个已无主的会话。拒绝同时落 harvest_log 痕迹。
+    if led.is_terminal(args.task):
+        status = led.get_contract(args.task)["harvest_status"]
+        try:
+            merged = led.get_contract(args.task)["harvest_log"] or ""
+            trail = (f"[resume-terminal] CLI 拒绝入队 "
+                     f"(harvest_status={status}) answered_by=main")
+            led.conn.execute(
+                "UPDATE harvest_contracts SET harvest_log=? WHERE task_id=?",
+                ((f"{merged}\n{trail}" if merged else trail)[:2000],
+                 args.task))
+            led.conn.commit()
+        except Exception:
+            pass  # 痕迹失败不阻断拒绝
+        print(f"[mw] task {args.task} 已终态 ({status}), 拒绝 resume 入队",
+              file=sys.stderr)
+        return 1
     # 问题6B: instruction_file 兜底
     instruction = args.instruction or ""
     if args.instruction_file:
@@ -104,9 +123,13 @@ def cmd_resume(args):
     if not instruction.strip():
         print(f"[mw] instruction 必填 (或用 --instruction-file)", file=sys.stderr)
         return 2
-    req_id = led.enqueue_resume(args.task, instruction)
+    req_id = led.enqueue_resume(args.task, instruction, actor="main")
+    # issue #104: 答复事实落痕 (harvest_log + resume.answered 事件) ——
+    # CLI 侧 (main) 与 console 侧 (operator) 共用同一套痕迹, 两侧互相可读。
+    led.record_resume_answer(args.task, "main", instruction)
     print(json.dumps({"ok": True, "task_id": args.task,
                       "request_id": req_id,
+                      "actor": "main",
                       "source": "file" if args.instruction_file else "inline",
                       "note": "已入队, reaper 下轮(≤15s)执行, kill 协调者也不丢"},
                      ensure_ascii=False, indent=2))

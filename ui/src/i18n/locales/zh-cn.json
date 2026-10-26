@@ -300,6 +300,7 @@
   },
   "tboard": {
     "already_archived": "✓ 已归档",
+    "answered_badge": "已被 {by} 于 {time} 答复",
     "archive_btn": "归档",
     "archive_busy": "归档中…",
     "archive_failed": "归档失败：{err}",
@@ -353,6 +354,7 @@
     "reply_modal_title": "回复并继续",
     "reply_submit": "提交并继续",
     "reply_submit_busy": "发送中…",
+    "reply_conflict": "已提交，但 ⚠ {conflict}",
     "retry": "重试",
     "run_status_aborted": "已中止",
     "run_status_active": "进行中",
@@ -433,7 +435,6 @@
     "backend_unreachable_prefix": "后端不可达：",
     "chat_btn": "对话",
     "compose_api_key_hint": "给这个 worker 设一个 API key",
-    "compose_port_label": "对外端口",
     "compose_subtitle": "按模版生成 compose 文件内容；起容器是宿主机上的显式操作,本平台不代跑。",
     "confirm_delete_text": "会停掉 Worker 并从列表移除;宿主机上的 compose 文件不会被自动删除。",
     "confirm_delete_title": "删除该 Worker？",

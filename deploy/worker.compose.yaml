@@ -5,19 +5,24 @@
 # Variables come from repo-root .env:
 #   WORKER_NAME       - container name suffix (coder / code-reviewer)
 #   WORKER_IMAGE      - hermes image (same as main)
-#   WORKER_PORT       - host port (8643 / 8644)
 #   WORKER_API_KEY    - this worker's API key (needed in registry, independent from main)
+# issue #109 (2026-10-26): 不再发布宿主端口 (原 WORKER_PORT:8642 已删)。
+# main<->worker 全部走容器内网别名 http://hermes_<name>:8642 (simple-dot 网络)。
 # See install.sh: it seeds one docker-compose.yaml + .env per worker under
 # <worker-deploy-dir>/<name>/, this template is the source.
 
 services:
-  hermes:
+  # issue #109: 本模版接入 simple-dot 后, service 名必须 == container_name
+  # (issue #82 铁律: service 名会自动注册为网络 alias, 共享 alias "hermes"
+  #  会让跨容器请求命中错误的服务)。
+  hermes_${WORKER_NAME:-coder}:
     image: ${WORKER_IMAGE:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/nousresearch/hermes-agent:v2026.9.24}
     container_name: hermes_${WORKER_NAME:-coder}
     restart: unless-stopped
     command: gateway run
-    ports:
-      - "${WORKER_PORT:-8643}:8642"
+    # issue #109 (2026-10-26): 删除宿主端口映射 "${WORKER_PORT:-8643}:8642"。
+    # worker 经容器内网别名 http://hermes_<name>:8642 被访问 (simple-dot 网络);
+    # 手工起 worker 时请确保容器接入该网络, 或直接使用控制台生成的 compose 模版。
     volumes:
       - ./hermes:/opt/data
       # 2026-10-01 SE card root-cause fix: worker must mount main share_workspace,
@@ -44,3 +49,14 @@ services:
       # (HERMES_LOCAL_STREAM_STALE_TIMEOUT).
       - HERMES_STREAM_READ_TIMEOUT=1800
       - HERMES_LOCAL_STREAM_STALE_TIMEOUT=1800
+    networks:
+      # issue #109 (2026-10-26): 删掉宿主端口映射后, 本手工模版必须接入共享
+      # 网络 simple-dot, main 才能经容器内网别名 http://hermes_<name>:8642
+      # 访问 worker (与 console COMPOSE_TEMPLATE 生成的 worker 同构)。
+      simple-dot:
+        aliases:
+          - hermes_${WORKER_NAME:-coder}
+
+networks:
+  simple-dot:
+    external: true

@@ -126,7 +126,7 @@ soul/skill/prompt 指定)。因此:
 三个常见假阳性:
 
 - **仓库 owner/repo 路径错写**: worker 笔记写"推到 sds/studio"实际推到
-  另一台主机上的 `<owner>/<repo>` (或反过来)。worker's local `git remote -v` 才是
+  `<owner>/<repo>`（或反过来）。worker's local `git remote -v` 才是
   唯一可信源, `PROJECT-MEMORY.md` 第 3-4 行的地址是权威比对基准。main 不要沿用
   worker 笔记里的 owner/repo 路径文字, 必须独立
   `curl .../repos/<owner>/<repo>/branches/main` 校验。

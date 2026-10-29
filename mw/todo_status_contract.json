@@ -1,0 +1,9 @@
+{
+  "statuses": {
+    "working": { "family": "running", "badge": "badge-blue" },
+    "blocked": { "family": "attention", "badge": "badge-yellow" },
+    "completed": { "family": "finished", "badge": "badge-green" },
+    "failed": { "family": "blocked", "badge": "badge-red" },
+    "waiting_sub": { "family": "running", "badge": "badge-blue" }
+  }
+}

@@ -4,8 +4,19 @@
     "api_url": "http://hermes_coder:8642",
     "api_key": "CHANGE_ME_WORKER_API_KEY_0123456789abcdef",
     "scope": {
-      "tags": ["code-write", "debug", "test", "analysis", "doc", "refactor", "code-read"],
-      "excludes": ["security-audit", "prod-deploy"]
+      "tags": [
+        "code-write",
+        "debug",
+        "test",
+        "analysis",
+        "doc",
+        "refactor",
+        "code-read"
+      ],
+      "excludes": [
+        "security-audit",
+        "prod-deploy"
+      ]
     }
   },
   "code-reviewer": {
@@ -13,8 +24,15 @@
     "api_url": "http://hermes_code-reviewer:8642",
     "api_key": "CHANGE_ME_WORKER_API_KEY_0123456789abcdef",
     "scope": {
-      "tags": ["review", "code-quality", "code-read"],
-      "excludes": ["code-write", "prod-deploy"]
+      "tags": [
+        "review",
+        "code-quality",
+        "code-read"
+      ],
+      "excludes": [
+        "code-write",
+        "prod-deploy"
+      ]
     }
   }
 }

@@ -26,6 +26,7 @@
     "subtitle_tasks_board": "{total} total · {attention} to do · {running} in progress · {finished} done",
     "subtitle_workers": "Register routes / generate compose / view run metadata",
     "subtitle_workflows": "Workflow templates · define how collaborative tasks decompose",
+    "subtitle_cron": "Scheduled tasks · created and managed by main",
     "theme_toggle": "Toggle theme",
     "toggle_theme_title": "Toggle theme",
     "worker_chat_title": "Worker · {name}",
@@ -206,11 +207,60 @@
   },
   "nav": {
     "chat": "Chat",
+    "cron": "Scheduled",
     "pixel_office": "Pixel Office",
     "settings": "Settings",
     "tasks_board": "Tasks",
     "workers": "Workers",
     "workflows": "Workflows"
+  },
+  "cron": {
+    "action": {
+      "pause": "Pause",
+      "resume": "Resume",
+      "trigger": "Run now"
+    },
+    "empty": {
+      "hint": "Tasks are created and managed by main — just ask in chat.",
+      "title": "No scheduled tasks yet"
+    },
+    "err": {
+      "title": "Failed to load scheduled tasks"
+    },
+    "loading": "Loading scheduled tasks…",
+    "never_run": "Never run",
+    "run_status": {
+      "claimed": "Claimed",
+      "completed": "Completed",
+      "failed": "Failed",
+      "running": "Running",
+      "unknown": "Unknown"
+    },
+    "runs": {
+      "empty": "No runs yet",
+      "error": "Failed to load runs",
+      "hide": "Hide runs",
+      "loading": "Loading runs…",
+      "retry": "Retry",
+      "show": "Recent runs"
+    },
+    "state": {
+      "completed": "Completed",
+      "error": "Error",
+      "paused": "Paused",
+      "scheduled": "Scheduled",
+      "unknown": "Unknown"
+    },
+    "terminal_hint": "Finished tasks can be handled via chat with main",
+    "ticker_down": "Scheduler is not running — jobs will not fire on time",
+    "title": "Scheduled Tasks",
+    "toast": {
+      "failed": "✗ Action failed: {err}",
+      "gone": "Task no longer exists; list refreshed",
+      "paused": "✓ Paused",
+      "resumed": "✓ Resumed",
+      "triggered": "✓ Queued for the next tick"
+    }
   },
   "pixel": {
     "aria": {
@@ -371,6 +421,7 @@
     "state_running": "Running",
     "state_unknown": "Unknown",
     "state_waiting": "Waiting",
+    "state_waiting_sub": "Subagent",
     "steered_in_progress": "Steering instructions injected into the current turn",
     "step_appended_label": "added",
     "step_appended_title": "Step {n} (added mid-run)",
@@ -421,7 +472,12 @@
     "token_short_label": "tokens",
     "token_cost_label": "cost",
     "token_missing": "—",
-    "token_detail_title": "{total} tokens ({in}/{out}/{cr}/{cw}/{reason}) · {cost} · {captured_at} · source={source}"
+    "token_detail_title": "{total} tokens ({in}/{out}/{cr}/{cw}/{reason}) · {cost} · {captured_at} · source={source}",
+    "todo_status_working": "Running",
+    "todo_status_blocked": "Needs your reply",
+    "todo_status_completed": "Completed",
+    "todo_status_failed": "Failed",
+    "todo_status_waiting_sub": "Subagent running"
   },
   "workers": {
     "avatar_change_aria": "Change {name}'s avatar",
@@ -517,6 +573,7 @@
     "status_offline": "Offline",
     "status_unknown": "Unknown",
     "status_waiting": "Waiting",
+    "status_waiting_sub": "Subagent",
     "status_working": "Busy",
     "tagline_label": "Tagline",
     "tagline_unknown": "Not set",

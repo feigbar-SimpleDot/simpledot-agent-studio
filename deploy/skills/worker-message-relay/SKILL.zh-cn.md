@@ -1,7 +1,7 @@
 ---
 name: worker-message-relay
 description: "Route worker questions and cross-worker information needs. Use when a worker task is NEED_CLARIFICATION / blocked, when one worker needs another worker's output, or when the user mentions 转发/转问/澄清/worker提问/worker之间通讯/relay."
-version: 2.0.0
+version: 2.1.0
 platforms: [linux]
 metadata:
   hermes:
@@ -86,3 +86,30 @@ python3 -m mw.cli resume --task <提问task_id> --instruction "你问的问题�
 python3 -m mw.cli status          # 账本: 谁 PENDING/NEED_CLARIFICATION/BLOCKED
 # Web 控制台: http://127.0.0.1:8700  待处理分组带 💬 回答按钮
 ```
+
+## 显式回执（issue #119）
+
+背景：`notify_confirmed_at` 原先只在 relay 真收到 gateway HTTP 200 时置位。gateway chat
+端点是全同步的（等 session turn lease + 跑完整回合才返回），客户端 timeout 早于服务端
+返回时确认位永远 NULL，卡会被反复重投。本端点让 main 消费完报告后主动确认，不必等那个
+可能永远不来的 200。
+
+```bash
+curl -s -X POST http://127.0.0.1:8700/api/relay/confirm \
+     -H 'Content-Type: application/json' \
+     -d '{"task_id": "<task_id>"}'
+```
+
+- 方法：POST；body `{"task_id": "<id>"}`。
+- 期望响应：200 `{"ok": true, "task_id": "...", "confirmed_at": <ts>}`。
+- 错误形态：400（缺 `task_id`）/ 404（`task not found`）——与内部错误（500）可区分。
+- 语义：置 `notify_confirmed_at` 并清退避/死信字段（`notify_attempts` → 0、
+  `notify_dead_until` → NULL、`notify_last_failed_at` / `notify_last_error` → NULL）。
+  死信卡（`notify_attempts >= 8`、`notify_dead_until` = now + 1 年）回执一次即恢复。
+- 幂等：同一张卡重复回执安全——结果一致、不报错、不重复发事件；只对显式点名的
+  `task_id` 生效，绝不批量扫描全表。
+- 与旧信号的关系：旧路径「relay 收到 HTTP 200 ⇒ 已确认」原样不动；本端点是给 main 的
+  显式替代通道，不是替换 relay 路径。不调用它时，现有行为逐字不变。
+
+典型用法：main 处理完某张 worker 报告后（含「已结算但从未送达」的历史卡），对该
+`task_id` 调用本端点闭环投递；若该卡已死信，同时完成恢复。

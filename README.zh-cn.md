@@ -49,6 +49,13 @@ open http://<host>:8700            # 控制台：聊天 / 看板 / 文件 / work
 | 变更日志（按合入顺序, 最新在前） | [CHANGELOG.md](CHANGELOG.md) |
 | English README | [README.md](README.md) |
 
+## 视频教程
+
+- [上手教程](https://youtu.be/2eWsBmwHzT0?si=NDQCfmLtZHU50LLt)
+- [进阶教程](https://youtu.be/ymXLxXRYZWk?si=K2SMFhe5qWcQah89)
+
+中文视频请搜索视频号 “SimpleClaw智能体工厂”。
+
 ## 致谢
 
 本平台建立在以下开源项目的肩膀上：
@@ -65,3 +72,7 @@ open http://<host>:8700            # 控制台：聊天 / 看板 / 文件 / work
 | [Vite](https://github.com/vitejs/vite) + [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) | 控制台构建工具与样式。 |
 
 感谢所有维护者。
+
+## 支持
+
+喜欢这个项目？欢迎 [请作者喝杯咖啡](https://buymeacoffee.com/feigbar) 支持它的持续开发。

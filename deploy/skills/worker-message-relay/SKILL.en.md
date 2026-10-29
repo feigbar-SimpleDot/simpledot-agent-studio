@@ -1,7 +1,7 @@
 ---
 name: worker-message-relay
 description: "Route worker questions and cross-worker information needs. Use when a worker task is NEED_CLARIFICATION / blocked, when one worker needs another worker's output, or when the user mentions `转发/转问/澄清/worker提问/worker之间通讯/relay`."
-version: 2.0.0
+version: 2.1.0
 platforms: [linux]
 metadata:
   hermes:
@@ -87,3 +87,37 @@ worker.
 python3 -m mw.cli status          # ledger: who is PENDING / NEED_CLARIFICATION / BLOCKED
 # Web console: http://127.0.0.1:8700  attention group has 💬 Answer button
 ```
+
+## Explicit relay confirm (issue #119)
+
+Background: `notify_confirmed_at` used to be set only when the relay actually received
+HTTP 200 from the gateway. The gateway chat endpoint is fully synchronous (it waits for
+the session turn lease and runs the whole turn before returning), so when the client
+times out before the server responds, the confirmation flag stays NULL forever and the
+card keeps getting re-delivered. This endpoint lets main confirm explicitly after it has
+consumed a report, without waiting for a 200 that may never come.
+
+```bash
+curl -s -X POST http://127.0.0.1:8700/api/relay/confirm \
+     -H 'Content-Type: application/json' \
+     -d '{"task_id": "<task_id>"}'
+```
+
+- Method: POST; body `{"task_id": "<id>"}`.
+- Expected response: 200 `{"ok": true, "task_id": "...", "confirmed_at": <ts>}`.
+- Error shapes: 400 (missing `task_id`) / 404 (`task not found`) — distinguishable from
+  internal errors (500).
+- Semantics: sets `notify_confirmed_at` and clears the backoff/dead-letter fields
+  (`notify_attempts` → 0, `notify_dead_until` → NULL, `notify_last_failed_at` /
+  `notify_last_error` → NULL). A dead-letter card (`notify_attempts >= 8`,
+  `notify_dead_until` = now + 1 year) recovers with one confirm call.
+- Idempotent: confirming the same card repeatedly is safe — same result, no error, no
+  duplicate events. It only affects the explicitly named `task_id`; it never batch-scans
+  the table.
+- Relationship to the old signal: the legacy path ("relay got HTTP 200 ⇒ confirmed") is
+  unchanged; this endpoint is an explicit alternative for main, not a replacement of the
+  relay path. When you don't call it, existing behavior is bit-for-bit identical.
+
+Typical use: after main has finished processing a worker report (including historical
+cards that were settled but never delivered), call this endpoint for that `task_id` to
+close the delivery loop and, if the card was dead-lettered, recover it.

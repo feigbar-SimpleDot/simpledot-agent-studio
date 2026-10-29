@@ -418,11 +418,18 @@ def test_g8_true_still_dead_null_slot_knocks() -> None:
 # =============================================================
 # G9: reap_once 已 HARVESTED 的卡不重 settle (现行 baseline 回归)
 # =============================================================
-def test_g9_harvested_terminal_not_resettled() -> None:
+def test_g9_harvested_terminal_not_resettled(tmp_path: Path) -> None:
     """harvest_status=HARVESTED 的卡 reap_once 不再 settle (现有白名单)。"""
     from mw import reaper
-    led, ws, tid = _setup(Path(tempfile.mkdtemp()))
-    base = Path(led.path).parent
+    # issue #126: 目录生命周期交给 pytest 的 tmp_path fixture。
+    # 旧写法 = 手工 tempfile.mkdtemp() + finally 里裸 shutil.rmtree(base);
+    # 但 reap_once 里的报告中继会起后台 _send 线程, 该线程事后重开 ledger
+    # (sqlite WAL) ⇒ 在 base 目录里重建 ledger.db-wal / ledger.db-shm。
+    # 并发跑测时 rmtree 扫完目录、后台线程正好落新文件 ⇒
+    # OSError: [Errno 39] Directory not empty (产品断言早已 PASS, 纯清理竞态)。
+    # tmp_path 的清理由 pytest 统一回收 (带锁 + 幂等重试), 不再与后台线程抢目录。
+    led, ws, tid = _setup(tmp_path)
+    base = tmp_path
     try:
         # 直接钉成 HARVESTED (模拟已完成)
         led.conn.execute(
@@ -447,7 +454,8 @@ def test_g9_harvested_terminal_not_resettled() -> None:
                 f"{rs}")
     finally:
         led.close()
-        import shutil; shutil.rmtree(base)
+        # issue #126: 不再 rmtree(base) —— 目录归 pytest tmp_path 生命周期管。
+        # 裸 rmtree 与 reap_once 起的后台 _send 线程抢同一个目录 ⇒ Errno 39。
 
 
 if __name__ == "__main__":
@@ -458,7 +466,13 @@ if __name__ == "__main__":
     test_g6_stale_todo_no_marker_skipped()
     test_g6_marker_task_id_mismatch_skipped()
     test_g8_true_still_dead_null_slot_knocks()
-    test_g9_harvested_terminal_not_resettled()
+    # issue #126: g9 改用 pytest tmp_path fixture; 直跑 (__main__) 时 fixture
+    # 不存在 ⇒ 传一个手工临时目录兜底, 保证两种跑法都绿。
+    # 用 TemporaryDirectory(ignore_cleanup_errors=True): 退出即回收 (不泄漏
+    # 临时目录), 且清理期若撞上 reap_once 的后台 _send 线程落 WAL 文件,
+    # 也只忽略清理错误、不把 __main__ 直跑搞挂。
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as _td:
+        test_g9_harvested_terminal_not_resettled(Path(_td))
     total = len(results)
     passed = sum(1 for r in results if r)
     print(f"\n{passed}/{total} passed")

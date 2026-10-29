@@ -35,6 +35,7 @@ After completion (both steps are required; missing either means the coordinator 
      cp '{todo_path}' '{todo_path}.tmp' && \
      sed -i 's/^- status: .*/- status: completed/' '{todo_path}.tmp' && \
      mv '{todo_path}.tmp' '{todo_path}'
+Terminal states must use the canonical English values (completed / failed / blocked); the platform also accepts Chinese variants (已完成/已失败/已阻塞) but English is the standard.
 
 ⚠ Modification boundary (strict):
 - You may **only** change the `status` and `result` lines of `## Current Task`.

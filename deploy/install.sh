@@ -221,6 +221,13 @@ fi
 # Issue #53 AC-53-04: host cp into the bind source dirs; no docker cp / docker exec.
 # 2026-10-18 (s1-req #53 C): hash compare / version stamp dropped — install.sh reports
 # what it copied, verify.sh is the place for byte-level checks.
+# issue#125 (2026-10-27, route A): 自本批起 mw/ui_dist **不再入库** — 仓库只 tracked
+# ui/dist/index.html 一份构建产物, mw/ui_dist/ 已进 .gitignore。本段 cp 是该目录的
+# **唯一**产物来源 (仓库不再自带这份), 每次 install 都从 ui/dist 重建 + 重写 stamp。
+# ⇒ 千万不要因为"目录不在 git 里"就删掉这段拷贝: 裸 clone 不跑 install.sh 时
+# console 会回退 console_ui.py 内置兜底页 (很旧的 HTML 常量), 这是预期行为。
+# 校验口径: 验 UI 一律以 ui/dist 构建为准 (curl 控制台首页比 md5), 绝不拿仓库/工作树里的
+# mw/ui_dist/index.html 当 UI 证据。门禁: deploy/check_dist_sync.sh (已接入 verify.sh)。
 UI_DIST_HTML="ui/dist/index.html"
 
 # s2b-fix-stamp (2026-10-18, TEST60-62 §6.1): 重写 .stamp.json, 与复制过去的

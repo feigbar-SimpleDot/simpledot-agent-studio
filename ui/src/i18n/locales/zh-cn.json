@@ -26,6 +26,7 @@
     "subtitle_tasks_board": "总 {total} · 待处理 {attention} · 进行中 {running} · 已完成 {finished}",
     "subtitle_workers": "注册路由 / 生成 compose / 查看运行元数据",
     "subtitle_workflows": "工作流模板 · 决定协作任务拆解粒度",
+    "subtitle_cron": "定时任务 · 由 main 创建与管理",
     "theme_toggle": "切换明暗",
     "toggle_theme_title": "切换明暗",
     "worker_chat_title": "Worker · {name}",
@@ -206,11 +207,60 @@
   },
   "nav": {
     "chat": "对话",
+    "cron": "定时任务",
     "pixel_office": "像素办公室",
     "settings": "设置",
     "tasks_board": "任务看板",
     "workers": "Worker 管理",
     "workflows": "Workflow 管理"
+  },
+  "cron": {
+    "action": {
+      "pause": "暂停",
+      "resume": "恢复",
+      "trigger": "立即运行"
+    },
+    "empty": {
+      "hint": "定时任务由 main 创建和管理，可在对话中让 main 帮你安排",
+      "title": "还没有定时任务"
+    },
+    "err": {
+      "title": "定时任务加载失败"
+    },
+    "loading": "加载定时任务…",
+    "never_run": "从未执行",
+    "run_status": {
+      "claimed": "已认领",
+      "completed": "完成",
+      "failed": "失败",
+      "running": "执行中",
+      "unknown": "未知"
+    },
+    "runs": {
+      "empty": "暂无执行记录",
+      "error": "执行记录加载失败",
+      "hide": "收起执行记录",
+      "loading": "加载执行记录…",
+      "retry": "重试",
+      "show": "查看最近执行"
+    },
+    "state": {
+      "completed": "已完成",
+      "error": "异常",
+      "paused": "已暂停",
+      "scheduled": "已排程",
+      "unknown": "未知"
+    },
+    "terminal_hint": "已结束的任务可通过与 main 对话处理",
+    "ticker_down": "调度器未在运行，任务不会按时执行",
+    "title": "定时任务",
+    "toast": {
+      "failed": "✗ 操作失败: {err}",
+      "gone": "任务已不存在，列表已刷新",
+      "paused": "✓ 已暂停",
+      "resumed": "✓ 已恢复",
+      "triggered": "✓ 已排入下次调度"
+    }
   },
   "pixel": {
     "aria": {
@@ -371,6 +421,7 @@
     "state_running": "执行中",
     "state_unknown": "未知",
     "state_waiting": "等介入",
+    "state_waiting_sub": "子任务处理中",
     "steered_in_progress": "转向指令已注入当前运行",
     "step_appended_label": "补",
     "step_appended_title": "第 {n} 步 (中途追加)",
@@ -421,7 +472,12 @@
     "token_short_label": "tokens",
     "token_cost_label": "成本",
     "token_missing": "—",
-    "token_detail_title": "{total} tokens ({in}/{out}/{cr}/{cw}/{reason}) · {cost} · {captured_at} · source={source}"
+    "token_detail_title": "{total} tokens ({in}/{out}/{cr}/{cw}/{reason}) · {cost} · {captured_at} · source={source}",
+    "todo_status_working": "执行中",
+    "todo_status_blocked": "等你回复",
+    "todo_status_completed": "已完成",
+    "todo_status_failed": "已失败",
+    "todo_status_waiting_sub": "子任务处理中"
   },
   "workers": {
     "avatar_change_aria": "更换 {name} 的头像",
@@ -517,6 +573,7 @@
     "status_offline": "离线",
     "status_unknown": "状态未知",
     "status_waiting": "等介入",
+    "status_waiting_sub": "子任务处理中",
     "status_working": "工作中",
     "tagline_label": "签名",
     "tagline_unknown": "未标注",

@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -43,6 +42,22 @@ def test_en_zh_cn_key_set_equal():
     assert en_keys == zh_keys, (
         f"key-set mismatch: only in en={en_keys - zh_keys}, "
         f"only in zh={zh_keys - en_keys}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# G1b: JSON 与 console_ui._LANG_TABLES 交集内 **值** 一致 (issue #121 F-1)
+#      原守护只查键集, 值漂移 (ph_url 双表不一致) 无人拦截; 本条堵口。
+# ──────────────────────────────────────────────────────────────────
+def test_json_vs_lang_tables_value_consistency():
+    import mw.console_ui as cui
+    for lang, json_name in (("en", "en.json"), ("zh-cn", "zh-cn.json")):
+        tbl = cui._LANG_TABLES[lang]
+        js = json.loads(
+            (ROOT / "mw" / "i18n" / json_name).read_text(encoding="utf-8"))
+        shared = set(tbl) & set(js)
+        assert shared, f"{lang}: 两表无交集, 守护失效"
+        diff = {k: (tbl[k], js[k]) for k in shared if tbl[k] != js[k]}
+        assert not diff, f"{lang} 表值漂移: {diff}"
 
 
 # ──────────────────────────────────────────────────────────────────

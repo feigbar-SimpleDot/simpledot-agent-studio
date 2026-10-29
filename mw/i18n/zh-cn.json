@@ -76,7 +76,7 @@
   "console.fallback.ph_api_key": "placeholder=\"worker gateway 的 API key\"",
   "console.fallback.ph_compose_api_key": "placeholder=\"给这个 worker 设一个 API key\"",
   "console.fallback.ph_reviewer": "placeholder=\"如 reviewer\"",
-  "console.fallback.ph_url": "placeholder=\"http://<host>:8643\"",
+  "console.fallback.ph_url": "placeholder=\"http://hermes_<name>:8642\"",
   "console.fallback.refresh": "onclick=\"load()\">刷新</button>",
   "console.fallback.save": ">保存</button>",
   "console.fallback.search_placeholder": "placeholder=\"🔍 搜索任务标题 / ID\"",

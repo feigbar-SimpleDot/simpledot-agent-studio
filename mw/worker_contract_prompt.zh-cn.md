@@ -34,6 +34,7 @@
      cp '{todo_path}' '{todo_path}.tmp' && \
      sed -i 's/^- 状态: .*/- 状态: completed/' '{todo_path}.tmp' && \
      mv '{todo_path}.tmp' '{todo_path}'
+终态一律写英文规范值 (completed / failed / blocked); 平台兼容中文写法 (已完成/已失败/已阻塞 等), 但规范是英文。
 
 ⚠ 修改权限边界 (严格遵守):
 - 你【只能】改『当前任务』的『状态』『结果』两行。

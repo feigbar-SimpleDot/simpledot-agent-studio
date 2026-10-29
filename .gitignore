@@ -28,6 +28,15 @@ _workflows_cache.json
 manifest_t_*.json
 spawn/
 
+# issue#125 (路线A): mw/ui_dist 是 install.sh 每次从 ui/dist 重建的部署期拷贝,
+# 不入库。仓库只保留 ui/dist/index.html 一份 tracked 构建产物, 杜绝双份漂移。
+# 必须整目录收录 (不是只收 index.html) —— .stamp.json 等伴生文件一并挡住,
+# 防止未来新增文件再被误 tracked。
+mw/ui_dist/
+
+# issue#128: install.sh 同步到宿主 share 副本 (bind mount 进容器 /share_workspace/ui_dist)
+data/share_workspace/ui_dist/
+
 # m1-impl (macOS 目录挂载): install.sh 每次全量重建的宿主暂存目录 (skills/SOUL 挂载源)
 deploy/.runtime-skills/
 deploy/.runtime-soul/

@@ -60,6 +60,11 @@ open http://<host>:8700            # console: chat / kanban / files / workers
 | Changelog (merged changes, newest first) | [CHANGELOG.md](CHANGELOG.md) |
 | Simplified-Chinese README | [`中文`](README.zh-cn.md) |
 
+## Video tutorials
+
+- [Getting started walkthrough](https://youtu.be/2eWsBmwHzT0?si=NDQCfmLtZHU50LLt)
+- [Advanced walkthrough](https://youtu.be/ymXLxXRYZWk?si=K2SMFhe5qWcQah89)
+
 ## Acknowledgements
 
 This platform stands on the shoulders of these open-source projects:
@@ -76,3 +81,7 @@ This platform stands on the shoulders of these open-source projects:
 | [Vite](https://github.com/vitejs/vite) + [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) | Console build tooling and styling. |
 
 Thanks to all their maintainers.
+
+## Support
+
+Enjoying this project? Consider [Buy Me a Coffee](https://buymeacoffee.com/feigbar) to support its development.

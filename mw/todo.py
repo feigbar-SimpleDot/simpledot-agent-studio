@@ -152,6 +152,48 @@ TERMINAL_STATUSES = frozenset({STATUS_COMPLETED, STATUS_FAILED})
 # reaper 关心的"需要 main 介入"集合
 ATTENTION_STATUSES = frozenset({STATUS_BLOCKED})
 
+# issue #124: 状态值中英别名总表 (单一归一化入口)。
+# 规范值 = 英文 (completed/failed/blocked/working/waiting_sub);
+# 中文与常见变异仅作兼容别名, 一律 lower()+strip() 后查表。
+# 未识别 → None (调用方按"未识别"处理, 与现状语义一致, 不新增猜测)。
+STATUS_ALIASES: dict = {
+    STATUS_COMPLETED: frozenset({
+        "completed", "complete", "done", "已完成", "完成"}),
+    STATUS_FAILED: frozenset({
+        "failed", "fail", "已失败", "失败"}),
+    STATUS_BLOCKED: frozenset({
+        "blocked", "block", "已阻塞", "阻塞"}),
+    STATUS_WORKING: frozenset({
+        "working", STATUS_INPROGRESS, "in-progress", "inprogress",
+        "in_progress"}),
+    STATUS_WAITING_SUB: WAITING_SUB_ALIASES,   # waiting_sub/waiting-sub/等待子任务
+}
+
+# 反查索引: 别名 → 规范值 (模块加载时构建一次)
+_STATUS_ALIAS_INDEX = {
+    alias: canon
+    for canon, aliases in STATUS_ALIASES.items()
+    for alias in aliases
+}
+
+# "在干 (不结算)" 集合: working 与 waiting_sub 都属之, 语义对齐旧 in_progress_set
+IN_PROGRESS_SET = frozenset({STATUS_WORKING, STATUS_WAITING_SUB})
+
+
+def normalize_status(raw) -> "str | None":
+    """把 TODO.md『状态』原始值归一化为英文规范值; 未识别 → None。
+
+    大小写 / 首尾空白不敏感 (CJK 不受 lower 影响)。
+    这是全仓唯一的状态语义入口: reaper / console 一律经此判状态,
+    禁止再写本地字面量集合 (issue #124 R-124-A/B)。
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    return _STATUS_ALIAS_INDEX.get(s)
+
 
 @dataclass
 class TodoTask:
@@ -250,15 +292,83 @@ class TodoDoc:
         return "\n".join(lines)
 
 
+# issue #139: 『当前任务』段字段行的**唯一识别点** (形态类容错集中于此)。
+# 旧实现四入口各持一份字段行正则、各自演化 ⇒ indented 形态入口间不一致。
+# 收敛为单一正则后, 缩进 / `*` bullet / 缺 `- ` 前缀 三种形态在同一处识别。
+#
+# 语义不放宽的护栏 (由调用方负责, 本函数无段概念):
+#   - 键名仍由调用方过 _canonical_field_key 折算 (本函数不做别名归一化);
+#   - 段限定由调用方的 in_current 把关 —— 不得在『当前任务』段外调用本
+#     函数, 否则等于复活被刻意删除的「全文件扫一行式状态字段」fallback
+#     (2026-10-03 减法: 该 fallback 掩盖过 worker 丢 `- ` 前缀的静默失败)。
+#   - 缺 `- ` 前缀的容错**只在段内**发生: 段外无 `- ` 前缀的普通文本行
+#     永不进入本函数 (调用方 continue 掉), 因此不违背上述减法决定。
+#
+# issue #139-F1 (2026-10-29): 代价特性 —— 本识别点必须有**线性上界**。
+# 旧 pattern `^\s*[-*]?\s*([^:：]+?)\s*[:：]\s*(.*)$` 把三个相邻量词
+# (`\s*` + `[-*]?` + `\s*` + 惰性 `([^:：]+?)` + `\s*`) 作用在同一段前导
+# 空白 run 上 ⇒ 行内**无冒号**时, 引擎须对「空白 run 的每一种切分」逐一回溯,
+# 成本实测呈超线性 (拟合幂次约 n^3.5~n^4.1, 随 n 区间而变; 400 空格单行
+# ≈ 17.6 s; 属结算面 reaper 每 15 s 串行轮询的热路径 ⇒ 单行可把一轮结算
+# 拖到分钟级)。这是本批 #139 引入的回归
+# (基线 dc71a31 的 `^-\s*(?i:状态|status)[:：]\s*(.*)$` 强制行首字面 `-`,
+# 无冒号行近零耗时失败)。
+#
+# 本次修复两处, 两者合起来把**整类**成本压到线性:
+#   (1) 键名组 `([^:：]+?)` → `([^:：]+)` (惰性改贪婪): 键名组与冒号之间
+#       不再留第二个相邻 `\s*` ⇒ 消除「键区内长空白 run」的二次回溯
+#       (实测 'x'+3200 空格+'y: v': 156.7 ms → 0.032 ms);
+#   (2) 键名组后**保留** `\s*` (不改写 pattern 语义): 键名与冒号之间的
+#       空白仍被吃掉, 与旧实现逐字等价 (见 _match_field_line 内的说明)。
+# 无冒号行的回溯由 _match_field_line 入口的**廉价短路**消除 (该 pattern
+# 必含冒号才可能匹配 ⇒ 短路逐字等价), 无需在此处改 pattern。
+#
+# 成本守护: tests/test_issue139_todo_contract_robustness.py 的 T-H 组
+# (深前导空白 + 无冒号行 / 耗时上界断言, 标准库 time.perf_counter 实测,
+# 仓库无 pytest-timeout 依赖, 不引入新依赖)。
+_FIELD_LINE = re.compile(r"^\s*[-*]?\s*([^:：]+)\s*[:：]\s*(.*)$")
+
+
+def _match_field_line(ln: str) -> "tuple[str, str] | None":
+    """识别『当前任务』段字段行, 返回 (键, 值) 或 None (issue #139)。
+
+    容错形态: 行首缩进 / `-` 或 `*` bullet / 缺 `- ` 前缀 三种都识别。
+    键、值各自 strip; 值可含冒号 (只切第一个)。段限定由调用方保证。
+
+    issue #139-F1 (2026-10-29) 代价上界: 入口**廉价短路** —— 本 pattern
+    必含冒号 (ASCII `:` 或全角 `：`) 才可能匹配, 故「行内无冒号」直接
+    返回 None, 与旧实现**逐字等价**, 却彻底消除该形态下的超线性回溯
+    (400 空格单行: 17.6 s → 0.002 ms)。短路是 O(n) 扫描, 不引入新依赖。
+    """
+    if ":" not in ln and "：" not in ln:
+        return None                      # 无冒号 ⇒ pattern 必不匹配 (等价短路)
+    m = _FIELD_LINE.match(ln)
+    if not m:
+        return None
+    return m.group(1).strip(), m.group(2).strip()
+
+
+def _is_current_header(raw: str) -> bool:
+    """段头字面 raw 是否『当前任务』段头 (中英别名都识别, issue #139)。
+
+    收敛现散在 parse_status / current_binding / diagnose 三处的段头判定
+    副本 (write_status_atomic 的副本属写面红线, 不动)。
+    """
+    zh, en = BILINGUAL_HEADER_ALIASES[CURRENT_HEADER]
+    return raw == zh or raw == en
+
+
 def _parse_kv(section_lines: List[str]) -> dict:
-    """解析 '- key: value' 行为 dict。value 可含冒号, 只切第一个。"""
+    """解析『当前任务』段字段行为 dict。value 可含冒号, 只切第一个。
+
+    issue #139: 行识别收敛到 _match_field_line (缩进 / bullet / 缺 `- `
+    前缀容错), 段限定由调用方保证 (全仓唯一调用点只喂当前任务段)。
+    """
     out = {}
     for ln in section_lines:
-        m = re.match(r"^\s*-\s*([^:：]+)[:：]\s*(.*)$", ln)
+        m = _match_field_line(ln)
         if m:
-            key = m.group(1).strip()
-            val = m.group(2).strip()
-            out[key] = val
+            out[m[0]] = m[1]
     return out
 
 
@@ -302,6 +412,56 @@ def _canonical_field_key(raw_key: str) -> str:
         if k.lower() == lk or en.lower() == lk:
             return cn
     return raw_key
+
+
+# issue #152 + #139: 行号前缀容错 —— 剥 `^\s*\d+[|\t]` 两种形态 (竖线 / 制表符)。
+#
+# 为什么是「行级剥离」而不是「只在字段正则处剥」:
+#   段头检测 (`## `) 与字段行检测是**两个独立环节**。只把前缀剥在字段
+#   正则 (如 parse_status 的状态行正则) 上, 段头行 `3|## 当前任务` 仍然
+#   匹配不上 `## ` ⇒ 循环体根本不进 ⇒ 状态行永远读不到。故必须**按行**
+#   剥离, 让整份文件回到无前缀形态, 再交给既有解析规则。
+#
+# 为什么是「解析时容错」而不是「写时修复」 (issue #152 §建议修法 3):
+#   写时修复会覆盖 worker 的原意 —— write_status_atomic() 是 worker 的
+#   写入口, 在写入前把整份文件重写为无前缀形态, 等于平台替 worker 改写了
+#   它交付的产物内容, 且写面是所有写入路径的共同入口, 影响面远超状态字段。
+#   读侧容错 = 平台更宽容地理解 worker 写出的同义形态, 不改变磁盘上任何
+#   字节 ⇒ TODO.md 写入面不变 (issue #152 红线第 1 条)。
+#
+# 为什么只影响读侧: 四个调用方 (parse / parse_status / current_binding /
+#   verify_current_task_binding) 全是纯读函数, 写入口 write_status_atomic
+#   不走本函数 ⇒ TODO.md 写入面不变。
+#
+# 容错范围**只**覆盖 `^[ \t]*\d+[|\t]` 两种行号前缀形态 (read_file /
+#   nl -ba 的 `N|` 与 cat -n 的 `数字+制表符`)。issue #139 有意把制表符
+#   形态纳入 (推翻 I 批 PLAN-I §10 Q-A 登记的遗留边界, 计划内变更);
+#   段划分、字段名双键、pending/done 计数、状态值字面一律不放宽。
+_LINE_NUM_PREFIX = re.compile(r"^[ \t]*\d+[|\t]")
+
+
+def _strip_line_num_prefix(text: str) -> str:
+    """剥掉每行的 `N|` / `N<TAB>` 行号前缀 (issue #152 + #139, 幂等)。
+
+    认 `^[ \\t]*\\d+[|\\t]` 两种形态 —— read_file / nl -ba 的 `N|` 与
+    `cat -n` 的 `数字+制表符`; 其它前缀形态 (如 `12:` / `12)`) 不在容错
+    范围, 保持原样, 让既有解析规则照旧判定。
+
+    快路径已移除 (issue #139): 旧实现 `if "|" not in text: return text`
+    使 pattern 只对含竖线文本生效 (#153 登记的掩蔽坑) —— tab 形态输入
+    无竖线, 保留快路径则 tab 容错静默无效。本实现**对每一行都应用**
+    pattern, 不存在按字符短路的掩蔽路径。
+
+    与 PLAN-K §1.2 字面「函数体只剩 splitlines+sub+join」的一处偏差:
+    纯 join 会丢尾部换行, 与 152 守护文件 L194/L296 (钉「无竖线原文逐字
+    返回原串」) 冲突, 而 §1.5 要求该文件除 tab 行外全部保持绿 ⇒ 取
+    「无任何行被改动 ⇒ 逐字原样返回」的等价写法, 语义严格不宽于纯 join。
+    """
+    lines = text.splitlines()
+    stripped = [_LINE_NUM_PREFIX.sub("", ln) for ln in lines]
+    if stripped == lines:
+        return text                      # 零改动: 逐字原样 (含尾部换行)
+    return "\n".join(stripped)
 
 
 def _normalize_kv(raw_kv: dict) -> dict:
@@ -363,6 +523,9 @@ def parse(path: Path) -> Optional[TodoDoc]:
     if not p.exists():
         return None
     text = p.read_text(encoding="utf-8")
+    # issue #152: 行级剥离行号前缀 (容错口径见 _strip_line_num_prefix 注释),
+    # 段划分/字段名/pending 计数语义零放宽 —— 剥完交给既有规则。
+    text = _strip_line_num_prefix(text)
     # title 从 '# Team Work: xxx' 取
     title = ""
     m = re.search(r"^#\s+Team Work:\s*(.+)$", text, re.MULTILINE)
@@ -449,11 +612,14 @@ def parse_status(path: Path) -> str | None:
     reaper 每 15s 轮询 PENDING 卡时调用, 只看『状态』一行就知道要不要
     结算, 不解析整份文档。
 
-    统一格式 (2026-10-03 减法): 只认『## 当前任务』段内的 `- 状态: <值>` 行。
+    统一格式 (2026-10-03 减法): 只认『## 当前任务』段内的状态字段行。
     文件不存在 / 没有当前任务段 / 没有状态行 → 返回 None
     (reaper 视为未知, 走保守等待)。
     旧的"全文件扫一行式状态字段" fallback 已删 —— 它掩盖过 worker 写错
     格式 (丢 `- ` 前缀) 的静默失败, 统一格式后不再需要。
+    ★ issue #139 的「缺 `- ` 前缀」容错**不违背**该决定: 容错严格限定
+    『当前任务』段内 (段外行根本不进识别点), 不是全文件扫描; 段内识别
+    与 parse / current_binding 的既有宽松度对齐, 消除入口间不一致。
 
     I18N-R3 (2026-10-16): 段头与键名都按双键别名识别 —— en 部署写
     `## Current Task` + `- status: working` 也正常读。返回值原样 (reaper
@@ -461,6 +627,15 @@ def parse_status(path: Path) -> str | None:
 
     兼容性: 枚举值大小写不敏感 (reaper 端 lower); 其他值原样返回
     (便于 main 写自定义状态)。
+
+    issue #152 (2026-10-29): 行号前缀容错 —— worker 用带行号的读法抓全文
+    原样写回时, 每行形如 `12|- 状态: completed`。解析前做**行级**剥离
+    (见 _strip_line_num_prefix), 段头与状态行同时恢复 ⇒ 返回**正确状态值**
+    而非 None。只影响读侧, 写入面不变。
+
+    issue #139 (2026-10-29): 段内字段行识别收敛到 _match_field_line ——
+    缩进 / `*` bullet / 缺 `- ` 前缀 三种形态与 parse / current_binding
+    同口径识别 (四入口一致); 容错仍限段内, 状态值仍原样返回。
     """
     p = Path(path)
     if not p.exists():
@@ -469,22 +644,20 @@ def parse_status(path: Path) -> str | None:
         text = p.read_text(encoding="utf-8")
     except OSError:
         return None
+    text = _strip_line_num_prefix(text)      # issue #152 + #139
     in_current = False
     for ln in text.splitlines():
         s = ln.strip()
         if s.startswith("## "):
-            raw = s[3:].strip()
-            in_current = any(raw == zh or raw == en
-                             for zh, en in BILINGUAL_HEADER_ALIASES.values()
-                             if zh == CURRENT_HEADER)
+            in_current = _is_current_header(s[3:].strip())
             continue
         if not in_current:
             continue
         # 双键 + 大小写不敏感: `状态:` / `status:` / `STATUS:` / `sTaTuS:`
-        # 都识别 (§ I18N-R3 M-1, 行为对齐 _canonical_field_key)。
-        m = re.match(r"^-\s*(?i:状态|status)[:：]\s*(.*)$", ln)
-        if m:
-            v = m.group(1).strip()
+        # 都识别 (§ I18N-R3 M-1, 经 _canonical_field_key 折算)。
+        m = _match_field_line(ln)
+        if m and _canonical_field_key(m[0]) == "状态":
+            v = m[1]
             return v if v else None
     return None
 
@@ -632,6 +805,13 @@ def current_binding(path) -> Optional[dict]:
 
     I18N-R3 (2026-10-16): 段头与字段名双键识别 (中英段头 / 中英键名都
     通吃), kv dict 归一化到中文协议键后, 既有 kv.get("状态", "") 仍命中。
+
+    issue #152 (2026-10-29): 与 parse_status 同口径的行号前缀容错 (行级
+    剥离, 见 _strip_line_num_prefix); verify_current_task_binding 经本函数
+    继承容错, 三种 reason 语义不变 —— 四入口行为一致。
+
+    issue #139 (2026-10-29): 字段行识别收敛到 _match_field_line, 与
+    parse_status 同口径 (缩进 / bullet / 缺 `- ` 前缀 段内容错)。
     """
     p = Path(path)
     if not p.exists():
@@ -643,6 +823,7 @@ def current_binding(path) -> Optional[dict]:
         # 非法 UTF-8 字节必须同样归入 todo_missing fail-closed —— 否则异常逃逸
         # 使 launch 跳过 ABORTED 回滚留 ACTIVE run、advance 返 500 非 409。
         return None
+    text = _strip_line_num_prefix(text)      # issue #152 + #139
     in_current = False
     raw_kv: dict = {}
     for ln in text.splitlines():
@@ -650,17 +831,15 @@ def current_binding(path) -> Optional[dict]:
         if s.startswith("## "):
             # 遇到下一个 '## ' 段即结束当前段扫描
             raw = s[3:].strip()
-            in_current = any(raw == zh or raw == en
-                             for zh, en in BILINGUAL_HEADER_ALIASES.values()
-                             if zh == CURRENT_HEADER)
+            in_current = _is_current_header(raw)
             if not in_current and raw_kv:
                 break
             continue
         if not in_current:
             continue
-        m = re.match(r"^\s*-\s*([^:：]+)[:：]\s*(.*)$", ln)
+        m = _match_field_line(ln)
         if m:
-            raw_kv[m.group(1).strip()] = m.group(2).strip()
+            raw_kv[m[0]] = m[1]
     if not raw_kv:
         return None
     # 键名归一化到中文协议键 (BILINGUAL_FIELD_ALIASES)
@@ -729,6 +908,48 @@ def verify_current_task_binding(path, task_id: str,
         "actual_status": binding["status"] or None,
         "todo_path": todo_path,
     }
+
+
+def diagnose(path) -> dict:
+    """issue #139 可观测入口: 读状态并说明读不出的原因。纯读零副作用。
+
+    背景: 状态读不出时 reaper 走保守等待 / fail-open 收尸, 全程零诊断
+    信息。本函数给调用方 (测试 / main 排障) 一个可区分的 reason, 不接入
+    reaper 结算路径、不加运行时告警 ⇒ 零噪音 (PLAN-K §1.2 改动 6 裁决)。
+
+    返回 {"status": <原样状态值或 None>, "reason": <以下之一>}
+      file_missing       — 文件不存在 / OSError / 非法 UTF-8 (与 current_binding
+                           的 todo_missing fail-closed 口径对齐)
+      no_current_section — 无『当前任务』段 (含中英别名)
+      no_status_line     — 段内无状态字段行
+      unrecognized_value — 有状态行但值为空或 normalize_status 归一化不了
+      ok                 — 正常读出
+    """
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {"status": None, "reason": "file_missing"}
+    text = _strip_line_num_prefix(text)
+    in_current = False
+    seen_current = False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("## "):
+            in_current = _is_current_header(s[3:].strip())
+            seen_current = seen_current or in_current
+            continue
+        if not in_current:
+            continue
+        m = _match_field_line(ln)
+        if m and _canonical_field_key(m[0]) == "状态":
+            v = m[1]
+            if not v or normalize_status(v) is None:
+                return {"status": v or None, "reason": "unrecognized_value"}
+            return {"status": v, "reason": "ok"}
+    if not seen_current:
+        return {"status": None, "reason": "no_current_section"}
+    return {"status": None, "reason": "no_status_line"}
 
 
 def rotate(path: Path, next_task: Optional[TodoTask]) -> Optional[TodoDoc]:

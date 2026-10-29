@@ -107,19 +107,31 @@ test('i18n: 顶层全量 flatten 键集合 en == zh (基线 639 → 643 → 644)
   // + tboard.answered_badge (卡片「已被 X 于 HH:MM 答复」角标), 双语同 commit。
   // 653 → 652: issue #109 删除 workers.compose_port_label (创建 Worker 不再
   // 填宿主端口), 双语同 commit —— 键数锚随合法删除同步下调。
-  assert(fe.size === 652 && fz.size === 652,
-    `期望 653-1=652 键, 实际 en=${fe.size} zh=${fz.size}`)
+  // 652 → 686: cron 定时任务视图 (s4 / 卡 t_da1c3a64) 新增 34 键
+  // (nav.cron + app.subtitle_cron + cron.* 子树 32 键), 双语同 commit
+  // (INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 686 → 688: issue #132 新增 tboard.state_waiting_sub +
+  // workers.status_waiting_sub (waiting_sub 派生态显示「子任务处理中」,
+  // 双语同 commit, INV-09 先例口径)。
+  // 688 → 693: issue #146 新增 tboard.todo_status_* 五键 (TODO 状态 chip
+  // 文案 i18n 化, 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  assert(fe.size === 693 && fz.size === 693,
+    `期望 688+5=693 键, 实际 en=${fe.size} zh=${fz.size}`)
 })
 
-test('i18n: tboard 子 dict 键集合差集为空 (121+2=123)', () => {
+test('i18n: tboard 子 dict 键集合差集为空 (124+5=129)', () => {
   const te = en.tboard, tz = zh.tboard
   const ke = new Set(Object.keys(te)), kz = new Set(Object.keys(tz))
   eq([...ke].filter((k) => !kz.has(k)), [], 'tboard only-in-en')
   eq([...kz].filter((k) => !ke.has(k)), [], 'tboard only-in-zh')
   // 120 → 121: issue #79 新增 todo_viewer_title_toggle_show (双语同 commit)。
   // 121 → 123: issue #116 新增 reply_conflict + answered_badge (双语同 commit)。
-  assert(ke.size === 123 && kz.size === 123,
-    `期望 tboard 123 键, 实际 en=${ke.size} zh=${kz.size}`)
+  // 123 → 124: issue #132 新增 state_waiting_sub (双语同 commit)。
+  // 124 → 129: issue #146 新增 todo_status_working / todo_status_blocked /
+  // todo_status_completed / todo_status_failed / todo_status_waiting_sub
+  // (双语同 commit)。
+  assert(ke.size === 129 && kz.size === 129,
+    `期望 tboard 129 键, 实际 en=${ke.size} zh=${kz.size}`)
 })
 
 test('i18n: 4 个 token 新键双边存在且在 tboard.* 下', () => {

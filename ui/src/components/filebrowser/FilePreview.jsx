@@ -97,7 +97,7 @@ function TextPreview({ project, selection, onError, registerRetry }) {
         <div className="md-body text-[13px]" dangerouslySetInnerHTML={md(content)} />
       ) : (
         <pre className="font-mono text-[12px] leading-relaxed whitespace-pre-wrap
-                        text-ink">{content}</pre>
+                        wrap-anywhere text-ink">{content}</pre>
       )}
     </div>
   )

@@ -82,7 +82,7 @@ def _run_alert(led: Ledger, **kw):
     with mock.patch.object(reaper_mod, "_send_to_main",
                           lambda *a, **k: sent.append(a) or True):
         results = []
-        reaper_mod._notify_post_terminal_output(led, None, results, **kw)
+        reaper_mod._notify_post_terminal_output(led, results, **kw)
     return [a[1] for a in sent], results
 
 
@@ -227,6 +227,28 @@ def test_c5_no_workspace_silent(tmp_path):
         led.close()
 
 
+def test_f4_no_initiator_not_notified(tmp_path, monkeypatch):
+    """issue #121 F-4: 有新产出但无发起人 ⇒ verdict=NO_INITIATOR, 不记 NOTIFIED。"""
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    led = _led(tmp_path)
+    try:
+        ws = tmp_path / "ws_f4"
+        settled = _seed_terminal(led, "t_f4", str(ws))
+        _touch(ws / "late.py", settled + 300)
+        # 抹掉发起人 ⇒ sid 缺失, 投递路径走 else 分支
+        led.conn.execute("DELETE FROM task_initiators WHERE task_id='t_f4'")
+        led.conn.commit()
+        msgs, results = _run_alert(led)
+        assert not msgs, f"无 key 仍敲门: {msgs}"
+        hits = [r for r in results if r.get("task_id") == "t_f4"]
+        assert hits and all(r["verdict"] == "NO_INITIATOR" for r in hits), results
+        assert not any(r.get("verdict") == "NOTIFIED" for r in results), results
+        # 事件仍应落盘 (去重戳不因未投递而丢)
+        assert len(_alerts(led, "t_f4")) == 1
+    finally:
+        led.close()
+
+
 # ── D: 开关与配置 ─────────────────────────────────────────────────
 
 def test_d1_switch_off_disables(monkeypatch, tmp_path):
@@ -304,8 +326,23 @@ def test_e2_reap_once_integration(tmp_path):
         led.close()
 
 
-def test_e3_scan_cap_bounds_work(tmp_path):
-    """cap 生效: 新产出在 cap 之后 ⇒ 扫不到 (有界遍历, 不无限扫大仓)。"""
+_REAL_WALK = os.walk  # 抓真 walk 引用, 防 monkeypatch 后 _sorted_walk 自递归
+
+
+def _sorted_walk(root, *args, **kwargs):
+    """把 os.walk 包装为确定性排序遍历 (测试专用, 去 readdir 序依赖)。"""
+    for dirpath, dirnames, filenames in _REAL_WALK(root, *args, **kwargs):
+        yield dirpath, sorted(dirnames), sorted(filenames)
+
+
+def test_e3_scan_cap_bounds_work(tmp_path, monkeypatch):
+    """cap 生效: 新产出在 cap 之后 ⇒ 扫不到 (有界遍历, 不无限扫大仓)。
+
+    issue #120: 本断言依赖遍历序 ("前 5 个全旧"), 原写法在 ext4
+    dir_index 下 f10_new 可能被 readdir 排进前 5 导致恒红; 用排序
+    包装 os.walk 去掉文件系统序依赖, 语义 (cap 有界) 不变。
+    """
+    monkeypatch.setattr(reaper_mod.os, "walk", _sorted_walk)
     ws = tmp_path / "ws_e3"
     ws.mkdir()
     base_ts = time.time() - 1000
@@ -313,7 +350,7 @@ def test_e3_scan_cap_bounds_work(tmp_path):
     for i in range(10):
         _touch(ws / f"f{i:02d}.py", base_ts - 100)
     _touch(ws / "f10_new.py", base_ts + 500)
-    # cap=5: 只扫前 5 个 (全旧) ⇒ 无命中
+    # cap=5: 只扫前 5 个 (排序后全旧) ⇒ 无命中
     assert reaper_mod._find_new_output(ws, base_ts, cap=5) is None
     # cap=50: 扫到第 11 个 ⇒ 命中
     hit = reaper_mod._find_new_output(ws, base_ts, cap=50)

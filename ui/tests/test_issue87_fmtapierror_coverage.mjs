@@ -56,6 +56,11 @@ const RW = countResidual(workers), RB = countResidual(board)
 let failed = 0
 function test(n, f) { try { f(); console.log(`ok - ${n}`) } catch (e) { failed++; console.error(`FAIL - ${n}\n  ${e.message}`) } }
 function assert(c, m) { if (!c) throw new Error(m) }
+// #144: 集合恒等断言用的深比较 (JSON 逐字), 与 test_cron_view.mjs 同款口径。
+function eq(a, b, m) {
+  const sa = JSON.stringify(a), sb = JSON.stringify(b)
+  if (sa !== sb) throw new Error(`${m || ''} 期望 ${sb}, 实得 ${sa}`)
+}
 
 test('S2-a WorkersView 无裸 e.message||e 残留 (issue #84 全覆盖口径)', () => {
   assert(RW === 0, `期望 0, 实际 ${RW}`)
@@ -113,7 +118,20 @@ test('S2-g 正常代码不误报矩阵 + squash 边界语义钉桩 (issue #90 �
 })
 
 // ---- issue #92: countResidual 与 countCalls 整行注释排除对称化 ----
-test('S2-h 两计数器注释排除口径对称 (issue #92, 示例注释不再使 S2-b 假红)', () => {
+// issue #144: S2-h 的**行号锚**改**内容锚** —— 行号锚在上方增删行时漂移
+// (该文件注释自证已漂移两轮: #92→#116 插 8 行、#132 插 9 行;
+//  MV-132-A 首轮全量 npm test 即因此假红)。
+// 锚的选取原则 (PLAN-H §4.2):
+//   ① **内容锚**而非行号锚 —— 抗行号漂移;
+//   ② 特征串必须**唯一命中同一个残留** —— 放宽成宽泛串 = 假绿;
+//   ③ 锚的语义是「这行**就是**一处 `x.message || x` 残留」—— 用
+//      **反向引用捕获组** (`(\w+)\??\.message\s*\|\|\s*\1`) 表达
+//      「同一标识符」, 与 RESIDUAL 的语义**同构**, 不引入第二套语义;
+//   ④ 锚集合必须与 RESIDUAL 集合**恒等** (不多不少) —— 只断「命中」
+//      不断「全集」会漏检 (删掉一处残留后另一处仍命中 ⇒ 假绿)。
+//   ★ 锚与词条键 `common.load_failed` **耦合** (MV-144-E 实测): 若该键改名,
+//     锚会失配并显式报红 (集合恒等断言) —— 届时必须同步更新锚, 不得放宽。
+test('S2-h 两计数器注释排除口径对称 + 残留内容锚定位 (issue #92 / #144)', () => {
   // 合成源: 1 处真残留 + 1 行含 x.message||x 的示例注释 + 1 处真调用 + 1 行含
   // fmtApiError( 的示例注释。对称口径 ⇒ 各计 1 (旧版残留侧不剥注释 ⇒ 计 2)。
   const synth = [
@@ -124,12 +142,58 @@ test('S2-h 两计数器注释排除口径对称 (issue #92, 示例注释不再�
   ].join('\n')
   assert(countResidual(synth) === 1, `残留应计 1, 实际 ${countResidual(synth)}`)
   assert(countCalls(synth) === 1, `调用点应计 1, 实际 ${countCalls(synth)}`)
-  // 现网两残留锚 [1410,1421] 复核非注释形态 (#92 要求同步核对; #116 在
-  // 文件前部插入 8 行角标 JSX, 锚随漂移): 剥注释后仍在 ⇒ 非注释
+
+  // ── issue #144: 内容锚 (替代旧行号锚 —— 旧锚的两个行号字面量已彻底移除,
+  //    AC-144-1 要求 grep 该文件零命中行号字面量) ──────────────────────
+  // 锚 = 「common.load_failed 的 err 参数处, 同一标识符的 .message || 自身」。
+  // 特征串刻意**窄**: 必须同时命中 t('common.load_failed' 调用形态 +
+  // 反向引用残留形态 —— 宽泛串 (如 '|| e' / 'e.message') 会命中无关行。
+  //
+  // 锚的改名敏感性 (issue #149 F-3): 本锚对**标识符**改名免疫
+  // (锚以内容特征定位 —— 调用形态 + 反向引用「同一标识符」, 不依赖标识符
+  //  名字; 后人把 err 改名为 error 时锚仍然命中), 但对**词条键**改名敏感
+  // (正则硬含 t('common.load_failed', ⇒ 键改名后锚集合变空而残留集合非空,
+  //  下方恒等断言**显式报红** —— 设计内的显式失败, 非静默假绿)。
+  // ⇒ 词条键改名时**必须同步更新本锚**, 不得放宽。
+  const RESIDUAL_ANCHOR =
+    /t\('common\.load_failed',\s*\{\s*err:\s*([A-Za-z_$][\w$]*)\??\.message\s*\|\|\s*\1\s*\}/
   const boardLines = board.split('\n')
-  for (const ln of [1410, 1421])
-    assert(RESIDUAL.test(squash(stripLineComments(board)[ln - 1])),
-      `锚 :${ln} 剥注释后不再是残留 ⇒ 该行号断言需更新 (现 ${JSON.stringify(boardLines[ln - 1].trim().slice(0, 60))})`)
+  const strippedBoard = stripLineComments(board)
+  const anchored = []
+  for (let i = 0; i < strippedBoard.length; i++) {
+    if (RESIDUAL_ANCHOR.test(strippedBoard[i])) anchored.push(i + 1)
+  }
+  // ① 锚集合必须与残留集合**恒等** (不多不少) —— 这是「锚没有放宽」的机器判据
+  const residualLines = []
+  for (let i = 0; i < strippedBoard.length; i++) {
+    if (RESIDUAL.test(squash(strippedBoard[i]))) residualLines.push(i + 1)
+  }
+  eq(anchored.join(','), residualLines.join(','),
+    `内容锚定位的行集 (${anchored}) 必须与残留行集 (${residualLines}) 恒等`)
+  // ② 锚到的每一行, 剥注释后**必须仍是残留** (非注释形态) —— 原行号锚语义保留
+  assert(anchored.length > 0, '内容锚零命中 ⇒ 锚失配 (词条键或残留形态变了?)')
+  for (const ln of anchored) {
+    assert(RESIDUAL.test(squash(strippedBoard[ln - 1])),
+      `锚 :${ln} 剥注释后不再是残留 ⇒ 内容锚失配 (现 ${JSON.stringify(boardLines[ln - 1].trim().slice(0, 60))})`)
+  }
+  // ③ 锚不得依赖行号: 源码上方插 N 行, 锚**命中数不变** (行号变, 集合随移)
+  for (const shift of [1, 5, 20]) {
+    const shifted = new Array(shift).fill('// inserted').concat(strippedBoard)
+    const shiftedHits = []
+    for (let i = 0; i < shifted.length; i++) {
+      if (RESIDUAL_ANCHOR.test(shifted[i])) shiftedHits.push(i + 1)
+    }
+    eq(shiftedHits.length, anchored.length,
+      `插入 ${shift} 行后锚命中数应不变 (实得 ${shiftedHits.length})`)
+    eq(shiftedHits, anchored.map((ln) => ln + shift),
+      `插入 ${shift} 行后锚应整体平移 ${shift} 行`)
+  }
+  // ④ **键名无关**的兜底: 残留总数仍由 S2-b 钉死 (RB === 2);
+  //    锚的作用是「复核这 2 处是**非注释形态**且位置符合预期」。
+  //    若 common.load_failed 被改名 (i18n 改造常见), 锚会失配 —— 此时
+  //    必须**显式**报红 (而不是安静地少锚一处), 由 coder 更新锚并说明。
+  eq(residualLines.length, 2,
+    `TasksBoardView 残留应恰为 2 处, 实际 ${residualLines.length} (${residualLines})`)
 })
 if (failed) { console.error(`\n${failed}/8 失败`); process.exit(1) }
 console.log('\n全部通过 (8)')

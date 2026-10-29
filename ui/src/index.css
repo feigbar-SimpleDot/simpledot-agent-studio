@@ -101,6 +101,11 @@
            whitespace-pre-wrap break-all leading-relaxed;
   }
 
+  /* issue #122 F-a: 无空格超长 token (URL/base64/连续 CJK) 按容器宽强制断行。
+     Tailwind 3.4 无 overflow-wrap:anywhere 内置 utility, 自定义一个;
+     禁用 break-all —— 中文场景任意字符断视觉劣化且非需求所指。 */
+  .wrap-anywhere { overflow-wrap: anywhere; word-break: normal; }
+
   /* ── 空状态 ── */
   .empty {
     @apply flex flex-col items-center justify-center gap-3 py-16 text-dim text-sm;
@@ -125,17 +130,30 @@
   .md-body ol { @apply list-decimal pl-5 my-2 space-y-1; }
   .md-body code {
     @apply font-mono text-[12px] bg-canvas border border-line rounded px-1.5 py-0.5;
+    /* issue #122 F-c: 行内代码超长 (长 URL/路径) 断行不撑破气泡 */
+    overflow-wrap: anywhere;
   }
   .md-body pre {
-    @apply bg-canvas border border-line rounded-xl p-3.5 overflow-auto my-2;
+    /* issue #122 F-b: 围栏代码块超长行按块宽换行 (原横向滚动改为换行向;
+       pre 默认 white-space:pre 会覆盖, 必须显式 pre-wrap) */
+    @apply bg-canvas border border-line rounded-xl p-3.5 my-2;
+    overflow-x: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .md-body pre code { @apply bg-transparent border-0 p-0 text-[12px]; }
   .md-body blockquote {
     @apply border-l-2 border-accent/50 pl-3 my-2 text-dim italic;
   }
-  .md-body a { @apply text-accent underline underline-offset-2 hover:opacity-80; }
-  .md-body table { @apply w-full border-collapse my-2 text-[12.5px]; }
-  .md-body th, .md-body td { @apply border border-line px-2.5 py-1.5 text-left; }
+  .md-body a { @apply text-accent underline underline-offset-2 hover:opacity-80;
+               /* issue #122 F-c: 链接超长 URL 断行 */
+               overflow-wrap: anywhere; }
+  .md-body table { @apply w-full border-collapse my-2 text-[12.5px];
+                   /* issue #122 F-d: 固定布局, 长单元格不再拉宽表格 */
+                   table-layout: fixed; }
+  .md-body th, .md-body td { @apply border border-line px-2.5 py-1.5 text-left;
+                             /* issue #122 F-d: 单元格内换行 */
+                             overflow-wrap: anywhere; }
   .md-body th { @apply bg-panel2 font-semibold; }
   .md-body hr { @apply border-line my-3; }
 }

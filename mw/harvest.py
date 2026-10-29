@@ -29,6 +29,22 @@ from typing import Optional
 # i18n v1.0 (架构 §5.2/§5.3): reason 文案写时 t(), 控制流零改动。
 from .i18n import t as _t
 
+# issue#127 S-1: 状态判定收敛到 mw.todo 的统一归一化入口 (issue #124 纪律:
+# 全仓唯一状态语义入口, 禁止再写本地字面量集)。todo.py 不 import harvest,
+# 无循环依赖。
+from .todo import (STATUS_ALIASES, STATUS_BLOCKED, STATUS_FAILED,
+                   normalize_status)
+
+# issue#127 S-1 输入域守恒: 改前 harvest 只接受 ASCII 英文别名
+# (failed/fail / blocked/block); 中文别名 (失败/阻塞) 由 reaper / console 在
+# **进 harvest 之前**就已归一化成规范英文值 (两处都先 normalize_status 再
+# 传参)。这里从同一张别名表派生 ASCII 子集, 保证 S-1 对**任何输入**都不
+# 产生行为变更 (issue #127 §3.6 总红线)。
+_FAILED_ALIASES = frozenset(
+    a for a in STATUS_ALIASES[STATUS_FAILED] if a.isascii())
+_BLOCKED_ALIASES = frozenset(
+    a for a in STATUS_ALIASES[STATUS_BLOCKED] if a.isascii())
+
 HERMES_BIN = shutil.which("hermes") or "hermes"
 
 
@@ -441,6 +457,8 @@ def harvest(task_id: str, *, ledger, hermes_home: str, workspace: str,
         completed → COMPLETE            → HARVESTED
         blocked   → NEED_CLARIFICATION  → NEED_CLARIFICATION
         failed    → FAILED              → BLOCKED   (worker 自己说做不到)
+        timeout   → FAILED              → BLOCKED   (平台收尸, **非** worker
+                                 可写状态; 见 issue#127 S-1 前置短路)
         None/未知 → COMPLETE (CLI 手动结算走这条)
     物理检查 (verify_physical) 降级为 evidence 字段, 不再产生
     PHYSICAL_ERROR / BLOCKED —— 产物齐不齐是事实, 交 main 判断。
@@ -598,14 +616,51 @@ def _harvest_inner(task_id, ledger, hermes_home, workspace,
     # 判定顺序: worker_status 优先 → 缺失时回退 .clarify.json → 默认 COMPLETE。
     ws_norm = (worker_status or "").strip().lower()
 
+    # 1a0. issue#127 S-1 — timeout 前置短路 (**必须**在 normalize 之前)。
+    #
+    # "timeout" 不是 worker 可写状态, 是平台内部收尸值: reaper 两条收尸
+    # 路径显式传入 (reaper.py:317 超时收尸 / reaper.py:382 TODO 缺失 5min
+    # 收尸)。STATUS_ALIASES 表**故意不含** timeout —— 它不该出现在 worker
+    # 的 TODO.md 里, 也不该被 normalize_status 归一化。
+    #
+    # 若让它落入 normalize_status: normalize_status("timeout") → None
+    # → 掉进 1c 未知状态兜底 (读 .clarify.json 否则按 COMPLETE)
+    # → **超时收尸被静默改判 COMPLETE/clarify, 收尸路径断裂** (P0 级
+    # 静默行为变更)。故此处前置显式处理, 并**禁止**把 "timeout" 塞进
+    # STATUS_ALIASES (那会让 worker 字面写出的 "timeout" 被当成合法
+    # failed, 破坏"worker 不可写 timeout"的边界)。
+    if ws_norm == "timeout":
+        why = _t("harvest.reason.failed_timeout")
+        worker_report = {
+            "verdict": "FAILED",
+            "why": why,
+            "evidence": log_parts,
+            # issue #58: 快照键必有 (AC-P3, 失败终态也要有 tokens)
+            "tokens": _tokens_snapshot,
+        }
+        ledger.update_worker_state(
+            task_id, "BLOCKED", actor="harvest", reason=why,
+            exit_code=exit_code,
+            log=f"{ws_norm}: " + "\n".join(log_parts))
+        ledger.set_worker_report(task_id, worker_report)
+        _emit(ledger, "harvest.failed", task_id, worker_report)
+        _teardown_current_card()
+        return {"settled": True, "verdict": "FAILED",
+                "worker_report": worker_report,
+                "harvest_status": "BLOCKED",
+                "log": log_parts}
+
     # 1a. failed = worker 明确宣告无法完成 (worker 自己的决策)
-    #     timeout = worker 一直没交卷, 平台收尸 (非 worker 决策)
-    #     两者都归 FAILED + BLOCKED, 球交 main; 区别只体现在 why 字段,
-    #     不新增 verdict 状态 (减法原则)。
-    if ws_norm in ("failed", "fail", "timeout"):
-        why = (_t("harvest.reason.failed_worker_self")
-               if ws_norm in ("failed", "fail")
-               else _t("harvest.reason.failed_timeout"))
+    #     (timeout 已在上方 1a0 前置短路处理, 不走本分支)
+    #     归 FAILED + BLOCKED, 球交 main; 不新增 verdict 状态 (减法原则)。
+    #
+    # issue#127 S-1: 判定收敛到统一归一化入口 (issue #124 纪律), 不再写
+    # 本地字面量集; 但**输入域守恒** —— 只接受改前就接受的 ASCII 英文
+    # 别名 (failed/fail), 中文别名由上游 reaper/console 先归一化再传参,
+    # harvest 这一层维持原样 (issue #127 §3.6 总红线: 零行为变更)。
+    _norm = normalize_status(ws_norm)
+    if _norm == STATUS_FAILED and ws_norm in _FAILED_ALIASES:
+        why = _t("harvest.reason.failed_worker_self")
         worker_report = {
             "verdict": "FAILED",
             "why": why,
@@ -627,7 +682,8 @@ def _harvest_inner(task_id, ledger, hermes_home, workspace,
 
     # 1b. blocked = 需澄清。clarify 文件按写序铁律先于状态落盘,
     #     正常必能读到; 读不到 (worker 违约) 用兜底占位, 不干等。
-    if ws_norm in ("blocked", "block"):
+    #     issue#127 S-1: 同 1a, 收敛到统一归一化入口 + 输入域守恒。
+    if _norm == STATUS_BLOCKED and ws_norm in _BLOCKED_ALIASES:
         clarify = check_clarification(workspace) or {}
         payload = {"question": str(clarify.get(
             "question", _t("harvest.reason.clarify_fallback_no_question_recorded")))[:500]}

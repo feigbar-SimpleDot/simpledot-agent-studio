@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -283,6 +284,29 @@ def test_C2_unreachable_gateway_settlement_unaffected(monkeypatch):
     _stub_no_cli_transcript(monkeypatch)
     """fail-open (AC-P4): registry 指向关闭端口 → 结算照常, tokens unavailable。"""
     led, ws, tid, restore = _settle_setup("completed")  # 空 registry
+    # issue #126: 把"墙钟"代理指标换成"零 HTTP 调用"行为断言。
+    # 旧断言 assert time.time() - t0 < 2.0 是拿绝对时间当判据 —— 高负载
+    # (并发跑测 / 机器忙) 下 2.04s 就击穿, 属假红, 而产品行为是对的。
+    # 该断言的真实语义 = "空 registry → 无 HTTP 输入 → 短路返回, 不卡在
+    # 超时等待上"。mw.harvest._capture_tokens 的 HTTP 出口是
+    # `import urllib.request` 后调 urllib.request.urlopen (函数内 import,
+    # 每次取模块属性), 所以打在 sys.modules['urllib.request'] 上的探针
+    # 必然拦截到 ⇒ 断言"零调用"才是"短路"语义本体, 比墙钟更严。
+    #
+    # 只统计**本线程**的调用: 同一 pytest 进程里, 前面测试文件 (reaper
+    # 用例) 起的报告中继后台线程也会打 urlopen —— 那是别的卡的投递, 与
+    # 本用例的结算路径无关, 计进来就成了新的假红源。按线程隔离后,
+    # 断言精确等于"本次结算路径自己没发任何 HTTP"。
+    _http_calls: list = []
+    _real_urlopen = urllib.request.urlopen
+    _self_ident = threading.get_ident()
+
+    def _spy_urlopen(*a, **k):
+        if threading.get_ident() == _self_ident:
+            _http_calls.append(a)
+        return _real_urlopen(*a, **k)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _spy_urlopen)
     try:
         t0 = time.time()
         r = harvest.harvest(tid, ledger=led, hermes_home="", workspace=ws,
@@ -291,8 +315,15 @@ def test_C2_unreachable_gateway_settlement_unaffected(monkeypatch):
         wr = _read_wr(led, tid)
         assert wr["tokens"]["source"] == "unavailable"
         assert wr["tokens"]["captured_at"] is None
-        # 空 registry → 无 HTTP 输入, 直接短路 (耗时远小于 5s 超时)
-        assert time.time() - t0 < 2.0
+        # 行为断言 (R-126-B 首选): 空 registry → 结算路径零 HTTP 调用。
+        # 这才是"短路"语义本体; 墙钟降为宽松兜底代理指标。
+        assert _http_calls == [], \
+            f"空 registry 结算不应发起 HTTP, 实际 {len(_http_calls)} 次"
+        # 墙钟兜底保留 (红线: 不得删除该断言), 阈值由 2.0s 放宽到 5.0s:
+        # 5s 恰是 _capture_tokens 的单次 HTTP timeout —— 真卡在超时等待上
+        # 必然超过它, 而高负载下的正常短路 (实测 ~0.2s) 远低于它。
+        assert time.time() - t0 < 5.0, \
+            "结算不应卡在超时等待上 (5s 兜底, 代理指标)"
     finally:
         restore()
 

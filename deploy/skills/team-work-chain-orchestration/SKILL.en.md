@@ -96,23 +96,29 @@ system-engineer.** main's output is "cards + a contract", not
 - Hand the requirement over **verbatim** to the PM card (issue body
   + snapshot path). Paraphrasing loses hard constraints from the
   user's own words (e.g. numeric limits like "max 10 per batch").
-- What main may add is only a **bounded measured baseline**: how
-  large an endpoint response is, what params an API actually
-  supports, whether a channel is really in use. These are **facts**
-  that save downstream one discovery round.
-- ★ **The baseline has a budget and must be done while writing the
-  cards**: keep probes to single-digit counts, hitting only the
-  endpoints/params/channels that decide the approach. Once the
-  numbers are in, the **next step is write cards + launch** — no
-  extra probe rounds. Perfecting every number before dispatch =
-  analysis by proxy.
+- Before creating cards main does only **second-scale intake**
+  (pull issue text and comments, download attachments, read
+  PROJECT-MEMORY). **Measured baselines are produced by the
+  first research/analysis card**; main only relays the issue
+  text and that intake — it does not grep the repo, reach
+  remote machines, or run tests.
+- ★ **Second-scale intake has a budget and must be done while
+  writing the cards**: keep pulls to single-digit counts,
+  hitting only second-scale sources (issue text and comments /
+  attachments / PROJECT-MEMORY). Once the quoted source text is
+  in, the **next step is write cards + launch** — no extra
+  intake rounds. Perfecting every document before dispatch =
+  analysis by proxy. Measured baselines are obtained by the
+  first research/analysis card, per that card's goal.
 - main **must not** pick the implementation approach (which
   technique, module split, page layout) — that is the REQ/ARCH
   card's deliverable. If you write it first, downstream copies it as
   a settled premise and the decision rights silently change hands.
-- Writing precise file/line locating hints into coder cards **is
-  allowed and encouraged** (shortens build rounds); that is build
-  positioning, not solution design.
+- Precise file/line locating hints are **produced by the first
+  research/analysis card** and relayed with that card's
+  conclusion (shortens build rounds); main does not locate code
+  itself and does not seed the first card with locating hints.
+  That is build positioning, not solution design.
 - ★ **Downstream card content is finalized at dispatch time**: card
   N's body only needs "this card's sole input is card N-1's
   deliverable" + hard constraints + artifact paths; concrete
@@ -394,10 +400,10 @@ side sees it.
    repro path live in the verification report, and the fix
    card names that doc as its sole basis (cards are
    self-contained; no context hand-off). Keep pre-dispatch
-   prep (pulling issue text, checking test-machine
-   connectivity, pre-locating code) to a few rounds before
-   creating cards — if the user can't see cards created
-   and dispatched they read it as zero progress.
+   prep (pulling issue text and comments, downloading
+   attachments, reading PROJECT-MEMORY) to a few rounds
+   before creating cards — if the user can't see cards
+   created and dispatched they read it as zero progress.
 4. **Reusing an old project workspace for a new chain**:
    the workspace usually still holds a CLOSED chain's
    TODO.md. Before launch, rebuild the whole file as the
@@ -407,10 +413,11 @@ side sees it.
    re-read from disk to confirm before launching — stale
    completed sections trigger the worker's "artifacts
    already exist, reuse" false completion. Fetch remote
-   first per PROJECT-MEMORY; putting main-side pre-located
-   root causes / file lines into the first card's
-   description shortens coder rounds, but locate only —
-   never edit code (Role Iron Rule).
+   first per PROJECT-MEMORY; putting the root causes and
+   file lines **produced by the first research/analysis
+   card**, relayed with that card's conclusion, into
+   downstream card descriptions shortens coder rounds, but
+   locate only — never edit code (Role Iron Rule).
 5. **On receiving an mw-settled forward, dedupe
    first**: `GET /api/tasks` to see the card's status
    — if already done it's a duplicate notification,

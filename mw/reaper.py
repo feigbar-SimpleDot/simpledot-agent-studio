@@ -55,9 +55,9 @@ from .harvest import harvest
 from .i18n import t as _t
 from .ledger import Ledger
 from .todo import (
-    parse_status, STATUS_COMPLETED, STATUS_FAILED, STATUS_BLOCKED,
-    STATUS_WORKING, STATUS_INPROGRESS, STATUS_INPROGRESS_EN,
-    WAITING_SUB_ALIASES,
+    parse_status, normalize_status, IN_PROGRESS_SET, TERMINAL_STATUSES,
+    STATUS_COMPLETED, STATUS_FAILED, STATUS_BLOCKED,
+    STATUS_WORKING, STATUS_WAITING_SUB,
 )
 
 
@@ -173,15 +173,11 @@ def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, resu
 
     # 1) 读 TODO.md 状态 (物理证据)
     todo_status = _read_todo_status(ws, ledger_row=row, contract=contract)
-    todo_status_norm = (todo_status or "").strip().lower() if todo_status else None
-    # 在干活. 进行中 / inprogress / working / waiting_sub 都属"在干, 不结算".
-    # 把 waiting_sub (别名 waiting-sub / 等待子任务) 一并纳入, 否则该卡会
-    # 落进 "TODO 缺失 5min 收尸" 分支被误收 (issue#13 §4.2b 减法保护).
-    # I18N-R3-FIX (2026-10-16, H-1): 加入 STATUS_INPROGRESS_EN="in-progress"
-    # 让 en worker/main 写带连字符的别名也能被识别, 不再误入 5min 收尸分支.
-    in_progress_set = {STATUS_WORKING, STATUS_INPROGRESS, STATUS_INPROGRESS_EN,
-                       "inprogress", "in_progress", *WAITING_SUB_ALIASES}
-    is_waiting_sub = todo_status_norm in WAITING_SUB_ALIASES
+    # issue #124: 状态语义统一经 normalize_status 归一化, 不再本地 lower()
+    # + 字面量集合。未识别 → None, 走下方"未写状态"兜底路径 (语义不变)。
+    norm = normalize_status(todo_status)
+    # waiting_sub (等子任务) 单独识别: 独立阈值 + 专属敲门文案 (issue#13)。
+    is_waiting_sub = norm == STATUS_WAITING_SUB
     sub_min = _subagent_wait_min()
     sub_enabled = sub_min > 0
 
@@ -218,7 +214,7 @@ def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, resu
         except Exception:
             pass
 
-    if todo_status_norm in {STATUS_COMPLETED, "complete"}:
+    if norm == STATUS_COMPLETED:
         ok, why = _stale_marker_guard()
         if not ok:
             results.append({"task_id": task_id,
@@ -239,7 +235,7 @@ def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, resu
                        "note": f"TODO.md 状态={todo_status}"})
         return
 
-    if todo_status_norm in {STATUS_FAILED, "fail"}:
+    if norm == STATUS_FAILED:
         # s2 (issue #9): failed 同 completed 一样有陈旧 TODO 假信号风险,
         # 共享 _stale_marker_guard。
         ok, why = _stale_marker_guard()
@@ -261,7 +257,7 @@ def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, resu
                        "note": f"TODO.md 状态={todo_status}"})
         return
 
-    if todo_status_norm in {STATUS_BLOCKED, "block"}:
+    if norm == STATUS_BLOCKED:
         # 边界减法 (2026-10-08): worker prompt 已强制「先落 .clarify.json
         # 再翻 blocked」(pipeline.py 写序铁律), blocked 与 clarify 原子
         # 产生 —— 不再存在「blocked 但 clarify 未落盘」的复合态, 旧的
@@ -278,7 +274,7 @@ def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, resu
                        "note": f"TODO.md 状态={todo_status}"})
         return
 
-    if todo_status_norm in in_progress_set:
+    if norm in IN_PROGRESS_SET:
         # 在干活. 检查超时.
         started = (marker or {}).get("started_at", 0) if marker else 0
         now = time.time()
@@ -353,7 +349,7 @@ def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, resu
                        "note": _t("reaper.why.not_suppressed_in_progress", status=todo_status)})
         # issue#13: worker 从 waiting_sub 切回普通 working → 清等待戳
         # (防后续 reap 误判仍 WAITING_SUB). is_waiting_sub 为 False 即
-        # 此分支; _reap_one_task 顶部已读 todo_status_norm, 这里再检查
+        # 此分支; _reap_one_task 顶部已读 norm, 这里再检查
         # 一次仅做保护性清戳, 不影响常规 working 卡 (NULL → NULL 无害).
         _clear_subagent_wait_stamp()
         return
@@ -454,9 +450,9 @@ def _reap_late_completions(ledger, hermes_home, base, registry, results,
             # ★ 重读 TODO.md 当前状态 (此刻的盘, 无缓存)
             todo_status = _read_todo_status(ws, ledger_row=row,
                                           contract=contract)
-            norm = (todo_status or "").strip().lower() if todo_status else None
-            if norm not in (STATUS_COMPLETED, STATUS_FAILED,
-                           "complete", "fail"):
+            # issue #124: 补结算门槛经统一归一化入口, 中文变异终态同样补
+            norm = normalize_status(todo_status)
+            if norm not in TERMINAL_STATUSES:
                 # blocked 等 main 答澄清 / working 还在跑 / None 没动静
                 # —— 都不补, 下轮再看
                 continue
@@ -958,7 +954,7 @@ def _subagent_wait_min() -> int:
     """issue#13 (2026-10-15): waiting_sub 卡独立等待阈值 (分钟)。
 
     env MW_REAPER_SUBAGENT_MIN, 默认 60. 设 0 = 整体停用 waiting_sub
-    新行为 (回滚开关, AC-A10) —— waiting_sub 仍被 in_progress_set
+    新行为 (回滚开关, AC-A10) —— waiting_sub 仍被 IN_PROGRESS_SET
     接纳 (防 5min 误收尸), 但不盖戳 / 不派生 WAITING_SUB / 不走专属
     阈值与文案; 超阈判断退回旧 stuck 30min 路径, fail-open 形态保留.
     非法值回落 60 (与既有 env 容错一致).
@@ -1115,9 +1111,8 @@ def _notify_main_of_stuck(ledger, base, results, registry: dict | None = None,
         ws = _row_get(sess, "workspace") if sess else None
         cur_todo_status = _read_todo_status(
             ws, ledger_row=row, contract=contract)
-        cur_todo_norm = (cur_todo_status or "").strip().lower() \
-            if cur_todo_status else None
-        cur_is_waiting_sub = cur_todo_norm in WAITING_SUB_ALIASES
+        cur_todo_norm = normalize_status(cur_todo_status)
+        cur_is_waiting_sub = cur_todo_norm == STATUS_WAITING_SUB
         sub_min = _subagent_wait_min()
         if cur_is_waiting_sub and sub_min > 0:
             threshold = sub_min * 60
@@ -1301,16 +1296,14 @@ def _notify_main_of_session_hang(ledger, base, results, registry=None,
     # 只在 TODO.md 仍是"在干"时判挂死; 已 completed/failed/blocked 走正常结算
     ws = _row_get(sess, "workspace")
     todo_status = _read_todo_status(ws, ledger_row=row, contract=contract)
-    todo_norm = (todo_status or "").strip().lower() if todo_status else None
     # issue#13 (2026-10-15) 显式排除 waiting_sub: waiting_sub 卡 SSE
     # 静默是 worker 等子任务的预期形态, 不是流断了; 此路径只盯
-    # 普通 working 卡. 注意不要把 waiting_sub 加进集合 —— 加了等价于
+    # 普通 working 卡. 注意不要把 waiting_sub 纳入 —— 纳入等价于
     # 把「等子任务」误判为「流断了」, 与 waiting_sub 设计语义相反.
-    # I18N-R3-FIX (2026-10-16, H-1): 加入 STATUS_INPROGRESS_EN="in-progress"
-    # 让 en worker 写的连字符别名也算 working, 不被误判挂死通知 main.
-    in_progress_set = {STATUS_WORKING, STATUS_INPROGRESS, STATUS_INPROGRESS_EN,
-                       "inprogress", "in_progress"}
-    if todo_norm not in in_progress_set:
+    # issue #124: 归一化后只认规范值 working, 各中英语义别名
+    # (进行中 / in-progress 等) 同样被盯, 未识别值不管 (语义不变)。
+    todo_norm = normalize_status(todo_status)
+    if todo_norm != STATUS_WORKING:
         return  # 没在"working" 状态, 不是本检测的目标
 
     # SSE-FIX-F3b 移植 (2026-10-08): 活体信号改经 console 端点获取。
@@ -1721,14 +1714,15 @@ def _find_new_output(root: Path, after_ts: float, cap: int) -> "tuple[str, float
     return None
 
 
-def _notify_post_terminal_output(ledger, active_run, results, registry=None,
-                               window_s=None, base="."):
+def _notify_post_terminal_output(ledger, results, registry=None,
+                               window_s=None):
     """issue #114: 终态卡结算后工作区仍有新产出 ⇒ 告警 main, 每 task 一次。
 
     形状: harvest_status ∈ 真终态三态 + updated_at 落在检测窗口内 +
     task_sessions.workspace 存在 mtime > updated_at+宽限 的文件。
     告警 = emit worker.state(reason=post_terminal_output) + _send_to_main;
     事件本身即去重戳, 下轮扫到同一 task 直接 SKIP。
+    (issue #121 F-3: 删去函数体从未引用的 active_run / base 死参数。)
     """
     if not _post_terminal_alert_enabled():
         return
@@ -1795,9 +1789,16 @@ def _notify_post_terminal_output(ledger, active_run, results, registry=None,
                        f"(无主施工残留), 请核查该卡是否被继续施工。")
                 _send_to_main(sid, msg, gw, key, ledger.path,
                              registry=registry, notify_task=None)
-            results.append({"task_id": tid, "trigger": "post_terminal_output",
-                          "verdict": "NOTIFIED",
-                          "note": f"{path} mtime=+{mins}min"})
+                results.append({"task_id": tid, "trigger": "post_terminal_output",
+                              "verdict": "NOTIFIED",
+                              "note": f"{path} mtime=+{mins}min"})
+            else:
+                # issue #121 F-4: 无发起人/无 key ⇒ 实际未投递,
+                # 不得记 NOTIFIED (事件已落但消息没出门, 口径要分开)。
+                results.append({"task_id": tid,
+                              "trigger": "post_terminal_output",
+                              "verdict": "NO_INITIATOR",
+                              "note": "no initiator/key, 未投递"})
         except Exception as e:
             # 检测失败静默跳过 (卡面铁律): 单卡异常不阻断其余卡与主流程
             results.append({"task_id": tid, "trigger": "post_terminal_output",
@@ -1928,8 +1929,7 @@ def reap_once(*, ledger: Ledger, hermes_home: str, base: str,
     # 事件即去重戳)。开关 MW_REAPER_POST_TERMINAL_ALERT 默认开, 检测
     # 失败静默跳过, 不影响后续步骤。
     try:
-        _notify_post_terminal_output(ledger, active_run, results,
-                                     registry=registry, base=base)
+        _notify_post_terminal_output(ledger, results, registry=registry)
     except Exception as e:
         results.append({"task_id": "_meta", "trigger": "post_terminal_output",
                         "verdict": "ERROR", "error": str(e)[:200]})

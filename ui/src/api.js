@@ -225,6 +225,35 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content }),
     }).then(j),
+
+  // ──────────────────────────────────────────────────────────────────
+  // 定时任务视图 (s4 / 卡 t_da1c3a64): cron 端点封装。
+  // 端点标签一律用【路径模板】形式 (含 :id), 不插值实际 id ——
+  // 标签必须稳定 (不随调用参数漂移), 且不把用户可控字符串带进错误文案
+  // (与 issue #75 s9 M-1 的既有纪律一致)。
+  // 三个写端点无 body ⇒ POST 不带 Content-Type/body, 服务端不预读请求体。
+  // ──────────────────────────────────────────────────────────────────
+  cron: {
+    jobs: () => net(
+      fetch('/api/cron/jobs').then((r) => j(r, '/api/cron/jobs')),
+      '/api/cron/jobs'),
+    runs: (id, limit = 3) => net(
+      fetch(`/api/cron/jobs/${encodeURIComponent(id)}/runs?limit=${limit}`)
+        .then((r) => j(r, '/api/cron/jobs/:id/runs')),
+      '/api/cron/jobs/:id/runs'),
+    pause: (id) => net(
+      fetch(`/api/cron/jobs/${encodeURIComponent(id)}/pause`, { method: 'POST' })
+        .then((r) => j(r, '/api/cron/jobs/:id/pause')),
+      '/api/cron/jobs/:id/pause'),
+    resume: (id) => net(
+      fetch(`/api/cron/jobs/${encodeURIComponent(id)}/resume`, { method: 'POST' })
+        .then((r) => j(r, '/api/cron/jobs/:id/resume')),
+      '/api/cron/jobs/:id/resume'),
+    trigger: (id) => net(
+      fetch(`/api/cron/jobs/${encodeURIComponent(id)}/trigger`, { method: 'POST' })
+        .then((r) => j(r, '/api/cron/jobs/:id/trigger')),
+      '/api/cron/jobs/:id/trigger'),
+  },
   soulTemplate: () => net(
     fetch('/api/soul-template').then((r) => j(r, '/api/soul-template')),
     '/api/soul-template'),

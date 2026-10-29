@@ -338,28 +338,30 @@ def test_parse_english_todo_pending_english_keys_roundtrip(monkeypatch):
 
 # ── H-1 (reaper in-progress 别名) ──────────────────────────────
 def test_reaper_in_progress_set_accepts_in_progress():
-    """H-1 修复: reaper.in_progress_set 含 STATUS_INPROGRESS_EN='in-progress'.
+    """H-1 修复语义 (in-progress 别名被识别) 经 issue #124 统一入口保持。
 
-    验证导入与集合构造: 模块加载后取出 in_progress_set 不抛 NameError, 且
-    含 STATUS_INPROGRESS_EN. 测试比 *reaper 内部函数路径* 更可靠 —— 直接
-    读模块常量集合对得上就够.
+    issue #124 前: reaper 两处本地 in_progress_set 字面量含
+    STATUS_INPROGRESS_EN。issue #124 后: 本地集合已删, 别名识别收敛到
+    todo.normalize_status —— 本测试改钉新机制, H-1 语义不变:
+    'in-progress' 写法仍被 reaper 当"在干", 不误入收尸分支。
     """
-    from mw.todo import STATUS_INPROGRESS_EN, STATUS_INPROGRESS, STATUS_WORKING
-    # 集合须含三个规范值 (reaper._reap_one_task 与 _notify_* 两处都靠它们)
+    from mw.todo import (STATUS_INPROGRESS_EN, STATUS_INPROGRESS,
+                        STATUS_WORKING, normalize_status)
     assert STATUS_INPROGRESS_EN == "in-progress"
-    # 在 reaper 顶层 import 也能拿到这个常量 (验证 import 不爆 + 模块加载顺序)
+    # 新机制: 归一化入口把 in-progress 收敛为规范值 working
+    assert normalize_status("in-progress") == STATUS_WORKING
+    assert normalize_status(STATUS_INPROGRESS) == STATUS_WORKING
+    # reaper 不再构造本地字面量集合, 一律经 normalize_status
     import mw.reaper as _r
-    # in_progress_set 是函数局部, 不直接导出; 但模块可以正常 import +
-    # 至少 STATUS_INPROGRESS_EN 已在 reaper 命名空间可用 (用于两处 set 构造)
-    assert hasattr(_r, "STATUS_INPROGRESS_EN") is False or True  # 不一定 import 进 reaper ns
-    # 直接看 todo.py 已经 import 进 reaper 的常量 (commit 161b78c 把 in-progress 加进 import 块)
     src = (Path(__file__).resolve().parent.parent / "mw" / "reaper.py").read_text(
         encoding="utf-8"
     )
-    assert "STATUS_INPROGRESS_EN" in src
-    # 两处 in_progress_set 字面量都要含 STATUS_INPROGRESS_EN (H-1 修两处)
-    assert src.count("STATUS_INPROGRESS_EN") >= 2, \
-        f"in_progress_set miss STATUS_INPROGRESS_EN in some location: src count={src.count('STATUS_INPROGRESS_EN')}"
+    assert "in_progress_set = {" not in src, \
+        "reaper 不应再有本地 in_progress_set 构造 (issue #124)"
+    assert "STATUS_INPROGRESS_EN" not in src, \
+        "reaper 不应再直接引 STATUS_INPROGRESS_EN (别名走别名表)"
+    assert src.count("normalize_status") >= 6, \
+        f"reaper 收敛调用点缺失: normalize_status count={src.count('normalize_status')}"
 
 
 

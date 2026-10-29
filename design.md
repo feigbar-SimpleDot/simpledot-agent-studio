@@ -267,7 +267,7 @@ middleware registry's lookup:
 
 ```
 Kanban card:        "this work is coder's"           <- record (ledger, no execution power)
-Middleware registry:"coder = http://host:8643"      <- route (the only mapping with execution power)
+Middleware registry:"coder = http://hermes_<name>:8642"  <- route (the only mapping with execution power)
 Inside image:       preset Hermes profile "coder"     <- worker's persona config
 ```
 
@@ -493,7 +493,8 @@ The dedup gate upgraded from "`should_notify` + `mark_notified`" to an
 - **Awaiting confirmation**: `claim_for_relay` atomic claim +
   `last_notified_at=now` (thread-crash fallback 660s)
 - **Confirmed delivered**: `notify_confirmed_at=now` (set on real HTTP
-  200) + `claim` release
+  200, and also settable explicitly via `POST /api/relay/confirm`, issue
+  #119) + `claim` release
 
 Three-state field meaning: "optimistic mark vs real delivery" fully
 decoupled — `last_notified_at` is an **in-transit signal**, NOT a dedup
@@ -511,7 +512,9 @@ effect when callers like `stuck_notify` explicitly pass an interval
 - Follow-up (2026-10-04): discovered 429 avalanche — halogen reasoning
   is slow, relay retries the same report every 15s, the run piles up 10
   concurrent -> 14-minute backoff. Three-state solves it:
-  `claim_for_relay` atomic grab + only true 200 `confirm_delivered` +
+  `claim_for_relay` atomic grab + relay marks `confirm_delivered` only on
+  true 200 (an explicit main-side receipt via `POST /api/relay/confirm`,
+  issue #119, is the second legal setter) +
   on failure rollback `last_notified_at=NULL` so backoff can re-dispatch.
 - `notify_dead_until` dead-letter backoff retained (dead-letter after
   at most 8 retries, `notify_dead_until=1` year); this is a
@@ -1063,12 +1066,18 @@ Subsequent cards are dispatched one at a time via `POST /api/dispatch`
 | Field | Who may change it |
 |---|---|
 | File structure / goal / assignee / artifact directory | main |
-| **status** (`working` / `blocked` / `completed` / `failed`) | the current owning worker |
+| **status** (`working` / `waiting_sub` / `blocked` / `completed` / `failed`) | the current owning worker |
 | **result** | the current owning worker |
 | pending / done / abandoned queues | main |
 
 The reaper recognises only the status line inside the current-task
 section. A worker that does not write its status is never settled.
+
+`waiting_sub` is the non-terminal status a worker writes while it waits
+for its own background subagent (issue #13). The reaper gives that state
+its own threshold (`MW_REAPER_SUBAGENT_MIN`; the default lives in
+`mw/reaper.py::_subagent_wait_min`) and its own
+knock text, instead of treating the card as a stuck one.
 
 ### 11.5 Workflow schema (v2) and registry schema
 
@@ -1153,6 +1162,7 @@ force-skipped by main as an explicit product decision.
 | `/api/team-work/launch` | POST | register all cards + dispatch the first | LLM |
 | `/api/dispatch` | POST | spawn a worker for one claimed card | LLM |
 | `/api/resume` | POST | relay a clarification answer to the worker's same session | LLM |
+| `/api/relay/confirm` | POST | explicit main-side receipt of a delivered report (`{"task_id": ...}`); idempotent, a dead-lettered card recovers on one receipt (issue #119) | LLM |
 | `/api/workspaces` | GET / POST | list / create project workspaces (allowlist) | frontend |
 | `/api/fs/list` | GET | list one directory level under a project workspace (read-only, allowlist-anchored, 1000-row cap) | frontend |
 | `/api/fs/file` | GET | stream a project file (mode=embed\|open\|download, read-only, symlinks blocked) | frontend |
@@ -1166,6 +1176,11 @@ force-skipped by main as an explicit product decision.
 | `/api/lang` | GET | deployment language (see §10) | frontend |
 | `/api/w/<path>` | GET/PUT/POST | passthrough to worker gateway | frontend |
 | `/api/sessions/<sid>/messages` | GET | proxy to the gateway session transcript; with `want`/`before` the console serves a windowed page itself (tail-anchored, cursor `o:<n>`), without those parameters it stays a plain passthrough (the rollback switch) | frontend |
+| `/api/cron/jobs` | GET | list cron jobs plus ticker liveness; the data plane is a JSON bridge to a venv subprocess (the console interpreter cannot import `cron.*`), and `state` is the derived `effective_job_state` | frontend |
+| `/api/cron/jobs/<id>/runs` | GET | recent executions of one job (`?limit=`, clamped to 1..10, default 3) | frontend |
+| `/api/cron/jobs/<id>/pause` | POST | pause one job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
+| `/api/cron/jobs/<id>/resume` | POST | resume one paused job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
+| `/api/cron/jobs/<id>/trigger` | POST | queue one job for the next scheduler tick (action whitelist; next-tick semantics, not a forced fire; 409 on a terminal job) | frontend |
 | `/health` | GET | health check | monitoring |
 | `/` | GET | serve React UI | user's browser |
 

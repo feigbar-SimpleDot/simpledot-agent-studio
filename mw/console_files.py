@@ -20,8 +20,8 @@
 import os
 import re
 import json
+import html
 import urllib.parse as urlparse_mod
-from pathlib import Path
 
 # 与 mw/console.py 同源 env: 由 console.py do_GET lazy-import 本模块,
 # 本模块顶层不 import console(避循环); 常量复制读取同一 env,
@@ -264,6 +264,90 @@ def _csp_for_open_html() -> str:
     return "default-src 'none'; style-src 'unsafe-inline'; img-src data:; sandbox"
 
 
+# issue #122: open 模式 .md 服务端渲染的大小上限 (超限回退 text/plain 流式,
+# 防大文件读入内存 OOM; 降级口径在 FIX-NOTES-122 文档化)。
+MD_OPEN_MAX_BYTES = 1024 * 1024  # 1 MiB
+
+# issue #122: 渲染页最小骨架。内联 <style> 是 index.css .md-body 规则的精简移植
+# (标题/列表/代码块/表格 + overflow-wrap:anywhere 四形态换行红线),
+# 无外链资源、无 <script> —— 与 sandbox CSP (无 allow-scripts) 自洽。
+# 用 .replace 占位, 不用 str.format (CSS 花括号会炸 format)。
+_MD_PAGE_TMPL = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin:0; padding:24px 28px; background:#fff; color:#1a1a1a;
+       font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif; }
+@media (prefers-color-scheme: dark) { body { background:#111318; color:#e5e7eb; } }
+.md { max-width: 860px; overflow-wrap: anywhere; }
+.md > *:first-child { margin-top: 0; }
+.md h1,.md h2,.md h3,.md h4 { font-weight:700; margin:1.2em 0 .5em; line-height:1.3; }
+.md h1 { font-size:22px; } .md h2 { font-size:18px; } .md h3 { font-size:16px; }
+.md p { margin:.5em 0; }
+.md ul,.md ol { padding-left:1.5em; margin:.5em 0; }
+.md li { margin:.2em 0; }
+.md code { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px;
+          background:rgba(127,127,127,.14); border-radius:4px; padding:1px 5px;
+          overflow-wrap:anywhere; }
+.md pre { background:rgba(127,127,127,.12); border-radius:10px; padding:12px 14px;
+         margin:.6em 0; overflow-x:hidden; white-space:pre-wrap;
+         overflow-wrap:anywhere; }
+.md pre code { background:none; padding:0; }
+.md a { color:#2563eb; overflow-wrap:anywhere; }
+.md table { width:100%; border-collapse:collapse; table-layout:fixed; margin:.6em 0;
+           font-size:13px; }
+.md th,.md td { border:1px solid rgba(127,127,127,.35); padding:6px 10px;
+               text-align:left; overflow-wrap:anywhere; }
+.md th { background:rgba(127,127,127,.12); font-weight:600; }
+.md hr { border:0; border-top:1px solid rgba(127,127,127,.35); margin:1em 0; }
+.md blockquote { border-left:2px solid rgba(127,127,127,.5); margin:.6em 0;
+                padding-left:12px; color:inherit; opacity:.8; font-style:italic; }
+</style></head><body>__BODY__</body></html>"""
+
+
+def _render_md_open_page(abs_path: str, name: str):
+    """issue #122: open 模式 .md → 自包含渲染 HTML bytes; 超限/读败 → None (回退流式)。"""
+    try:
+        size = os.path.getsize(abs_path)
+    except OSError:
+        raise FsPathError(404, "not found")
+    if size > MD_OPEN_MAX_BYTES:
+        return None  # 降级: 走原 text/plain 流式 (文档化, 防 OOM)
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    from .md_render import render_markdown_safe
+    try:
+        # I-1 兜底: 渲染段任何异常 (对抗性输入等) → None 走既有 text/plain
+        # 降级路径, 不让异常穿透 handle_fs_get 造成请求 500。
+        body = render_markdown_safe(raw)
+    except Exception:
+        return None
+    # issue#127 S-4: 单趟替换, 封死双向二次污染。
+    #
+    # 改前是链式 .replace(__TITLE__).replace(__BODY__), 有两个方向的串位:
+    #   方向1 (文件名含 "__BODY__"): TITLE 替换把 __BODY__ 带进 <title> 区,
+    #        随后的 BODY 替换二次展开 → body 内容注入 <title>。
+    #   方向2 (正文含 "__TITLE__"): BODY 替换把 __TITLE__ 带进正文区,
+    #        随后的 TITLE 替换二次展开 → 文件名注入正文。
+    # 单纯调换顺序只能封死方向1 —— 正文是任意内容, 不可假设。
+    #
+    # re.sub 回调单趟从左到右扫模板, 命中占位符即替换为对应值, 且
+    # **替换进去的值不再被扫描** ⇒ 两个方向同时封死。返回值走 lambda
+    # (而非字符串模板) 天然规避 \g 等反斜杠序列的转义问题。
+    _replacements = {
+        "__TITLE__": html.escape(name, quote=True),
+        "__BODY__": body,
+    }
+    page = re.sub(r"__TITLE__|__BODY__",
+                  lambda m: _replacements[m.group(0)], _MD_PAGE_TMPL)
+    return page.encode("utf-8")
+
+
 def _csp_for_open_pdf() -> str:
     return "default-src 'none'; sandbox"
 
@@ -305,6 +389,22 @@ def _stream_file(handler, abs_path: str, mode: str) -> None:
             headers["Content-Security-Policy"] = _csp_for_open_svg()
         elif is_image:
             headers["Content-Security-Policy"] = "sandbox"
+
+    # issue #122: open 模式 .md → 服务端渲染 HTML (escape-first, 见 md_render.py)。
+    # 1 MiB 超限 / 读败 → 回退下方 text/plain 流式 (降级口径文档化)。
+    # embed/download 路径零改动; 其余 text 类 open 行为零改动 (§2.3)。
+    if mode == "open" and ext in (".md", ".markdown"):
+        page = _render_md_open_page(abs_path, name)
+        if page is not None:
+            _send_headers(handler, 200, {
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Disposition":
+                    f'inline; filename="{fname_ascii}"; '
+                    f"filename*=UTF-8''{fname_star}",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": _csp_for_open_html(),
+            }, page)
+            return
 
     try:
         size = os.path.getsize(abs_path)

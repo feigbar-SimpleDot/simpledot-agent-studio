@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import binascii
 import json
+import logging
 import math
 import os
 import re
@@ -31,6 +32,7 @@ import urllib.request
 import urllib.error
 from contextlib import suppress  # issue #63: 排空模式吞读异常
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler  # issue #143: cron 桥 stderr 落点轮转
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -1742,13 +1744,54 @@ _TODO_FIELD_HELP = {
     "结果": "result",
     "kanban_task": "kanban_task_id",
 }
+# issue #124: 键 = normalize_status 归一化后的规范值 (中文变异经归一化命中)
+# issue #146: tuple 第二位由中文展示文案改为**规范状态 token** (与键同形) ——
+# 后端只下发机器值, 文案由前端按运行时语言渲染 (后端 MW_LANG 是部署时钟,
+# 满足不了运行时切换; 见 PLAN-H §6.2/§6.3)。第一位 family / 第三位 badgeCls
+# 契约不变。
+# issue #149 F-2: 状态契约的**单一真相源** = mw/todo_status_contract.json。
+# 前端 ui/src/views/TasksBoardView.jsx 的 TODO_STATUS_TEXT_KEYS 由同一文件
+# 派生 ⇒ 加第 6 个状态时前后端自动同步, 「只改一侧」在物理上不可能
+# (旧版两份独立字面量只靠测试维系, 见 PLAN-I §5.1)。
+def _load_todo_status_contract() -> dict:
+    """读状态契约 JSON (与 console.py 同目录, 随 mw/ bind mount 进容器)。"""
+    _p = os.path.join(os.path.dirname(__file__), "todo_status_contract.json")
+    with open(_p, encoding="utf-8") as _f:
+        return json.load(_f)["statuses"]
+
+
 _TODO_STATUS_SEM = {
-    "进行中": ("pending", "排队中", "badge-slate"),
-    "working": ("running", "执行中", "badge-blue"),
-    "blocked": ("attention", "等你回复", "badge-yellow"),
-    "completed": ("finished", "已完成", "badge-green"),
-    "failed": ("blocked", "已失败", "badge-red"),
+    _tok: (_d["family"], _tok, _d["badge"])
+    for _tok, _d in _load_todo_status_contract().items()
 }
+
+# ── issue #143: cron 桥等 stderr 的固定落点 ────────────────────────────
+# 落点 = ${MW_HOME}/logs/console.log (默认 /mw_data/logs/console.log)。
+# 宿主可达: compose 把 ./data/mw_data bind 到 /mw_data ⇒ 宿主
+# ./data/mw_data/logs/console.log 即容器内同一文件 (见 PLAN-H §3.3)。
+# 轮转: console.log + 3 份备份 = 4 份 × 5 MiB ⇒ 上界 20 MiB, 满足「不无限膨胀」(#143 条件 3)。
+# 失败即降级: 落点不可写 (权限/只读) 时**不抛**, 退回 stderr (docker logs
+# 仍是可用兜底) ⇒ fail-open, 与 mw/realtime.py 的 handler 先例同款。
+_CONSOLE_LOG_DIR = os.path.join(os.environ.get("MW_HOME", "/mw_data"), "logs")
+_CONSOLE_LOG_PATH = os.path.join(_CONSOLE_LOG_DIR, "console.log")
+_console_log = logging.getLogger("mw.console")
+_console_log.setLevel(logging.INFO)
+_console_log.propagate = False  # 与 mw/realtime.py 一致, 防重复冒泡到 root
+if not _console_log.handlers:
+    try:
+        os.makedirs(_CONSOLE_LOG_DIR, exist_ok=True)
+        _console_file_handler = RotatingFileHandler(
+            _CONSOLE_LOG_PATH, maxBytes=5 * 1024 * 1024,
+            backupCount=3, encoding="utf-8")
+        _console_file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s"))
+        _console_log.addHandler(_console_file_handler)
+    except Exception:
+        # 落点不可写时不阻断启动: 退回 stderr (docker logs 兜底), 绝不抛出。
+        _console_stderr_handler = logging.StreamHandler()
+        _console_stderr_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(message)s"))
+        _console_log.addHandler(_console_stderr_handler)
 
 
 # 单行 '- [step_id] title → result' markdown 行无损拆出 (s5 fix #10 UI 卡片化):
@@ -1800,7 +1843,13 @@ def _serialize_todo_doc(doc, raw_text: str) -> dict:
             "product_workspace": t.product_workspace,
             "required_files": list(t.required_files or []),
             "status": t.status,
-            "status_sem": _TODO_STATUS_SEM.get(t.status.lower() if isinstance(t.status, str) else "",
+            # issue #124: 展示映射按归一化规范值查表, 中文变异 (已完成 等)
+            # 也能命中正确徽章, 不再降级为灰色排队中 (AC-124-4)。
+            # issue #146: 命中分支第二位是**规范状态 token** (机器值);
+            # fallback 分支第二位是**非 token 的自由文本** (原始状态透传)。
+            # 前端必须用映射表查表判定 (不能用前缀判断), 查不到 ⇒ 原样透传,
+            # 未知状态不被吞成「排队中」(AC-146-6)。
+            "status_sem": _TODO_STATUS_SEM.get(_todo.normalize_status(t.status) or "",
                                                ("pending", t.status, "badge-slate")),
             "result": t.result,
             "has_result": t.has_result,
@@ -3629,7 +3678,7 @@ def api_task_state_correct(task_id: str, payload: dict) -> dict:
                     "from": old, "to": target, "reason": reason}
         # reassess: 按当前 TODO.md 状态立即重 harvest (复用 M3 语义)
         from .reaper import _read_todo_status
-        from .todo import STATUS_COMPLETED, STATUS_FAILED
+        from .todo import TERMINAL_STATUSES, normalize_status
         from .harvest import harvest
         sess = led.get_session(task_id)
         ws = _row_get(sess, "workspace")
@@ -3639,13 +3688,14 @@ def api_task_state_correct(task_id: str, payload: dict) -> dict:
         contract = json.loads(row["contract_json"] or "{}")
         todo_status = _read_todo_status(ws, ledger_row=row,
                                       contract=contract)
-        norm = (todo_status or "").strip().lower() if todo_status else None
+        # issue #124: reassess 门槛经统一归一化入口 (镜像 M3),
+        # 中文变异终态 (completed / failed 的中文写法) 同样可 reassess 结算。
+        norm = normalize_status(todo_status)
         # P1-1 修复 (BATCH1-REVIEW): 镜像 M3 (_reap_late_completions) 的
         # 终态门槛 —— 仅 completed/failed 才结算。working/blocked/缺失等
         # 非终态一律不结算, 杜绝 `or "completed"` 兜底把「没交卷」误报
         # 成 COMPLETE 中继给 main。
-        if norm not in (STATUS_COMPLETED, STATUS_FAILED,
-                       "complete", "fail"):
+        if norm not in TERMINAL_STATUSES:
             return {"ok": True, "task_id": task_id, "action": "reassess",
                     "todo_status": todo_status, "settled": False,
                     "note": _t("console.note.reassess_non_terminal"), "reason": reason}
@@ -3728,6 +3778,481 @@ def api_task_archive(task_id: str) -> dict:
     return {"ok": True, "task_id": task_id, "killed_procs": killed,
             "note": _t("console.note.task_archive")}
 
+
+def api_relay_confirm(payload: dict) -> dict:
+    """issue #119: main 侧显式回执通道 —— 主动确认「报告已消费」。
+
+    背景: notify_confirmed_at 原先只在 relay 真收到 gateway HTTP 200 时置位,
+    而 gateway chat 是全同步的 ⇒ 客户端 timeout 早于服务端返回时确认位永远
+    NULL, 留下残余重投通道。本端点让 main 消费完报告即可主动置位, 不必等
+    那个可能永远不来的 200。
+
+    语义 (复用 Ledger.confirm_delivered, 不另造清理语义):
+      - 置 notify_confirmed_at, 顺带清 notify_attempts/notify_dead_until 等
+        退避与死信字段 ⇒ 死信卡 (attempts>=8 → dead_until=+1年) 回执一次即恢复;
+      - 幂等: 重复回执 = 重写时间戳, 结果一致, 不报错, 不重复发事件
+        (回执是幂等状态位写入, 非状态机迁移, 故不 emit mw_events);
+      - 隔离: 只对调用方显式点名的 task_id 生效 (confirm_delivered 的
+        WHERE task_id=? 保证), 不批量扫描全表;
+      - 不调用本端点时现有 relay 路径零变化 (扫描 SQL 逐字不变)。
+    鉴权口径: 与 /api/task/cancel 等既有写端点一致 (受信内网 8700, 无独立
+    令牌); 回执只写确认位 (幂等、无破坏面), 不引入令牌体系。
+    错误字面量用英文 (机器消费面, 不新增 i18n 键)。
+    """
+    from .ledger import Ledger
+    task_id = (payload or {}).get("task_id", "")
+    if not task_id:
+        return {"code": 400, "ok": False, "error": "task_id required"}
+    led = Ledger(LEDGER_DB)
+    try:
+        # confirm_delivered 对不存在 task_id 静默 no-op ⇒ 必须先预检,
+        # 否则「卡不存在(404)」与「内部错误(500)」无法区分。
+        # ── #157 观察 2 (登记, 不收紧) ────────────────────────────────
+        # 本预检与下方 confirm_delivered 之间若卡恰被并发删除, 回执后重查
+        # row 为 None ⇒ 现语义返回 ok:true + confirmed_at:null。全仓今天
+        # 无 DELETE FROM harvest_contracts 路径 ⇒ 窗口纯理论, 且回执幂等
+        # 无破坏面, 实际影响可忽略。
+        # 触发条件: 未来若新增契约删除路径, 须收紧 —— 按 confirm_delivered
+        # 的 UPDATE rowcount 判定 (rowcount=0 ⇒ ok:false), 而非现状的
+        # ok:true + confirmed_at:null。收紧会改变既有返回语义, 届时须同步
+        # 改 tests/test_issue119_relay_confirm.py::test_race_window_pinned_current_semantics
+        # (该用例钉住现行语义, 收紧后必转红以强制重读本注释)。
+        if led.get_contract(task_id) is None:
+            return {"code": 404, "ok": False, "error": "task not found"}
+        led.confirm_delivered(task_id)
+        row = led.get_contract(task_id)
+        confirmed_at = row["notify_confirmed_at"] if row else None
+    finally:
+        led.close()
+    return {"ok": True, "task_id": task_id, "confirmed_at": confirmed_at}
+
+
+
+# ════════════════════════════════════════════════════════════════════
+# cron 定时任务视图 (s4 / 卡 t_da1c3a64) —— 端点 + venv 子进程 JSON 桥
+#
+# 依据: docs/PLAN-CRON-20261027.md (R2 修订版) §1.2/§2.0/§2.1/§2.2/§2.3
+#       + docs/PLAN-CRON-R2-20261027.md §4 硬要求
+#       + docs/UX-CRON-20261027.md (前端视图照此实现)
+#       (以上三份是**过程文档**, 位于任务 workspace docs/, 不入仓 —— 干净克隆
+#        里无此路径; 本段注释自含协议要点, 不依赖它们才能读懂)
+#
+# 数据通路 = 路线 (c′)「venv 子进程 JSON 桥」:
+#   console 进程的解释器是 /usr/bin/python3.13, import cron.* 直接失败
+#   (main 实测 No module named 'cron'; 加 PYTHONPATH=/opt/hermes 仍缺 yaml),
+#   所以 console 侧**零 import cron**, 改起子进程跑 venv 解释器
+#   ($PYTHON_BIN, 默认 /opt/hermes/.venv/bin/python3 —— 与本文件
+#   _api_reaper_reap_once / _api_reaper_debug_todo_scan 先例同款),
+#   在 venv 内 import cron 并输出**一行 JSON** (桥侧是唯一写者, 保证单行;
+#   console 侧按**末行**解析, 容忍前置噪声行 —— 见 _cron_bridge 解析段)。
+#
+# 同源保证 (PLAN §1.3):
+#   子进程 env **显式覆写** HERMES_HOME (不继承 console 进程可能被改过的值),
+#   值取 os.environ["MW_HERMES_HOME"] 兜底 /opt/data (与本文件 harvest 调用
+#   同款口径); 桥响应回带 home 字段, console 侧断言相等, 不等 → 500。
+#
+# 鉴权口径 (PLAN §2.0): 控制台 8700 现状**无独立鉴权层**(无 Origin/Referer/
+#   CSRF 校验), 本批不新增令牌, 与既有写端点(/api/task/cancel 等)同口径 ——
+#   部署面 8700 只在受信内网暴露。写端点安全靠: ① action 白名单;
+#   ② job_id 正则校验后才进 req; ③ 桥无注入面(见下)。
+#
+# 注入面 (PLAN §2.0 R2 追加): 桥脚本是本文件内嵌常量, req 字段全部白名单
+#   构造 (job_id 先过 ^[A-Za-z0-9_-]+$), 无 shell=True, 无字符串拼接进
+#   python 源码 ⇒ 桥侧不存在注入面。
+#
+# 红线: 本段只新增 _CRON_BRIDGE_SRC / _cron_bridge / api_cron_* 三组符号,
+#   路由只在 do_GET / do_POST 各加 cron 分支, 不碰任何既有端点行为。
+# ════════════════════════════════════════════════════════════════════
+
+# 桥脚本源码常量 —— 必须是**一行 JSON** 协议的唯一写者。
+# 只用 cron 公开 API (list_jobs/get_job/pause_job/resume_job/trigger_job/
+# effective_job_state/list_executions), 禁碰 `_` 前缀私有符号 (PLAN R6)。
+_CRON_BRIDGE_SRC = r'''
+import json
+import sys
+
+# ── 请求: stdin 一个 JSON ────────────────────────────────────────────
+try:
+    req = json.loads(sys.stdin.read() or "{}")
+    if not isinstance(req, dict):
+        req = {}
+except Exception:
+    req = {}
+
+# 桥侧统一失败出口: 任何异常都收敛成结构化 JSON, 绝不把 traceback 打到 stdout
+# (stdout 协议只容一行 JSON; stderr 不参与解析, 仅供 console 侧排障)。
+def _fail(code, error):
+    out = {"ok": False, "code": int(code), "error": str(error)}
+    sys.stdout.write(json.dumps(out, ensure_ascii=False))
+    sys.stdout.flush()
+    sys.exit(0)
+
+# ── 导入 cron (公开 API only) ────────────────────────────────────────
+try:
+    from cron.jobs import (list_jobs, get_job, pause_job, resume_job,
+                           trigger_job, effective_job_state)
+    from cron.executions import list_executions
+    from cron.jobs import get_hermes_home
+except Exception:
+    _fail(503, "cron 数据源不可用")
+
+# ── 投影: 单条作业 → 前端契约 (§2.1 / §2.3 同一形状) ────────────────
+# state 唯一判定源 = effective_job_state(job)(权威派生态, 不信 record["state"])。
+# schedule 是 dict, 展示值取 schedule["display"], 回退 schedule["expr"]。
+# prompt 摘要后端截断 200 字符 + 省略号(前端不做长文本处理)。
+def _project(job):
+    if not isinstance(job, dict):
+        return None
+    try:
+        state = effective_job_state(job)
+    except Exception:
+        state = "unknown"
+    sched = job.get("schedule")
+    if isinstance(sched, dict):
+        sched_display = sched.get("display") or sched.get("expr") or ""
+        sched_expr = sched.get("expr") or ""
+    else:
+        sched_display = sched or job.get("schedule_display") or ""
+        sched_expr = ""
+    prompt = job.get("prompt") or ""
+    if not isinstance(prompt, str):
+        prompt = str(prompt)
+    if len(prompt) > 200:
+        prompt = prompt[:200] + "…"
+    latest = job.get("latest_execution")
+    if isinstance(latest, dict):
+        latest = {
+            "status": latest.get("status"),
+            "started_at": latest.get("started_at"),
+            "finished_at": latest.get("finished_at"),
+            "error": latest.get("error"),
+        }
+    else:
+        latest = None
+    return {
+        "id": str(job.get("id") or ""),
+        "name": str(job.get("name") or job.get("id") or ""),
+        "prompt": prompt,
+        "schedule_display": str(sched_display),
+        "schedule_expr": str(sched_expr),
+        "state": state,
+        "next_run_at": job.get("next_run_at"),
+        "last_run_at": job.get("last_run_at"),
+        "paused_reason": job.get("paused_reason"),
+        "latest_execution": latest,
+    }
+
+action = str(req.get("action") or "")
+job_id = req.get("job_id")
+job_id = str(job_id) if job_id is not None else ""
+
+try:
+    if action == "list":
+        # include_disabled=True: 暂停态作业必须可见可恢复(§2.1)。
+        jobs = [_project(j) for j in list_jobs(include_disabled=True)]
+        jobs = [j for j in jobs if j]
+        sys.stdout.write(json.dumps(
+            {"ok": True, "home": str(get_hermes_home()), "count": len(jobs),
+             "jobs": jobs}, ensure_ascii=False))
+        sys.stdout.flush()
+        sys.exit(0)
+
+    if action == "runs":
+        if not job_id:
+            _fail(422, "job_id 必填")
+        job = get_job(job_id)
+        if not job:
+            _fail(404, "任务已不存在")
+        limit = req.get("limit")
+        try:
+            limit = int(limit)
+        except Exception:
+            limit = 3
+        limit = max(1, min(limit, 10))
+        rows = list_executions(job_id=job.get("id") or job_id, limit=limit)
+        runs = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            runs.append({
+                "id": r.get("id"),
+                "status": r.get("status"),
+                "started_at": r.get("started_at"),
+                "finished_at": r.get("finished_at"),
+                "error": r.get("error"),
+                "scheduled_instant": r.get("scheduled_instant"),
+            })
+        sys.stdout.write(json.dumps(
+            {"ok": True, "home": str(get_hermes_home()),
+             "runs": runs, "limit": limit}, ensure_ascii=False))
+        sys.stdout.flush()
+        sys.exit(0)
+
+    if action in ("pause", "resume", "trigger"):
+        if not job_id:
+            _fail(422, "job_id 必填")
+        if action == "pause":
+            job = pause_job(job_id)
+        elif action == "resume":
+            job = resume_job(job_id)
+        else:
+            job = trigger_job(job_id)
+        if not job:
+            _fail(404, "任务已不存在")
+        sys.stdout.write(json.dumps(
+            {"ok": True, "home": str(get_hermes_home()),
+             "job": _project(job)}, ensure_ascii=False))
+        sys.stdout.flush()
+        sys.exit(0)
+
+    _fail(422, "未知 action")
+except ValueError as e:
+    # cron 库对状态冲突抛 ValueError(终态 trigger / 一次性过期 resume)
+    # → 409, 错误原文透传(PLAN §2.0 映射表)。
+    _fail(409, e)
+except Exception as e:
+    _fail(500, e)
+'''
+
+
+# 桥超时: 读 10s / 写 15s(cron 库 flock 自身 30s 上限, 桥取保守值)。
+_CRON_BRIDGE_TIMEOUT_READ = 10.0
+_CRON_BRIDGE_TIMEOUT_WRITE = 15.0
+# job_id 白名单: 与 URL 段形态一致, 杜绝注入面(PLAN §2.0 R2 追加)。
+_CRON_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _cron_home() -> str:
+    """cron store 的 home 解析 —— 与 console 既有 harvest 口径同款(console.py:3657)。"""
+    return os.environ.get("MW_HERMES_HOME", "/opt/data")
+
+
+def _cron_valid_job_id(job_id: str) -> bool:
+    """job_id 白名单校验 —— 端点层前置 + 桥侧入口双重把关。
+
+    422 属参数非法, 必须在**端点层**就能判定 (不落子进程、不起进程),
+    故此校验在 api_cron_* 里先做一道; `_cron_bridge` 内再做一道兜底
+    (防将来新增调用点绕过端点层)。
+    """
+    return bool(_CRON_JOB_ID_RE.match(str(job_id or "")))
+
+
+def _cron_bridge(req: dict, timeout: float) -> dict:
+    """起 venv 子进程跑 cron 桥, 解析单行 JSON, 归一化所有失败面。
+
+    返回值恒为 dict:
+      成功 → 桥的原始 payload (含 ok/home/...)
+      失败 → {"ok": False, "code": <HTTP 码>, "error": <中文可读短句>}
+
+    四类 503 触发面(PLAN §2.0, 逐条实现):
+      ① 子进程超时 (TimeoutExpired)
+      ② 子进程起不来 (FileNotFoundError: PYTHON_BIN 不存在)
+      ③ rc≠0 或 stdout 非 JSON (桥自身损坏; 解析取末行, 容忍前置噪声)
+      ④ 桥返回 ok:false, code:503 (venv 内 import cron 失败)
+    —— 一律结构化归因, 绝不裸抛, console 进程不得因 cron 数据面崩。
+    """
+    import subprocess as _sp
+
+    # req 白名单构造: 只透出桥认识的字段, job_id 先过正则。
+    action = str(req.get("action") or "")
+    payload: dict = {"action": action}
+    job_id = req.get("job_id")
+    if job_id is not None:
+        job_id = str(job_id)
+        if not _CRON_JOB_ID_RE.match(job_id):
+            return {"ok": False, "code": 422, "error": "job_id 非法"}
+        payload["job_id"] = job_id
+    if req.get("limit") is not None:
+        try:
+            payload["limit"] = int(req.get("limit"))
+        except Exception:
+            return {"ok": False, "code": 422, "error": "limit 非法"}
+    # action 白名单: 桥侧也会校验, 这里先收一道(鉴权口径 §2.0 ①)。
+    if action not in ("list", "runs", "pause", "resume", "trigger"):
+        return {"ok": False, "code": 422, "error": "未知 action"}
+
+    home = _cron_home()
+    env = {**os.environ, "HERMES_HOME": home}
+    py = os.environ.get("PYTHON_BIN", "/opt/hermes/.venv/bin/python3")
+    try:
+        proc = _sp.run([py, "-c", _CRON_BRIDGE_SRC],
+                       input=json.dumps(payload, ensure_ascii=False),
+                       capture_output=True, text=True, timeout=timeout, env=env)
+    except _sp.TimeoutExpired:
+        return {"ok": False, "code": 503, "error": "cron 数据源不可用",
+                "detail": "bridge timeout"}
+    except FileNotFoundError:
+        return {"ok": False, "code": 503, "error": "cron 数据源不可用",
+                "detail": "python interpreter not found"}
+    except Exception as e:  # 起进程失败等其余异常面, 同样归 503
+        return {"ok": False, "code": 503, "error": "cron 数据源不可用",
+                "detail": str(e)}
+
+    # stdout 必须是**一行 JSON**; 非 JSON / rc≠0 → 503(触发面 ③)。
+    # 解析取**末行** (`out.splitlines()[-1]`): 容忍库在前置行打出的噪声,
+    # 但只认最后一行 —— 桥侧是唯一写者, 正常路径恒为单行。
+    if proc.returncode != 0:
+        # rc≠0 = 解释器级故障 (桥脚本自身已收敛全部业务异常, 只剩路径/版本类
+        # 信息) ⇒ stderr 原文**只进日志面**, 响应体只留固定文案 + rc 码,
+        # 避免把解释器绝对路径等内部信息带进 HTTP 响应 (issue #135)。
+        # `split()` 折叠换行/空白控制符 → stderr 尾巴单行化, 防日志注入
+        # (伪造多行伪装成别的日志行); 截断 500 字符, 只留尾部。
+        _tail = " ".join((proc.stderr or "").split())[-500:]
+        # 日志写入**不得**成为新的裸抛点 (落点文件 IO / 编码异常同样可能抛)
+        # ⇒ 沿用 suppress 兜住, 保证本函数「一律结构化归因, 绝不裸抛」的
+        # 契约不被日志面破坏 (见本函数 docstring)。
+        with suppress(Exception):
+            # issue #143: 落点从「进程 stderr (仅 docker logs 可见)」改为
+            # 文件落点 ${MW_HOME}/logs/console.log (宿主可达, 跨重启存活)。
+            # ★ #135 契约不回退: 尾巴仍单行化 + ≤500 字符, 且**仍只进日志面**,
+            #   不进 HTTP 响应体 (响应体只留固定文案 + rc)。
+            _console_log.error(
+                "[cron-bridge] rc=%s stderr_tail: %s", proc.returncode, _tail)
+        return {"ok": False, "code": 503, "error": "cron 数据源不可用",
+                "detail": f"cron bridge exited rc={proc.returncode}"}
+    out = (proc.stdout or "").strip()
+    if not out:
+        return {"ok": False, "code": 503, "error": "cron 数据源不可用",
+                "detail": "empty bridge output"}
+    try:
+        data = json.loads(out.splitlines()[-1])
+    except Exception:
+        return {"ok": False, "code": 503, "error": "cron 数据源不可用",
+                "detail": "non-json bridge output"}
+    if not isinstance(data, dict):
+        return {"ok": False, "code": 503, "error": "cron 数据源不可用",
+                "detail": "bridge output not an object"}
+    return data
+
+
+def _cron_bridge_error(data: dict) -> tuple[int, dict]:
+    """桥失败 → (HTTP 码, 响应体)。逐行落实 PLAN §2.0 错误映射表。
+
+    ok:false, code:404 → 404, error 透传
+    ok:false, code:409 → 409, error 透传
+    ok:false, code:500 → 500, error 透传
+    ok:false, code:503 → 503, "cron 数据源不可用"
+    其余未知 code → 503(归到数据源不可用, 不裸奔成 200)
+    """
+    code = int(data.get("code") or 503)
+    if code == 503:
+        body = {"error": "cron 数据源不可用"}
+    elif code in (404, 409, 422, 500):
+        body = {"error": data.get("error") or "cron 数据源不可用"}
+    else:
+        code = 503
+        body = {"error": "cron 数据源不可用"}
+    if data.get("detail"):
+        body["detail"] = str(data["detail"])[:500]
+    return code, body
+
+
+def _cron_assert_home(data: dict) -> None:
+    """同源双保险: 桥回带 home, 与 console 期望的 home 不等 → 500。
+
+    不等意味着桥子进程解析到的 store 与 console 以为的不是同一份
+    (env 被改写 / 多 profile 串了), 此时展示的数据不可信, 直接报错。
+    """
+    home = data.get("home")
+    if not home:
+        return  # 桥未回带 home → 不阻断, 由 env 显式覆写保证
+    if str(home) != str(_cron_home()):
+        raise ValueError(f"cron store home 不一致: 期望 {_cron_home()}, 实际 {home}")
+
+
+def _cron_ticker() -> dict | None:
+    """ticker 心跳 —— console 直读文件 mtime(不经桥, PLAN §2.1)。
+
+    heartbeat 文件 = ticker 最近一次循环; success 文件 = 最近一次无异常 tick。
+    文件缺失 → 读不到 ⇒ 不做"停摆"判断, 返回 None(前端不显示横幅)。
+    """
+    import time as _time
+    base = os.path.join(_cron_home(), "cron")
+    hb = os.path.join(base, "ticker_heartbeat")
+    ok = os.path.join(base, "ticker_last_success")
+    try:
+        hb_age = _time.time() - os.stat(hb).st_mtime
+        ok_age = _time.time() - os.stat(ok).st_mtime
+    except OSError:
+        return None
+    # 心跳超过 3 个 tick 周期(默认 60s)未更新 ⇒ 判定调度器停摆。
+    alive = hb_age <= 180
+    return {"alive": alive,
+            "last_success_age_s": int(max(0, ok_age)) if ok_age >= 0 else None}
+
+
+def api_cron_jobs() -> tuple[int, dict]:
+    """GET /api/cron/jobs —— 定时任务列表(PLAN §2.1)。
+
+    响应形状: {"jobs": [...], "ticker": {...}|null}
+    错误: 503 cron 数据源不可用 / 500 home 不一致或坏形状。
+    """
+    data = _cron_bridge({"action": "list"}, _CRON_BRIDGE_TIMEOUT_READ)
+    if not data.get("ok"):
+        return _cron_bridge_error(data)
+    try:
+        _cron_assert_home(data)
+    except ValueError as e:
+        return 500, {"error": str(e)}
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list):
+        # 桥坏形状 → 500(不是 200 + 空体), 前端落错误态。
+        return 500, {"error": "cron 数据源返回了非法形状"}
+    return 200, {"jobs": jobs, "ticker": _cron_ticker()}
+
+
+def api_cron_runs(job_id: str, limit) -> tuple[int, dict]:
+    """GET /api/cron/jobs/{id}/runs?limit=3 —— 最近执行记录(PLAN §2.2)。
+
+    limit 默认 3, clamp 到 [1, 10]; 非数字 → 422。
+    """
+    if limit is None or limit == "":
+        limit = 3
+    try:
+        limit = int(limit)
+    except Exception:
+        return 422, {"error": "limit 非法"}
+    limit = max(1, min(limit, 10))
+    # job_id 白名单前置: 非法 id 直接 422, 不起子进程(无注入面)。
+    if not _cron_valid_job_id(job_id):
+        return 422, {"error": "job_id 非法"}
+    data = _cron_bridge({"action": "runs", "job_id": job_id, "limit": limit},
+                        _CRON_BRIDGE_TIMEOUT_READ)
+    if not data.get("ok"):
+        return _cron_bridge_error(data)
+    try:
+        _cron_assert_home(data)
+    except ValueError as e:
+        return 500, {"error": str(e)}
+    runs = data.get("runs")
+    if not isinstance(runs, list):
+        return 500, {"error": "cron 数据源返回了非法形状"}
+    return 200, {"runs": runs, "limit": limit}
+
+
+def api_cron_action(job_id: str, action: str) -> tuple[int, dict]:
+    """POST /api/cron/jobs/{id}/pause|resume|trigger —— 三个写操作(PLAN §2.3)。
+
+    成功 → 200 + 操作后的**完整 job 投影**(与 §2.1 单条同形状, 复用同一投影)。
+    错误码: 404 不存在 / 409 状态冲突 / 422 参数非法 / 500 未预期 / 503 数据源不可用。
+    """
+    if action not in ("pause", "resume", "trigger"):
+        return 422, {"error": "未知 action"}
+    # job_id 白名单前置: 非法 id 直接 422, 不起子进程(无注入面)。
+    if not _cron_valid_job_id(job_id):
+        return 422, {"error": "job_id 非法"}
+    data = _cron_bridge({"action": action, "job_id": job_id},
+                         _CRON_BRIDGE_TIMEOUT_WRITE)
+    if not data.get("ok"):
+        return _cron_bridge_error(data)
+    try:
+        _cron_assert_home(data)
+    except ValueError as e:
+        return 500, {"error": str(e)}
+    job = data.get("job")
+    if not isinstance(job, dict):
+        return 500, {"error": "cron 数据源返回了非法形状"}
+    return 200, job
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -4185,6 +4710,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(_code, _body)
             if p == "/api/soul-template":
                 return self._send(200, api_soul_template())
+            # ── cron 定时任务视图 (s4 / t_da1c3a64) ──────────────────
+            # 只读端点: 列表 + 单作业最近执行记录。
+            # 必须先于 /api/w/ 与 /api/sessions 两个透传分支吗? 不需要 ——
+            # 路径前缀 /api/cron/ 与那两族无交集, 但仍放在此处以免误撞。
+            if p == "/api/cron/jobs":
+                _code, _body = api_cron_jobs()
+                return self._send(_code, _body)
+            # 单作业执行记录: /api/cron/jobs/{id}/runs?limit=3
+            # job_id 白名单正则与桥侧一致, 非法 id 直接 422(不落子进程)。
+            m = re.match(r"^/api/cron/jobs/([^/]+)/runs$", p)
+            if m:
+                _rq = parse_qs(urlparse(self.path).query,
+                               keep_blank_values=True)
+                _code, _body = api_cron_runs(
+                    m.group(1), (_rq.get("limit") or [None])[0])
+                return self._send(_code, _body)
             if p == "/api/workspaces":
                 return self._send(200, api_workspaces())
             # Issue #46 / docs/ARCH-FILEBROWSER.md §3.5: fs 只读路由
@@ -4301,6 +4842,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._proxy_to_worker(p)
             if p.startswith("/api/sessions") or p.startswith("/v1/runs"):
                 return self._proxy_to_gateway(p)
+            # ── cron 写操作 (s4 / t_da1c3a64) ────────────────────────
+            # ★ 必须放在 body 预读**之前**: 本批三个写端点无 body,
+            #   若先走 json.loads(self.rfile.read(n)) 会等一个永不到来的
+            #   请求体 ⇒ 挂死。放在代理分支之后(代理优先级最高)、预读之前。
+            # 路径前缀 /api/cron/ 与 /api/w/ /api/sessions 无交集, 不误撞。
+            m = re.match(r"^/api/cron/jobs/([^/]+)/(pause|resume|trigger)$", p)
+            if m:
+                _code, _body = api_cron_action(m.group(1), m.group(2))
+                return self._send(_code, _body)
             n = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/resume":
@@ -4361,6 +4911,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, api_task_cancel(payload.get("task_id", "")))
             if p == "/api/task/archive":
                 return self._send(200, api_task_archive(payload.get("task_id", "")))
+            # issue #119: main 侧显式回执通道 (有 body ⇒ 必须在预读之后;
+            # /api/relay/ 前缀与既有全部路由无交集, 不误撞)。
+            # 错误码经 payload 的 code 字段透传 (400/404), 与 /api/resume 同形态。
+            if p == "/api/relay/confirm":
+                _res = api_relay_confirm(payload)
+                _code = _res.pop("code", 200)
+                return self._send(_code, _res)
             # M5 (BATCH1-DESIGN): main 纠正误报/错误终结端点
             m = re.match(r"^/api/tasks/([A-Za-z0-9_-]+)/state-correct$", p)
             if m:
@@ -4629,7 +5186,10 @@ def main():
     except Exception as e:
         print(f"[console] avatar migration skipped: {e}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    # issue #143 (改 B-4): 「console 起来了」也落固定文件, 排障时可用文件
+    # 自证进程存活; print 保留给 docker logs 面 (StreamHandler 兜底时同源)。
     print(f"[console] listening on :{PORT}")
+    _console_log.info("console listening on :%s", PORT)
     srv.serve_forever()
 
 

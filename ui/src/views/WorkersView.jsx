@@ -21,6 +21,9 @@ import { Modal, Confirm, Toast } from '../components/ui.jsx'
 // 与 run 页 (TasksBoardView classify(t.state)) 同一派生输入源。
 const DERIVED_TO_VISUAL = {
   WORKING: 'working', HANDOFF: 'working',
+  // issue #132: waiting_sub 不再落空折到 idle/offline, 归入 subagent 可视态
+  // (球在 worker 的子任务侧); 顺序与后端 _DERIVED_SALIENCE 同构便于对照。
+  WAITING_SUB: 'subagent',
   NEED_CLARIFICATION: 'attention', BLOCKED: 'attention', ERROR: 'attention',
   WAITING: 'waiting',
 }
@@ -54,6 +57,9 @@ function workerStatus(entry, activeRunId) {
 // 可视映射: 颜色 + 图形 class + label 由 t() 翻译。
 const STATUS_META = {
   working:   { i18nKey: 'workers.status_working',   cls: 'badge-blue',    gfx: 'wcard-gfx-working' },
+  // issue #132: subagent = worker 在等自己的子任务, 复用 working 图形与忙碌族蓝,
+  // 不再误显示 idle/offline/等介入。
+  subagent:  { i18nKey: 'workers.status_waiting_sub', cls: 'badge-blue',  gfx: 'wcard-gfx-working' },
   attention: { i18nKey: 'workers.status_attention', cls: 'badge-yellow',  gfx: 'wcard-gfx-idle' },
   waiting:   { i18nKey: 'workers.status_waiting',   cls: 'badge-amber',   gfx: 'wcard-gfx-idle' },
   idle:      { i18nKey: 'workers.status_idle',      cls: 'badge-green',   gfx: 'wcard-gfx-idle' },

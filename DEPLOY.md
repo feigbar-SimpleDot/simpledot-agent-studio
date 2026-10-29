@@ -46,6 +46,15 @@ vi .env        # only fill API_SERVER_KEY (generate with: $(openssl rand -hex 32
 bind-mount setup, bring up containers, wait for healthy. About
 1~3 minutes total (depending on image pull speed).
 
+**Step ③ is mandatory, not optional.** The repo ships exactly **one**
+frontend build artifact (`ui/dist/index.html`). `mw/ui_dist/` and
+`data/share_workspace/ui_dist/` are **deploy-time copies** that
+`install.sh` rebuilds from `ui/dist` on every run — they are not in git
+(issue #125, route A). So a clone that skips `install.sh` has no console
+frontend at all: the console falls back to the built-in `console_ui.py`
+page (very old HTML constants). That fallback is expected behaviour, not
+a bug, but it means **always run `./deploy/install.sh` after cloning**.
+
 The installer does **not** initialise Kanban — `kanban.db` is created by
 Hermes itself: the gateway's embedded dispatcher calls the idempotent
 `init_db()` on start-up, and so does every `hermes kanban` command. If
@@ -124,6 +133,11 @@ report-style output:
   semantics, but every line and section banner is in Chinese, summary
   in Chinese.
 
+One exemption: the `LANG=` report line carries only its English text at
+the call site, so it prints in English under either language (the
+language pick falls back to the first argument when no second argument
+is given).
+
 It is safe to run with either value; pick whichever you read faster
 when triaging a deployment issue.
 
@@ -133,9 +147,11 @@ when triaging a deployment issue.
 # 1. edit .env
 vi .env            # change the LANG= line
 
-# 2. re-run install. SOUL/SKILL are read-only bind mounts of the repo
-#    source files (docs/main-soul.<LANG>.md, deploy/skills/...), selected
-#    by the new LANG — there is no host-side copy to preserve.
+# 2. re-run install. install.sh regenerates the staging copies
+#    deploy/.runtime-soul/SOUL.md and deploy/.runtime-skills/<sk>/SKILL.md
+#    from the repo sources (docs/main-soul.<LANG>.md, deploy/skills/...),
+#    selected by the new LANG, and mounts those staging dirs read-only.
+#    There is no host-side copy to preserve.
 #    --preserve-soul is still accepted for old automation but is a no-op
 #    (since s4d-fix2); to keep a customized SOUL, edit the repo source
 #    docs/main-soul.<LANG>.md yourself and re-run install.
@@ -336,8 +352,11 @@ ssh <host> 'docker cp /tmp/registry.json hermes_main:/opt/mwroot/mw/registry.jso
 | Force container CLI (skip auto-detect) | n/a — install.sh calls `docker` directly. On macOS the docker-for-apple-container shim exposes the same `docker` surface; pick a different binary by editing `deploy/install.sh` only if your host does not have `docker` on PATH |
 | Change model / endpoint / Hermes behaviour | **Hermes's own config** (`hermes config` or `config.yaml` inside the container); this platform does not proxy it. After change, `docker restart <container>` to apply |
 | reaper period | add `MW_REAPER_INTERVAL` in compose (default 15s) |
-| subagent waiting timeout (issue#13) | add `MW_REAPER_SUBAGENT_MIN` in `.env` (default 60 min, `0` disables new behavior — reaper falls back to the old stuck threshold; note: even when `0`, reaper still classifies a `waiting_sub` card as in-progress per the contract timeout, so the 5-min TODO-missing cleanup does NOT apply to it) |
+| subagent waiting timeout (issue#13) | add `MW_REAPER_SUBAGENT_MIN` in `.env` (the default is defined by `mw/reaper.py::_subagent_wait_min` — read that function for the current value; `0` disables new behavior — reaper falls back to the old stuck threshold; note: even when `0`, reaper still classifies a `waiting_sub` card as in-progress per the contract timeout, so the 5-min TODO-missing cleanup does NOT apply to it) |
 | SSE drain budget after a downstream disconnect (issue#63) | add `MW_PROXY_DRAIN_MAX_S` in compose (default 3600 s — upper bound on how long the console keeps draining the upstream gateway stream after the browser drops; `0` disables draining altogether — the rollback switch for issue#63) |
+| Python interpreter for the console's subprocess bridges | add `PYTHON_BIN` in compose (default `/opt/hermes/.venv/bin/python3` — the interpreter the console uses for the cron bridge and the reaper probes; it must be the Hermes venv, because the console's own interpreter cannot import `cron.*`) |
+| Hermes home directory (job store + ticker heartbeat) | add `MW_HERMES_HOME` in compose (default `/opt/data` — the per-profile Hermes home that holds `cron/jobs.json` and `cron/executions.db`; the cron bridge overrides `HERMES_HOME` for its subprocess so it reads the same store as the scheduler ticker) |
+| hermes-webui port (optional WebUI embed; NOT this platform's console port — that one is `CONSOLE_PORT`, default 8700) | add `HERMES_WEBUI_PORT` in compose (default 8787 — one instance per host must pick a distinct port when running isolated consoles side by side; see §3.1 / the port-mapping notes below) |
 | Worker needs a browser | see design.md §9: bring up a Chromium CDP container, worker sets `browser.cdp_url` |
 | Worker needs a desktop GUI | see design.md §9: bare metal + peekaboo MCP / Hermes peer |
 | Need a fuller WebUI | embed hermes-webui, see §3.1 below |
@@ -460,8 +479,9 @@ an upgrade).
 |---|---|---|
 | `install.sh` says "missing .env" | .env not copied | `cp .env.example .env` and fill ★ items |
 | Container fails to start with Permission denied | Volume owner != container UID (10000) | `chmod -R 777 data` then re-run `install.sh` (the kanban.db write inside the container still needs the parent dirs to be world-writable; `chmod -R 777` is the first thing install.sh does, but it itself can fail on a 10000-owned tree) |
-| `install.sh` aborts on `cp ... Permission denied` (skills/SOUL bind-mount targets) | upgrade over a running container: `01-hermes-setup` chowned bind dirs to uid 10000, host cp cannot overwrite (issue #53 BUG-53-A) | **s4d-fix2 (2026-10-17)**: skills/SOUL are now read-only bind mounts of the repo source (`deploy/skills/<sk>/SKILL.<LANG>.md`, `docs/main-soul.<LANG>.md`) — there is no host-side cp for these paths anymore, so Permission denied cannot happen on the bind mount itself. If you still see this symptom on an **older** s4b-fix install, upgrade to a commit ≥ s4d-fix2 (`git pull && ./deploy/install.sh`). For everything **else** under data/ (e.g. settings.json, registry.json, share_workspace), the existing `chmod -R 777 data` in §3 is the first fix; on machines without host write access to 10000-owned dirs, the historical `sudo chown -R $USER data` one-time command is the fallback. |
+| `install.sh` aborts on `cp ... Permission denied` (skills/SOUL bind-mount targets) | upgrade over a running container: `01-hermes-setup` chowned bind dirs to uid 10000, host cp cannot overwrite (issue #53 BUG-53-A) | **s4d-fix2 (2026-10-17)**: skills/SOUL are now read-only bind mounts of the staging copies install.sh generates from the repo source (`deploy/skills/<sk>/SKILL.<LANG>.md`, `docs/main-soul.<LANG>.md` → `deploy/.runtime-skills/<sk>/SKILL.md`, `deploy/.runtime-soul/SOUL.md`) — there is no host-side cp for these paths anymore, so Permission denied cannot happen on the bind mount itself. Editing the repo source alone does not change the running copy: re-run the installer to regenerate the staging. If you still see this symptom on an **older** s4b-fix install, upgrade to a commit ≥ s4d-fix2 (`git pull && ./deploy/install.sh`). For everything **else** under data/ (e.g. settings.json, registry.json, share_workspace), the existing `chmod -R 777 data` in §3 is the first fix; on machines without host write access to 10000-owned dirs, the historical `sudo chown -R $USER data` one-time command is the fallback. |
 | Console not ready after 60s | Image not pulled / port occupied | `docker logs hermes_main` to see the error |
+| Cron data source returns 503 (the `error` field is the fixed string `cron 数据源不可用` on every locale — the backend does not localize this message) | cron bridge subprocess exited non-zero | read the tail of the console log: `./data/mw_data/logs/console.log` (host path) — look for lines containing `[cron-bridge] rc=`; the same file is `/mw_data/logs/console.log` inside the container. The line only falls back to stderr (`docker logs hermes_main`) when the log file itself is not writable. |
 | Chat sent, no reply | Model endpoint unreachable or wrong key | This is a Hermes config issue: check `model.base_url` in container's `config.yaml`, `curl <base_url>/models` for self-test |
 | Worker write to shared volume rejected | missing `HERMES_WRITE_SAFE_ROOT` | add that env to the worker compose |
 | Task dispatched but always pending | profile not registered / worker unreachable | check worker in console; `curl <worker_api>/health` |
@@ -493,10 +513,11 @@ socket perfectly well while the guest can no longer `stat`/`unlink` it.
 **Symptom set** (all three usually appear together):
 
 - The console reports `gateway unreachable` when sending a chat message.
-- The host-side port `8642` answers with an empty reply / `503` (colima's
-  ssh port forward has no live backend to forward to), while `curl` to
-  the port is *not* refused — the listener you see on the host is the
-  forwarder itself.
+- (pre-#109) The host-side port `8642` answers with an empty reply / `503`
+  (colima's ssh port forward has no live backend to forward to), while
+  `curl` to the port is *not* refused — the listener you see on the host
+  is the forwarder itself. (Since issue #109 the gateway publishes no
+  host port; this bullet is kept as pre-#109 historical cause analysis.)
 - Inside the container, `gateway-starts.log` grows in an equal-interval
   loop (one restart every ~1–9 minutes), and most of the time **no
   gateway process is alive** (`docker exec hermes_main ps` shows none).
@@ -642,7 +663,9 @@ docker exec "$MAIN_CONTAINER_NAME" sh -c '
 # 4) functional: live socket file + api_server answering
 docker exec "$MAIN_CONTAINER_NAME" sh -c 'ls -l /opt/data/gateway.sock'   # expect srw-------
 # issue #109: gateway 8642 无宿主映射, 探测在容器内进行 (verify.sh 同口径)
-docker exec "$MAIN_CONTAINER_NAME" python3 -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8642/api/sessions", timeout=8).status)'   # expect 401 (no key) or 200 with key
+docker exec "$MAIN_CONTAINER_NAME" python3 -c 'import urllib.request,urllib.error;
+try: print(urllib.request.urlopen("http://127.0.0.1:8642/api/sessions",timeout=8).status)
+except urllib.error.HTTPError as e: print(e.code)'   # expect 401 (no key) or 200 with key
 ```
 
 **D-2 upstream dependency.** The upstream image should give
@@ -773,6 +796,13 @@ the installer instead, which recreates the container (stop+rm then
 compose up; m1-impl dropped `--force-recreate` because the Apple
 container docker shim does not support that flag):
 
+The same applies when the pull touches the **SOUL or SKILL sources**
+(`docs/main-soul.*.md` or `deploy/skills/**`): the container does not mount
+those repo files, it mounts the staging copies that `deploy/install.sh`
+regenerates from them on every run. A pull plus a restart leaves the
+previous text in place, so the installer has to run for the new text to
+reach the container.
+
 ```bash
 git pull
 ./deploy/install.sh    # stop+rm existing container, then docker compose up -d
@@ -786,6 +816,32 @@ state to schedule around. The only mixed-version combination users can
 hit is **stale browser cache**: a browser holding an older `ui/dist`
 bundle against the current backend. Clear the cache (hard reload) when
 the chat page still polls `/messages` with a full-transcript payload.
+
+**Only `ui/dist` is tracked; `mw/ui_dist` is a deploy-time copy**
+(issue #125, route A). The repo contains exactly one frontend build
+artifact: `ui/dist/index.html`. `install.sh` copies it to `mw/ui_dist/`
+and `data/share_workspace/ui_dist/` on every run and rewrites their
+`.stamp.json`; neither copy is in git (`.gitignore` covers
+`mw/ui_dist/`). Consequences:
+
+- Editing `ui/src` still requires `cd ui && npm run build` and
+  committing the rebuilt `ui/dist/index.html` — the tracked-artifact
+  discipline is unchanged.
+- Never use a repo/worktree `mw/ui_dist/index.html` as UI evidence. It
+  is a local runtime copy whose freshness depends on when you last ran
+  `install.sh`, and before this change it silently drifted for months
+  (that was issue #125). To check what the console actually serves,
+  compare md5 against the live endpoint:
+
+  ```bash
+  md5sum ui/dist/index.html
+  curl -s http://127.0.0.1:${CONSOLE_PORT:-8700}/ | md5sum   # must match
+  ```
+
+- `deploy/check_dist_sync.sh` is the local gate for this (wired into
+  `deploy/verify.sh`): it fails if `mw/ui_dist` is tracked again, if the
+  local runtime copy drifts from `ui/dist` in either direction, or if
+  `ui/dist/index.html` went missing.
 
 When in doubt, `./deploy/install.sh` is always safe (idempotent).
 
@@ -814,6 +870,13 @@ npm run build
 **Verdict method**: rely on browser actual SVG / React component render
 result (runtime attribute values), don't grep the `dist` static file
 (vite minifies variable names).
+
+**Don't use a worktree `mw/ui_dist/index.html` as the verdict input**
+(issue #125): it is a deploy-time copy of `ui/dist`, rebuilt by
+`install.sh`, and it can lag behind `ui/dist` between installs. Judge the
+build against `ui/dist/index.html` (the single tracked artifact) or
+against the live console endpoint, and run `bash deploy/check_dist_sync.sh`
+if the two copies disagree.
 
 ## 5.2 workflow changes — bidirectional sync
 

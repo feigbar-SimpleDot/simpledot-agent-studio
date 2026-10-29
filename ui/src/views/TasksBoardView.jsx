@@ -382,6 +382,11 @@ function classify(card, t) {
       return { group: 'handoff', badge: 'badge-purple', sem: t('tboard.state_handoff'), icon: '↻', dataState: sv }
     if (sv === 'WAITING')
       return { group: 'waiting', badge: 'badge-amber', sem: t('tboard.state_waiting'), icon: '⌛', dataState: sv }
+    // issue #132: waiting_sub 派生态不再被压平成「等介入」—— worker 在等自己
+    // 的子任务, 球在 worker 不在 main, 归忙碌族 (蓝) 与琥珀色 waiting 区分。
+    // 分支顺序在 WAITING 之后: 与 ledger 派生优先级一致 (AC-A7 单一派生态真理源)。
+    if (sv === 'WAITING_SUB')
+      return { group: 'running', badge: 'badge-blue', sem: t('tboard.state_waiting_sub'), icon: '⋯', dataState: sv }
     if (sv === 'PENDING')
       return { group: 'pending', badge: 'badge-slate', sem: t('tboard.state_pending'), icon: '○', dataState: sv }
     if (sv === 'CANCELLED')
@@ -764,6 +769,10 @@ function CurrentTaskCard({ active, detail, detailErr, closing,
               <StatusBadge cls="badge-purple" title={t('tboard.state_handoff')}>{t('tboard.state_handoff')}</StatusBadge>
             ) : isWaiting ? (
               <StatusBadge cls="badge-amber" title={t('tboard.state_waiting')}>{t('tboard.state_waiting')}</StatusBadge>
+            ) : cardState === 'WAITING_SUB' ? (
+              // issue #132: 当前卡派生态 waiting_sub 显示「子任务处理中」;
+              // 必须插在 WORKING 分支之前, 否则 tasks 摘要 running 兜底会先把它渲染成「执行中」。
+              <StatusBadge cls="badge-blue" title={t('tboard.state_waiting_sub')}>{t('tboard.state_waiting_sub')}</StatusBadge>
             ) : displayState === 'BLOCKED' || displayState === 'ERROR' ? (
               <StatusBadge cls="badge-red" title={t('tboard.state_blocked')}>{t('tboard.state_blocked')}</StatusBadge>
             ) : (cur && cur.state === 'WORKING') || active.current_card_status === 'running' ? (
@@ -1005,6 +1014,45 @@ function ResultSegment({ seg, t }) {
   )
 }
 
+// issue #146: 规范状态 token → 前端词条键 (唯一映射点)。
+// issue #149 F-2: 状态契约的**单一真相源** = mw/todo_status_contract.json
+// (后端 mw/console.py::_TODO_STATUS_SEM 由同一文件派生) ⇒ 键集自动跟随后端,
+// 「只改一侧」物理上不可能。词条为 tboard 段平铺键 todo_status_*
+// (与 test_issue58_tokens.mjs 的 tboard 直系键锚同形)。
+import TODO_STATUS_CONTRACT from '../../../mw/todo_status_contract.json'
+
+const TODO_STATUS_TEXT_KEYS = Object.fromEntries(
+  Object.keys(TODO_STATUS_CONTRACT.statuses).map(
+    (tok) => [tok, `tboard.todo_status_${tok}`]))
+
+// issue #146 审查 F-1: token → 词条键的**自有键判定** (与 CronView 的
+// cronStateKey 同款口径)。TODO_STATUS_TEXT_KEYS 是普通对象字面量 ⇒ 继承
+// Object.prototype ⇒ 无防御地查表会让 'constructor' 等原型链键命中继承属性
+// (函数/对象), 把 `function Object() { [native code] }` 灌进 chip 文案;
+// typeof 守卫另挡下数组等会被 String() 强制转换的坏形状
+// (hasOwnProperty.call(TODO_STATUS_TEXT_KEYS, ['working']) === true)。
+// 非 token (含原型链键) 一律返回 null ⇒ 调用方原样透传原始状态文本。
+export function todoStatusTextKey(token) {
+  if (typeof token !== 'string') return null
+  return Object.prototype.hasOwnProperty.call(TODO_STATUS_TEXT_KEYS, token)
+    ? TODO_STATUS_TEXT_KEYS[token]
+    : null
+}
+
+// issue #146 审查 F-1: 『当前任务』chip 文案解析 (纯函数, 便于单测直测,
+// 与 CronView 的 cronStateKey / cronRunBadge 同款口径)。
+// ① token 命中映射 → 返回该词条键 (由调用方 t() 渲染);
+// ② 未命中 (fallback 分支, 第二位是原始状态文本) → 原样透传, 不被吞成
+//    「排队中」(AC-146-6);
+// ③ 非字符串坏形状 (对象/数组) → 一律落 '?', 不把非文本灌进 JSX。
+export function todoStatusText(token, status, t) {
+  const textKey = todoStatusTextKey(token)
+  if (textKey) return t(textKey)
+  if (typeof token === 'string' && token) return token
+  if (typeof status === 'string' && status) return status
+  return '?'
+}
+
 // 『当前任务』主块 — 头部标题 + 状态徽章 + 元数据栅格。
 function CurrentBlock({ cur, t }) {
   if (!cur) {
@@ -1015,7 +1063,14 @@ function CurrentBlock({ cur, t }) {
       </div>
     )
   }
-  const [, sem, badgeCls] = cur.status_sem || ['pending', cur.status || '?', 'badge-slate']
+  // issue #146: 后端下发的是**规范状态 token** (机器值), 文案由前端按
+  // 运行时语言渲染 (后端 MW_LANG 是部署时钟, 满足不了运行时切换)。
+  // 第二位是 token 时查 tboard.todo_status_*; 否则 (fallback 分支) 是
+  // 原始状态文本 ⇒ 原样透传, 不被吞成「排队中」(AC-146-6)。
+  // 审查 F-1: 查表走 todoStatusText() (自有键判定) ⇒ 原型链键
+  // ('constructor' 等) 不会命中继承属性, 不会把函数源码灌进 chip。
+  const [, semToken, badgeCls] = cur.status_sem || ['pending', '', 'badge-slate']
+  const sem = todoStatusText(semToken, cur.status, t)
   return (
     <div className="rounded-xl border-2 border-accent/30 bg-accent/5 overflow-hidden">
       {/* 标题 + 状态 (对齐规范 §3.2: 主行信息密) */}

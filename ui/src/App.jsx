@@ -5,6 +5,7 @@ import ChatView from './views/ChatView.jsx'
 import TasksBoardView from './views/TasksBoardView.jsx'
 import WorkersView from './views/WorkersView.jsx'
 import WorkflowsView from './views/WorkflowsView.jsx'
+import CronView from './views/CronView.jsx'
 import PixelOfficeView from './views/PixelOfficeView.jsx'
 import SettingsView from './views/SettingsView.jsx'
 import LogoMark from './components/LogoMark.jsx'
@@ -28,6 +29,10 @@ const NAV = [
   { id: 'chat',        icon: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.86 9.86 0 01-4-.8L3 21l1.8-4.2A7.9 7.9 0 013 12c0-4.418 4.03-8 9-8s9 3.582 9 8z' },
   { id: 'workers',     icon: 'M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4' },
   { id: 'workflows',   icon: 'M4 6h16M4 12h16M4 18h7m-7 0l3-3m-3 3l3 3M17 15l2 2 4-4' },
+  // 定时任务 (s4 / t_da1c3a64): 时钟图标 (heroicons outline clock),
+  // 位置按交互设计 §1.1 —— workflows 之后、pixel-office 之前
+  // (定时任务与 Workflow 同属「自动化编排」心智组)。
+  { id: 'cron',        icon: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' },
   // 像素办公室 tab 仅在启用时显示(pixelStatus.enabled), 未启用不占导航位。
   { id: 'pixel-office', icon: 'M4 4h16v12H4zM4 20h16M9 8h.01M12 8h.01M15 8h.01M8 12h8', dynamic: true },
   { id: 'settings',    icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z' },
@@ -39,6 +44,7 @@ const NAV_LABEL_KEYS = {
   'chat':        'nav.chat',
   'workers':     'nav.workers',
   'workflows':   'nav.workflows',
+  'cron':        'nav.cron',
   'pixel-office':'nav.pixel_office',
   'settings':    'nav.settings',
 }
@@ -323,6 +329,7 @@ export default function App() {
                 {view === 'tasks-board' && <TasksBoardView onChanged={pollStatus} />}
                 {view === 'workers' && <WorkersView onChanged={pollStatus} onChat={openWorkerChat} />}
                 {view === 'workflows' && <WorkflowsView onChanged={pollStatus} />}
+                {view === 'cron' && <CronView />}
                 {view === 'pixel-office' && pixelEnabled && <PixelOfficeView onNavigate={setView} />}
                 {view === 'settings' && <SettingsView onSaved={(st) => { setWebuiUrl((st?.hermes_webui_url || '').trim()); api.pixelStatus().then((d) => setPixelEnabled(!!d.enabled)).catch(() => {}) }} />}
               </>
@@ -450,6 +457,7 @@ export default function App() {
               {view === 'tasks-board' && t('app.subtitle_tasks_board', { total: counts.total, attention: counts.attention, running: counts.running, finished: counts.finished })}
               {view === 'workers' && t('app.subtitle_workers')}
               {view === 'workflows' && t('app.subtitle_workflows')}
+              {view === 'cron' && t('app.subtitle_cron')}
               {view === 'pixel-office' && t('app.subtitle_pixel_office')}
               {view === 'settings' && t('app.subtitle_settings')}
             </p>
@@ -493,6 +501,7 @@ export default function App() {
               {view === 'tasks-board' && <TasksBoardView onChanged={pollStatus} />}
               {view === 'workers' && <WorkersView onChanged={pollStatus} onChat={openWorkerChat} />}
               {view === 'workflows' && <WorkflowsView onChanged={pollStatus} />}
+              {view === 'cron' && <CronView />}
               {view === 'pixel-office' && pixelEnabled && <PixelOfficeView onNavigate={setView} />}
               {view === 'settings' && <SettingsView onSaved={(st) => { setWebuiUrl((st?.hermes_webui_url || '').trim()); api.pixelStatus().then((d) => setPixelEnabled(!!d.enabled)).catch(() => {}) }} />}
             </>

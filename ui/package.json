@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node tests/test_chatlinks.mjs && node tests/test_sse_parse.mjs && node tests/test_todo_viewer_chips.mjs && node tests/test_toolgroup.mjs && node tests/test_issue58_tokens.mjs && node tests/test_issue63_stop.mjs && node tests/test_issue75_chat_asi.mjs && node tests/test_issue79_run_title.mjs && node tests/test_issue87_s1_deadbranch.mjs && node tests/test_issue86_net_cause.mjs && node tests/test_issue87_fmtapierror_coverage.mjs"
+    "test": "node tests/test_chatlinks.mjs && node tests/test_sse_parse.mjs && node tests/test_todo_viewer_chips.mjs && node tests/test_toolgroup.mjs && node tests/test_issue58_tokens.mjs && node tests/test_issue63_stop.mjs && node tests/test_issue75_chat_asi.mjs && node tests/test_issue79_run_title.mjs && node tests/test_issue87_s1_deadbranch.mjs && node tests/test_issue86_net_cause.mjs && node tests/test_issue87_fmtapierror_coverage.mjs && node tests/test_cron_view.mjs && node tests/test_issue132_waiting_sub.mjs && node tests/test_issue146_todo_status_i18n.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.16",

@@ -76,7 +76,7 @@
   "console.fallback.ph_api_key": "placeholder=\"API key of the worker gateway\"",
   "console.fallback.ph_compose_api_key": "placeholder=\"Set an API key for this worker\"",
   "console.fallback.ph_reviewer": "placeholder=\"e.g. reviewer\"",
-  "console.fallback.ph_url": "placeholder=\"http://<host>:8643\"",
+  "console.fallback.ph_url": "placeholder=\"http://hermes_<name>:8642\"",
   "console.fallback.refresh": "onclick=\"load()\">Refresh</button>",
   "console.fallback.save": ">Save</button>",
   "console.fallback.search_placeholder": "placeholder=\"🔍 Search task title / ID\"",

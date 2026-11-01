@@ -99,6 +99,19 @@ def proxy_http(handler, upstream_path: str):
     /webui 前缀, 含 query string。全方法通用 (GET/POST/PUT/PATCH/DELETE/
     OPTIONS); SSE 响应逐行流式透传。
     """
+    # issue #196: 裸 /webui (无尾斜杠) 规范化 302 → /webui/。
+    # webui index.html 的动态 <base href> 按 location.pathname 推导
+    # (无尾斜杠路径算出 base='/'), 相对静态资源与相对 302 Location
+    # 都会落出 /webui 前缀 → 控制台 404。带尾斜杠是唯一正确形态。
+    # 仅 GET: POST 等打到裸 /webui 属畸形调用, 维持透传不改语义;
+    # query 保留 (/webui?x=1 → /webui/?x=1); "/" 来自 /webui/ 不误伤。
+    if handler.command == "GET" and (
+            upstream_path == "" or upstream_path.startswith("?")):
+        handler.send_response(302)
+        handler.send_header("Location", "/webui/" + upstream_path)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return
     url = upstream_base() + (upstream_path or "/")
     n = int(handler.headers.get("Content-Length", 0) or 0)
     body = handler.rfile.read(n) if n else None

@@ -89,6 +89,8 @@ export default function App() {
   const [counts, setCounts] = useState({ attention: 0, running: 0, finished: 0, total: 0 })
   const [theme, setTheme] = useState(() => localStorage.getItem('sas-theme') || 'dark')
   const [webuiUrl, setWebuiUrl] = useState('')
+  // issue #196: webui 同源代理是否启用 —— 未配置外部地址时入口自动指向 /webui/
+  const [webuiProxy, setWebuiProxy] = useState(false)
   // 像素办公室是否启用(控制 tab 显隐); 与设置页开关联动。
   const [pixelEnabled, setPixelEnabled] = useState(false)
   // ── 多对话 tab 并存(路径1): 数组里第一项恒为 'main', 后跟若干 worker 名。
@@ -110,12 +112,14 @@ export default function App() {
   // 大小的 ref 数组,位置与 chatTabs 一一对应。
   const chatViewRefs = useRef([])
 
-  // hermes-webui 跳转地址(设置页配置, 非空才显示入口)
+  // hermes-webui 外部覆盖地址(设置页配置); 留空且代理启用时入口回退同源 /webui/ (#196)
   // issue #75 B2: 依赖 [view] → [] — 这两个是会话级静态配置, 每次切视图
   // 重复拉属重复请求 (§2 闸门表); 保存设置成功后由 onSaved 回调单独刷新。
   useEffect(() => {
     api.settings().then((d) => setWebuiUrl((d.settings?.hermes_webui_url || '').trim())).catch(() => {})
     api.pixelStatus().then((d) => setPixelEnabled(!!d.enabled)).catch(() => setPixelEnabled(false))
+    // issue #196: 代理启用时入口自动指向同源 /webui/ (天然跟随 host/端口/上层反代)
+    api.webuiStatus().then((d) => setWebuiProxy(!!d.enabled)).catch(() => {})
   }, [])
 
   const openWorkerChat = (name) => {
@@ -133,7 +137,10 @@ export default function App() {
     // 如果当前 view 是 chat 且没有任何 worker tab 了, 退回默认的 chat 视图(main)
     if (name === activeChat) setView('chat')
   }
-  const openWebui = () => webuiUrl && window.open(webuiUrl, '_blank', 'noopener')
+  // issue #196: 入口地址 = 外部配置优先, 否则代理启用时回退同源 /webui/ (相对
+  // 地址经 window.open 按当前源解析, 天然适配任意 host/端口/上层反代)。
+  const webuiTarget = webuiUrl || (webuiProxy ? '/webui/' : '')
+  const openWebui = () => webuiTarget && window.open(webuiTarget, '_blank', 'noopener')
   // 2026-10-15 R2.3a: 全局「核心功能」按钮点击 = (1) 切回 main 对话 +
   // (2) 触发 main ChatView 的 openTeamWork() 打开协作启动弹窗。
   // R2.6: 全局按钮恒可点击,不感知 busy。
@@ -155,8 +162,8 @@ export default function App() {
       setTimeout(() => mainRef.openTeamWork(), 0)
     }
   }
-  const WebuiBtn = ({ compact = false }) => webuiUrl ? (
-    <button onClick={openWebui} className="btn-ghost btn-sm shrink-0" title={webuiUrl}>
+  const WebuiBtn = ({ compact = false }) => webuiTarget ? (
+    <button onClick={openWebui} className="btn-ghost btn-sm shrink-0" title={webuiTarget}>
       <Icon d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6m4-3v6m-1 9l5-5m0 0l-5-5m5 5H10" className="w-4 h-4" />
       {!compact && 'hermes-webui'}
     </button>

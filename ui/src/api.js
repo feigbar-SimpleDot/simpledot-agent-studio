@@ -92,6 +92,10 @@ export const api = {
   pixelStatus: () => net(
     fetch('/api/pixel/status').then((r) => j(r, '/api/pixel/status')),
     '/api/pixel/status'),
+  // issue #196: webui 同源代理状态 —— 入口据此自动指向 /webui/ (零配置)。
+  webuiStatus: () => net(
+    fetch('/api/webui/status').then((r) => j(r, '/api/webui/status')),
+    '/api/webui/status'),
   saveSettings: (body) =>
     fetch('/api/settings', {
       method: 'PUT',

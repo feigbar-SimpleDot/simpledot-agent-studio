@@ -6,6 +6,24 @@ first. Prose is English per the repo root-doc convention (see
 spans. Process/review/test notes live outside the repo under the task
 workspace `docs/` and are referenced by card id, not duplicated here.
 
+## Unreleased — Issue #196 (2026-11-01): a bare `/webui` stops 404-ing its own assets, and the top-bar entry finds the webui on its own
+
+Range: one implementation commit on top of `3cb4968`. The plan of record is `docs/FIX-PLAN-196.md` in the task workspace (card t_23f1425e); this entry is the release-facing summary.
+
+### Fixed
+
+- **Typing `http://<host>:8700/webui` (no trailing slash) produced a page whose every asset 404-ed (#196)** — the prefix-stripping proxy passed the bare path through to the webui root, and the webui's dynamic `base href` derives from `location.pathname`: a path without a trailing slash computes the base as `/`, so all 23 relative references (`static/boot.js`, `static/style.css`, `manifest.json`, …) resolved to the console's root, where none of them exist. The unauthenticated path died the same way: the webui's relative `302` to `login?next=/` resolved to `/login`, which the console does not route. The proxy now canonicalizes a bare `GET /webui` (and `GET /webui?…`, query preserved) with a `302` to `/webui/` before touching the upstream — one insertion point inside `proxy_http` covers all five `do_*` entries, and only those two request shapes change behaviour. A `POST` to the bare path stays a pass-through (malformed call, no semantic change). Guards: W10 in `tests/test_issue131_webui_proxy.py`.
+- **The top-bar entry could never point at the reverse-proxied webui (#196)** — the entry was driven solely by the `hermes_webui_url` setting, which accepts only an absolute URL, defaults to empty, and whose hint text still advertised the `:8787` host port that batch O removed; nothing generated the correct same-origin address. The console gained a read-only `GET /api/webui/status` endpoint (mirroring `/api/pixel/status`; its key is deliberately not in `SETTINGS_DEFAULTS`, same discipline as the proxy switch), and the frontend now falls back to the relative `/webui/` when no external override is configured — a relative URL through `window.open` resolves against the current origin, so it follows any host, port or upstream reverse proxy. `hermes_webui_url` keeps its validation and becomes an explicit external-override channel; the i18n hints (both locales) no longer mention `:8787`. Guards: W11 in the same test file.
+
+### Changed
+
+- **`hermes_webui_url` is now an override, not a requirement** — with the webui deployed, a standard installation shows the entry with zero configuration. `DEPLOY.md`'s migration note records the new semantics and tells users with a stale `:8787` value to clear it.
+
+### Notes
+
+- **Verification** — `tests/test_issue131_webui_proxy.py` stands at 28 passed (23 baseline + 5 new); the full suite, the frontend guard track and `i18n_docs_sync --strict` ran green at commit time. The browser-level acceptance (V1–V6 of the plan, including the pre-fix control group) belongs to the tester card and requires `HERMES_WEBUI_DIR` to be configured on the test host first.
+- **Deployment** — this changes `mw/console.py`, `mw/webui_proxy.py`, the console bundle and the locale files, so `git pull` alone is not enough: run `./deploy/install.sh` and restart the container.
+
 ## Unreleased — Issue batch O (2026-10-31): the console stops echoing its internals, the notification path stops knocking forever, and the embedded WebUI moves behind the console's single door
 
 Range: nine commits `3aa7c9d` + `4d0092b` + `3fb3f72` + `26e9685` + `9756110` + `1ee4632` + `930acaa` + `1a9e5dd` + `40732c9`, i.e. `a7380ac..40732c9` (`git log --oneline a7380ac..40732c9 | wc -l` = 9). Four implementation commits, one per cluster (the console, the notification path, the frontend, the deployment surface); three orchestration merges that brought those four branches onto the combination branch and changed no content (each merge's diff against its first parent is byte-identical to the branch diff it carried); one fix-up commit that closed the review's only P2 plus one leftover wording; and one documentation commit that closed the five important findings of the batch's document audit. This entry and the two documentation corrections listed under "Notes" were added by the delivery-closure commit on top of that range.

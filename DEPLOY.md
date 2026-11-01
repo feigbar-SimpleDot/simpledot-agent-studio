@@ -422,6 +422,12 @@ and `/webui` answers `404 {"error": "webui proxy disabled"}`.
 > `http://<host>:8700/webui/`. Direct host access to the webui port is
 > intentionally no longer possible — that is the attack-surface win of
 > this change.
+>
+> **Update (issue #196):** the top-bar entry now points at the same-origin
+> `/webui/` automatically whenever the webui proxy is enabled — no manual
+> configuration needed. The `hermes_webui_url` setting's meaning changed:
+> it is now an optional external-address override, not the only way to get
+> an entry. Clear any stale `http://<host>:8787` value you still have.
 
 > Note: hermes-webui's first start builds its own Python venv (start.sh
 > does this automatically); the first start may take an extra 1-2

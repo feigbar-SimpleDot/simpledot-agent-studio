@@ -337,7 +337,7 @@
       "default_timeout_seconds_label": "Task timeout (seconds)",
       "docker_compose_dir_hint": "Suggested host directory to save the generated worker docker-compose.yaml (advisory only).",
       "docker_compose_dir_label": "Worker compose output directory [host]",
-      "hermes_webui_url_hint": "Fuller WebUI (Agent management) external link, e.g. http://<host>:8787. When set, a \"hermes-webui\" button appears in the header and opens in a new tab; leave empty to hide.",
+      "hermes_webui_url_hint": "Link to the fuller WebUI (Agent management). Leave empty: when the webui is deployed (same-origin /webui proxy enabled) the header shows a \"hermes-webui\" entry pointing at /webui/ automatically, no config needed. Set an absolute URL (http(s)://...) to override the entry with that external address. With neither, the entry is hidden.",
       "hermes_webui_url_label": "hermes-webui link",
       "pixel_office_enabled_hint": "When enabled, the sidebar shows a \"Pixel Office\" tab that renders worker live status as pixel-character animation (embedded via same-origin console proxy; pixel-agents exposes no external port). Requires the compiled pixel-agents package mounted and sidecar running at deploy time. Enabling without that setup just shows \"sidecar not running\".",
       "pixel_office_enabled_label": "Pixel Office (pixel-agents)",

@@ -337,7 +337,7 @@
       "default_timeout_seconds_label": "任务超时（秒）",
       "docker_compose_dir_hint": "控制台生成的 worker docker-compose.yaml 建议保存到你机器的哪个目录（仅提示用）",
       "docker_compose_dir_label": "Worker compose 存放目录 [宿主机]",
-      "hermes_webui_url_hint": "功能更完善的 WebUI（Agent 管理）外部链接，如 http://<host>:8787。填写后顶栏出现「hermes-webui」入口按钮，点击新标签页打开；留空则不显示",
+      "hermes_webui_url_hint": "功能更完善的 WebUI（Agent 管理）跳转地址。留空 = webui 已部署（同源 /webui 代理启用）时顶栏自动出现「hermes-webui」入口并指向 /webui/，无需配置；填写绝对地址（http(s)://…）则以该外部地址覆盖入口。两者都没有时不显示入口",
       "hermes_webui_url_label": "hermes-webui 跳转地址",
       "pixel_office_enabled_hint": "开启后侧栏出现「像素办公室」标签页，把 worker 实时状态渲染成像素角色动画（经控制台同源代理内嵌，pixel-agents 不对外暴露端口）。需部署时已挂载已编译的 pixel-agents 包并启动 sidecar；未部署时开启也只会提示 sidecar 未运行",
       "pixel_office_enabled_label": "像素办公室（pixel-agents）",

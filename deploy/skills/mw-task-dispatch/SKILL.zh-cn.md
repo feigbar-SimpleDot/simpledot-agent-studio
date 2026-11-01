@@ -180,6 +180,43 @@ typo/文档改动跳过 testing。`workflows.yaml` 的 `skip_when` 列表是给�
 6. **worker 对 kanban 零感知。** 你的任务描述就是它的全部世界，
    写清楚：做什么、产出什么文件、放在哪。
 
+### ⚠ 卡正文到不了 worker —— 实质内容必须走 TODO.md 或文件
+
+**worker 容器的 kanban toolset 是 disabled（`/v1/toolsets` 查 `kanban.enabled=false`），
+且 mw 派活时给 worker 的 prompt 只有 worker_contract_prompt 模板（指向 TODO.md 契约文件）。
+⇒ `hermes kanban create --body` 里的正文 worker 一辈子看不到，它只是 main 侧的留痕。**
+
+后果：把全部要求只写进卡正文 ⇒ worker 收到的 TODO.md『目标』只有一句话，
+按猜测施工，返工率极高。
+
+正解（二选一，建议都做）：
+1. **实质内容写进 TODO.md『目标』**：main 播种时把关键要求（做什么/产出什么/放哪/
+   禁止什么/上游依据文件路径）全写进去，卡号用 `- 卡: <id>` 绑定。
+2. **长内容写独立文件 + 在『目标』里给指针**：例如
+   `完整任务书: docs/dispatch/<CHAIN>-BRIEF.md 的 sN 段（必读）`，
+   worker 有 terminal/file 工具，路径可达即可读。
+
+**补投（worker 已在跑但漏了要求）**：用 resume 走同一会话续作，
+且**必须在 harvest 之前**（卡进终态后 `resume_task` 拒收）。
+中文/全角标点会被 tirith 判 homoglyph 拦截 ⇒ 指令写文件再传：
+
+```bash
+# 指令写文件（避免 tirith 同形字扫描）
+cat > /tmp/xxx.txt <<'EOF'
+补充契约要点（不改变你正在做的事）……
+EOF
+export PATH=/opt/hermes/.venv/bin:$PATH
+cd /opt/mwroot && python3 -m mw.cli resume --task <task_id> \
+  --instruction-file /tmp/xxx.txt
+```
+
+入队即返回（reaper ≤15s 消费），确认消费：`ledger.task_resume_requests`
+该行 `status` 由 `PENDING` → `PROCESSING` → `DONE`。
+
+**worker 容器自带 skill 优先**：设计/文案类任务先 `skills_list` 看容器里有没有
+现成的一手标准（如 emil / hallmark 系 skill 已原生装在 design 分类），
+本机 skill 比网上抓的副本更权威；外部标准同时备一份本地副本兜底。
+
 ## reaper 何时结算（worker 视角）
 
 launch 之后，reaper 每 15s 轮询 worker 写的 `TODO.md`

@@ -430,3 +430,72 @@ def test_w9_verify_probes_inside_container():
     assert 'curl -sf --max-time 5 "http://127.0.0.1:${WPORT}/health"' not in text
     # 新探活走 docker exec + 容器内 python3 urllib (容器内无 curl 保证)
     assert "docker exec -e WPORT" in text
+
+
+# ──────────────────────────────────────────────────────────────────
+# W10: issue #196 裸 /webui 尾斜杠规范化 302 (proxy_http 直测)
+# ──────────────────────────────────────────────────────────────────
+
+def test_w10a_bare_webui_get_redirects_to_slash():
+    """GET + upstream_path="" ⇒ 302 /webui/, 上游 opener 零调用。"""
+    op = FakeOpener(FakeResp(200, {}, b"should-not-be-used"))
+    h = make_handler(path="/webui")
+    with mock.patch.object(wp, "_opener", op):
+        wp.proxy_http(h, "")
+    assert ("status", 302) in h.headers_sent
+    assert ("Location", "/webui/") in h.headers_sent
+    assert ("Content-Length", "0") in h.headers_sent
+    assert op.requests == []          # 未透传上游
+    assert bytes(h.wfile.buf) == b""  # 302 无 body
+
+
+def test_w10b_bare_webui_get_keeps_query():
+    """GET + "?x=1" ⇒ 302 /webui/?x=1 (query 保留)。"""
+    op = FakeOpener(FakeResp(200, {}, b""))
+    h = make_handler(path="/webui?x=1")
+    with mock.patch.object(wp, "_opener", op):
+        wp.proxy_http(h, "?x=1")
+    assert ("status", 302) in h.headers_sent
+    assert ("Location", "/webui/?x=1") in h.headers_sent
+    assert op.requests == []
+
+
+def test_w10c_slash_and_post_not_redirected():
+    """"/" (来自 /webui/) 与 POST 裸 /webui 均不重定向, 照常透传上游。"""
+    resp = FakeResp(200, {"Content-Type": "text/html"}, b"<html></html>")
+    op = FakeOpener(resp)
+    h1 = make_handler(path="/webui/")
+    h2 = make_handler(command="POST", path="/webui")
+    with mock.patch.object(wp, "_opener", op):
+        wp.proxy_http(h1, "/")
+        wp.proxy_http(h2, "")
+    assert len(op.requests) == 2      # 两者都走了上游
+    assert not any(s == 302 for k, s in h1.headers_sent if k == "status")
+    assert not any(s == 302 for k, s in h2.headers_sent if k == "status")
+
+
+# ──────────────────────────────────────────────────────────────────
+# W11: issue #196 GET /api/webui/status 只读端点
+# ──────────────────────────────────────────────────────────────────
+
+def _webui_status_via_env(tmp_path, env_val):
+    """env 驱动 webui_proxy_enabled 后直调 do_GET 取 /api/webui/status 响应。"""
+    missing = str(tmp_path / "no-settings.json")
+    h = make_handler(path="/api/webui/status")
+    with mock.patch.object(wp, "settings_path", lambda: missing), \
+         mock.patch.dict(os.environ, {"WEBUI_PROXY_ENABLED": env_val}):
+        h.do_GET()
+    assert h.sent and h.sent[0][0] == 200
+    return h.sent[0][1]
+
+
+def test_w11a_webui_status_endpoint(tmp_path):
+    """WEBUI_PROXY_ENABLED=1/0 ⇒ {"enabled": true/false}。"""
+    assert _webui_status_via_env(tmp_path, "1") == {"enabled": True}
+    assert _webui_status_via_env(tmp_path, "0") == {"enabled": False}
+
+
+def test_w11b_webui_status_key_not_in_defaults():
+    """端点只读探测, 其依赖键 webui_proxy_enabled 刻意不进 SETTINGS_DEFAULTS
+    (与 W7 同法守护: 进键集会被设置页保存钉死, 压掉自动探测)。"""
+    assert "webui_proxy_enabled" not in console.SETTINGS_DEFAULTS

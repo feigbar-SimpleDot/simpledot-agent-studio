@@ -106,7 +106,7 @@ SETTINGS_DEFAULTS = {
     "default_timeout_seconds": 1800,            # 任务超时(dead-man's switch)
     "reaper_interval_seconds": 15,              # reaper 轮询间隔
     "default_image": "nousresearch/hermes-agent:v2026.9.24",
-    "hermes_webui_url": "",   # hermes-webui 跳转地址(外部完整 WebUI/Agent 管理); 留空则顶栏不显示入口
+    "hermes_webui_url": "",   # hermes-webui 外部覆盖地址(可选); 留空且同源代理启用时顶栏入口自动指向 /webui/ (#196)
     "pixel_office_enabled": False,  # 像素办公室(pixel-agents)开关: 控制控制台 /pixel 代理 + iframe tab
     # issue #131 方案B 注记: webui 同源代理开关 webui_proxy_enabled **刻意不进**
     # 本键集 —— api_settings_save 会把全部默认键落盘, 若在此登记则任何一次设置页
@@ -5111,6 +5111,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {
                     "enabled": pixel_enabled(),
                     "running": pixel_proxy.pixel_office_running(),
+                })
+            # issue #196: webui 同源代理状态 (前端入口据此自动指向 /webui/)。
+            # 刻意不进 SETTINGS_DEFAULTS (与 webui_proxy_enabled 同纪律,
+            # 见上方 #131 注记): 只读探测, 不可经设置页保存钉死。
+            if p == "/api/webui/status":
+                return self._send(200, {
+                    "enabled": webui_proxy.webui_proxy_enabled(),
                 })
             # 像素办公室同源代理: /pixel/* → pixel-agents(保留 Host 头)。
             # 浏览器只见控制台一个源; pixel-agents 只绑容器内 127.0.0.1。

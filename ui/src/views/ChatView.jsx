@@ -552,6 +552,35 @@ function backfillToolResults(setMessages, messages) {
   })
 }
 // 用户气泡的展示文本(附件以文件名摘要呈现, 实际发送走 multimodal/路径)
+// issue #159: 图片压缩元信息 → 模型可见上下文。独立 text part 紧跟图片 part,
+// 保持图文配对相邻; 方括号形态与非图片附件占位符同族 (模型有先验知道这是
+// 系统附加说明而非用户发言)。直通形态只换文案不省略 (AC-159-1 同样满足)。
+function imageMetaText(f, t) {
+  const mb = (n) => (n / 1024 / 1024).toFixed(2)
+  const m = f.meta || {}
+  if (!f.compressed) {
+    return t('chat.input.image_meta', {
+      name: f.name, resolution: m.originalResolution || 'unknown',
+      bytes: m.originalBytes ?? f.bytes, mb: mb(m.originalBytes ?? f.bytes),
+      // issue #169 第3条 (P3-1): 直通路径也显示真实 format —— 顶层优先,
+      // meta 兜底 (顶层被裁剪时不退化 unknown)。
+      originalFormat: f.originalFormat || m.originalFormat || 'unknown',
+    })
+  }
+  return t('chat.input.image_meta_compressed', {
+    name: f.name,
+    originalResolution: m.originalResolution || 'unknown',
+    originalBytes: m.originalBytes ?? f.bytes,
+    originalMb: mb(m.originalBytes ?? f.bytes),
+    compressedResolution: m.compressedResolution || 'unknown',
+    compressedBytes: m.compressedBytes ?? f.bytes,
+    compressedMb: mb(m.compressedBytes ?? f.bytes),
+    // issue #169 第3条 (P3-1): 顶层优先 + meta 兜底, 防顶层字段被裁剪退化 unknown
+    originalFormat: f.originalFormat || m.originalFormat || 'unknown',
+    savedPct: Math.round((m.savedRatio || 0) * 1000) / 10,
+  })
+}
+
 function fullTextForDisplay(text, files) {
   if (!files || files.length === 0) return text
   const att = files.map(f => `📎 ${f.name}`).join(' ')
@@ -681,6 +710,13 @@ const ChatView = React.forwardRef(function ChatView(
   const [twLaunching, setTwLaunching] = useState(false) // 提交中
   const [twError, setTwError] = useState('')            // 弹窗内错误
   const [twWorkspace, setTwWorkspace] = useState('')    // 弹窗里选的工作目录(空=继承 session 绑定)
+  // issue #164: 弹窗提交改入队后的「已加入收件箱」提示条 (5s 自动消失)
+  const [queueToast, setQueueToast] = useState('')
+  useEffect(() => {
+    if (!queueToast) return
+    const timer = setTimeout(() => setQueueToast(''), 5000)
+    return () => clearTimeout(timer)
+  }, [queueToast])
   // ── 工作目录(workspace)选择器状态 ──
   const [workspaces, setWorkspaces] = useState([])       // [{name,path,writable,mtime}]
   const [wsRoot, setWsRoot] = useState('/share_workspace/projects')
@@ -956,8 +992,10 @@ const ChatView = React.forwardRef(function ChatView(
     setWsCreateError('')  // 面板关闭时清除新建错误 (§4.7)
   }
 
-  // 新 session 创建后, 把 draft 期选的 workspace 迁到新 sid 名下
-  // (ensureSession 内联了同样逻辑; Team Work 直接 createSession 时用它)
+  // 【DEAD CODE / 死代码】migrateDraftWorkspace 全仓无调用点 (零引用),
+  // 等价逻辑已内联在 ensureSession (见下方 draftWs 迁移段)。保留仅为历史参考,
+  // 勿在此维护 —— 修改迁移逻辑请改 ensureSession 内联副本; 删除本函数需同步
+  // 撤掉 test_issue164b_entry.mjs E7a/E7b 守护锚 (issue #185)。
   const migrateDraftWorkspace = (newSid) => {
     const draftWs = localStorage.getItem(wsKeyFor(''))
     if (draftWs) {
@@ -1141,6 +1179,9 @@ const ChatView = React.forwardRef(function ChatView(
       for (const f of files) {
         if (f.isImage) {
           parts.push({ type: 'image_url', image_url: { url: f.dataUrl } })
+          // issue #159: 元信息独立 text part 紧跟图片 part (图文配对相邻),
+          // 不并进用户文本 —— 避免模型把数字当成用户发言、多图丢对应关系
+          parts.push({ type: 'text', text: imageMetaText(f, t) })
         } else {
           parts.push({ type: 'text',
             text: t('chat.input.attachment_placeholder_msg', { name: f.name, path: f.path }) })
@@ -1206,8 +1247,41 @@ const ChatView = React.forwardRef(function ChatView(
         })
         const isImage = (f.type || '').startsWith('image/')
         if (isImage) {
-          // 图片: 不落盘, 直接以 data:image 走 Hermes 原生 multimodal
-          setPendingFiles((p) => [...p, { name: f.name, isImage: true, dataUrl, bytes: f.size }])
+          // issue #159: 图片先经服务端压缩再内联 —— 大图 base64 直送会撞
+          // gateway 10MB 上限 (413) 且无提示, 表现为「图片静默丢失」。
+          // 失败必须抛错走 setError (明确错误文案), 绝不静默丢图。
+          const res = await fetch('/api/attachments/image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: f.name, data: dataUrl }),
+          })
+          const d = await res.json().catch(() => ({}))
+          if (!res.ok || !d.ok || !d.dataUrl) {
+            const reason = d.error === 'pillow_unavailable'
+              ? t('chat.errors.pillow_unavailable')
+              : d.error === 'still_too_large' || d.error === 'image_too_large'
+                ? t('chat.errors.image_too_large')
+                : d.error === 'not_an_image' || d.error === 'decode_failed'
+                  ? t('chat.errors.image_unsupported')
+                  // issue #169 第1条 (F-L1): 后端三码 missing_data / bad_base64 /
+                  // payload_too_large 不再裸码进文案, 各有专属中文/英文文案。
+                  : d.error === 'missing_data'
+                    ? t('chat.errors.image_missing_data')
+                    : d.error === 'bad_base64'
+                      ? t('chat.errors.image_bad_base64')
+                      : d.error === 'payload_too_large'
+                        ? t('chat.errors.image_payload_too_large')
+                        // 兜底不再回显 d.error 裸码 (未来新增错误码也不再泄露裸码);
+                        // res.ok 时给带 status 的通用文案, 否则给无参通用文案。
+                        : (res.ok ? t('chat.errors.upload_failed', { status: res.status })
+                                  : t('chat.errors.image_compress_failed_generic'))
+            throw new Error(t('chat.errors.image_compress_failed', { reason }))
+          }
+          setPendingFiles((p) => [...p, {
+            name: d.name || f.name, isImage: true, dataUrl: d.dataUrl,
+            bytes: d.bytes, compressed: d.compressed, meta: d.meta,
+            originalFormat: d.originalFormat,
+          }])
           continue
         }
         const res = await fetch('/api/upload', {
@@ -1308,103 +1382,26 @@ const ChatView = React.forwardRef(function ChatView(
     if (!task) { setTwError(t('chat.errors.teamwork_task_required')); return }
     setTwLaunching(true)
     setTwError('')
-    // issue#12 R3 (2026-10-13): 注释承诺「createSession 失败→弹错并保留
-    // 旧 session + 旧画面」, 实际 (b) 已先 setMessages([])+删 wsKey,
-    // 失败时旧画面/工作目录绑定不可恢复——前端注释与行为脱节。
-    // 修法: 把 (b) 块延后到 createSession 成功之后, 失败路径根本不动
-    // 旧 messages / wsKey / workspace。保留 (a) 在 try 开头是因为
-    // abort 是「取消上一个 turn」的清理动作,与新 session 无关,在 try
-    // 内做更安全(避免某个旧 stream 续写)。
+    // issue #164 (F7/AC-7.x) + 追加裁决 (ENTRY-164B): 「确定并启用」不再直接
+    // 发起 run —— 本弹窗是排期任务的**唯一新建入口** (排期页「新建任务」已
+    // 移除), 提交落点 = POST /api/schedule/tasks 入队 (ARCH-164 §4#4)。
+    // 弹窗的 workflow/workspace 选择随任务入库 (A14), 字段完整: detail/
+    // workflow/workspace 三字段与后端 api_schedule_create 一一对应, 到点由
+    // 排期服务以等价消息触发 (R1)。openTeamWork / 弹窗 UI / tw* state 全部
+    // 不动; 失败仍走 setTwError。
     try {
-      // Issue#8 (2026-10-13): Team Work 必须把消息锚到全新 sid。launch
-      // 服务端已加入「一 run 一 session」守卫, 老 sid 复用直接 409。
-      // UI 这边三件事必须发生,顺序不可错:
-      //   (a) 取消上一个 turn 的 abortRef + 清状态 (避免旧 stream
-      //       在新 session 上续写消息)
-      //   (b) [延迟] createSession 成功后才清空 messages + 删 wsKey
-      //       + 清 workspace —— 失败路径必须保留旧 session/旧画面
-      //       (issue#12 R3 实锤修复: 旧代码这里就清,createSession
-      //       失败时旧 session 上下文不可恢复)
-      //   (c) createSession 拿新 sid, setSessionId 立即切, 然后 runStream
-      //   (d) createSession 失败 → 弹错并保留旧 session + 旧画面
-      // 任意一步失败不应破旧 session 状态。
-
-      // (a) 取消旧 stream (如果上轮 chatStream 没正常结束的话)
-      try {
-        if (abortRef.current) abortRef.current.abort()
-      } catch { /* 静默 */ }
-
-      // 1. 建真实 Hermes session(session_id 由 hermes 分配, 消息会落进 gateway)
-      const sid = await g.createSession()
-      // 1a. createSession 成功后才执行 (b): 立即清空旧画面,把 session 切
-      //     回「新会话」占位形态: 旧 messages 留了会让用户产生「新任务
-      //     已经接上了旧 context」的错觉 (issue #8 主诉之一)。
-      //     [R3] 这段从 try 开头延后到这里:createSession 失败时整段
-      //     不执行 → 旧 session + 旧 messages + 旧 wsKey + 旧 workspace
-      //     全部完好保留。
-      setMessages([])
-      setError('')
-      setRunInfo(null)
-      setPhase(null)
-      // issue #75 B3: 新 run 的 session = 无历史, 分页游标/去重集一并重置
-      histMetaRef.current = { hasMore: false, beforeCursor: null }
-      seenIdsRef.current = new Set()
-      setHistMore(false)
-      // 同时清 workspace 旧绑定:draft 后再让用户挑, 不沿用旧 sid 的
-      // 工作目录,避免旧 run 的产物污染新 run 文件名空间
-      try {
-        if (sessionId) localStorage.removeItem(wsKeyFor(sessionId))
-      } catch { /* ignore */ }
-      setWorkspace('')
-
-      // Issue#8: UI 把新 sid 设到 React state + localStorage 与工作目录
-      // 迁移的顺序遵循「先写 localStorage 再 setState」避免组件在
-      // setMessages([]) 之前有时间窗口把旧 messages 推到新 sid 上;
-      // 同时 currentSessionIdRef 也同步 (供 polling 双层保险比对)。
-      localStorage.setItem(sidKey, sid)
-      setSessionId(sid)
-      currentSessionIdRef.current = sid
-      // 1b. 工作目录: 弹窗里选的优先, 否则继承 draft/session 绑定
-      const ws = twWorkspace || migrateDraftWorkspace(sid)
-      if (ws) localStorage.setItem(wsKeyFor(sid), ws)
-      // 2. 拼首条消息: 需求 + 参考 workflow + 严格多 agent 细分指令。
-      //    这条作为真实用户消息发给 main, main 用 mw-task-dispatch 拆解并下发。
-      // I18N-R3 (2026-10-16, REQ §3.4 #8): 字段名按 i18next 切换; marker
-      //     `【Team Work 多智能体任务】` 协议字面保持不变 (en/zh 前端都识
-      //     别 marker); 正文 `需求:` / `Requirement:` 等走 t(), 前端
-      //     parseDispatchCard 双键兼容 (此发送端只发当前语种)。
-      const wfHint = (twWorkflow && twWorkflow !== 'auto')
-        ? t('chat.team_work_dispatch_field_workflow_explicit', { wf: twWorkflow })
-        : t('chat.team_work_dispatch_field_workflow_auto')
-      const wsHint = ws
-        ? t('chat.team_work_dispatch_field_workspace_set', { ws })
-          + t('chat.team_work_dispatch_field_workspace_set_launch', { ws })
-        : t('chat.team_work_dispatch_field_workspace_unset')
-          + t('chat.team_work_dispatch_field_workspace_unset_suffix')
-      // Issue#8 (2026-10-13): 首条消息里明确告诉 main「launch 时
-      // session_id = 我们刚创建的 sid」, 杜绝 main 从对话历史复制
-      // 上一个 session 的 sid 再调 launch。后端会验证;前端补强语义。
-      const sidHint = t('chat.team_work_dispatch_sid_hint_prefix', { sid })
-                     + t('chat.team_work_dispatch_sid_hint_body')
-      const firstMsg = [
-        t('chat.team_work_dispatch_marker'),
-        ``,
-        t('chat.team_work_dispatch_field_requirement', { task }),
-        `${wfHint}`,
-        `${wsHint}`,
-        ``,
-        t('chat.team_work_dispatch_instruction_skill'),
-        t('chat.team_work_dispatch_instruction_no_repeat'),
-        `${sidHint}`,
-      ].join('\n')
-      // 3. 显示用户消息 + 流式发给 main(消息落进真实 session)
-      setMessages([{ role: 'user', text: firstMsg, ts: Date.now() / 1000 }])
-      setListOpen(false)
+      await api.scheduleCreate({
+        detail: task,
+        workflow: twWorkflow || 'auto',
+        workspace: twWorkspace || '',
+      })
       setTwOpen(false)
-      setTwLaunching(false)
-      await runStream(firstMsg, sid)
+      setTwError('')
+      // 「已加入收件箱」反馈: 聊天区顶部提示条, 5s 自动消失 (AC-7.4)
+      setQueueToast(t('chat.team_work_modal.queued_toast'))
     } catch (e) {
       setTwError(String(e.message || e))
+    } finally {
       setTwLaunching(false)
     }
   }
@@ -1575,6 +1572,13 @@ const ChatView = React.forwardRef(function ChatView(
 
       {/* 消息流 */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 md:px-6 py-4 space-y-3">
+        {/* issue #164: 入队成功反馈条 (聊天区顶部, 5s 自动消失, AC-7.4) */}
+        {queueToast && (
+          <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-ok/10 border border-ok/30 text-[12.5px] text-ok"
+               role="status">
+            <span className="min-w-0 break-words">{queueToast}</span>
+          </div>
+        )}
         {/* issue #75 B3 §5.3: 「更多历史对话」前插入口 (has_more=true 才显示;
             加载态 disabled+.spin; 错误态内联 .field-err, 按钮恢复可重试) */}
         {histMore && (

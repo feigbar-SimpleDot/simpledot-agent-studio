@@ -56,9 +56,14 @@ review code yourself.
 - How to classify: trust the endpoint verdict; `path_id: null` (i.e.
   `fallback: "ask_user"`) ⇒ **you must ask the user**; picking a role
   on your own is forbidden.
-- What you do: read `route_to` + `role_tags` → re-read
-  `GET /api/workers` and pick a profile by `scope.tags` semantics →
-  create the first card → dispatch.
+- What you do: read `route_to` + `role_tags` → read the local worker
+  registry file directly (`$MW_REGISTRY`, deployed at
+  `/mw_data/registry.json`; the top-level keys ARE the worker names)
+  and pick a profile by `scope.tags` semantics → create the first card
+  → dispatch.
+  **Use `GET /api/workers` only when you need the derived `online` /
+  `live` / `derived_state` fields** — the registry file does not carry
+  them (they are derived from console process memory and sqlite).
 - What you do NOT do (each path lists it in `forbidden_for_main`):
   reproduce the problem / analyze root causes / review code / design
   the implementation. Those are the receiving role's deliverables.
@@ -110,7 +115,7 @@ cannot resolve after thorough research escalate, one at a time.
 **The first card is a research/adjudication card**: its body says only
 "research X, produce an adjudication/checklist"; the assignee (SE / PM /
 tester when necessary) is chosen via the classify endpoint plus
-`/api/workers` scope.tags semantics.
+`worker registry` scope.tags semantics.
 
 **First-card quality bar**: not "no ambiguity", but "every ambiguity is
 listed and has an owner". A requirement the next LLM can take is precisely
@@ -243,7 +248,8 @@ signal (`cmd_spawn_bg`'s `exit_code` is the return value of
 1. **Clarify** (optional, max 2-3 rounds) — when `initial_task`
    information is insufficient, ask the user in this session. Do not
    dispatch in this phase.
-2. **Split** — read `/api/workflows` + `/api/workers`, decide N steps:
+2. **Split** — read `/api/workflows` + the local worker registry
+   directly, decide N steps:
    - Before splitting, call
      `GET /api/decision-paths/classify?text=<raw user input>` to pick the
      first card's receiving role; if classification fails
@@ -307,7 +313,8 @@ signal (`cmd_spawn_bg`'s `exit_code` is the return value of
 3. **Kanban status** — the card transitions between ready / running /
    done / blocked.
 4. **`/api/tasks/<id>`** — returns a `verdict` field
-   (`NEED_CLARIFICATION`, etc.).
+   (`NEED_CLARIFICATION`, etc.) and the `delivery` status dictionary
+   (issue #167).
 
 All four sources reflect the same fact; don't trust only one.
 

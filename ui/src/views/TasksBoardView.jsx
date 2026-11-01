@@ -670,7 +670,7 @@ function CurrentTaskCard({ active, detail, detailErr, closing,
   // 当前步骤: 优先从详情取整卡(拿 question/session_id), 兜底用 tasks 摘要字段
   const cur = active.current_card_id
     ? (cards.find((c) => c.id === active.current_card_id) || null) : null
-  const runState = active.state || null  // 由 api_team_work_get 注入
+  const runState = active.state || null  // 由轻量/全量轮询面透传 (#141, s3a 补 state 键)
   const cardState = cur?.state || null
   const displayState = cardState || (cur && (
       cur.harvest_status === 'NEED_CLARIFICATION' ? 'NEED_CLARIFICATION' :
@@ -689,6 +689,10 @@ function CurrentTaskCard({ active, detail, detailErr, closing,
   const runExtraBadge = (() => {
     if (runState === 'HANDOFF') return { cls: 'badge-purple', text: t('tboard.state_handoff') }
     if (runState === 'WAITING_ACTIVE') return { cls: 'badge-amber', text: t('tboard.state_waiting') }
+    // #141 裁②: WAITING_SUB 单列一态 —— run 副徽标与卡级 chip 一致显「子任务处理中」,
+    // 必须插在 ACTIVE_BLOCKED 兜底分支之前 (holder_state 由轮询面透传, s3a 落地)。
+    if (runState === 'ACTIVE_BLOCKED' && active.holder_state === 'WAITING_SUB')
+      return { cls: 'badge-blue', text: t('tboard.state_waiting_sub') }
     if (runState === 'ACTIVE_BLOCKED') return { cls: 'badge-yellow', text: t('tboard.blocked_state_short') }
     if (runState === 'CLOSED') return { cls: 'badge-slate', text: t('tboard.closed_state_short') }
     return null
@@ -781,6 +785,15 @@ function CurrentTaskCard({ active, detail, detailErr, closing,
               // 复用 classify 语义层兜底, 任何未识别状态码都渲染翻译文本, 不泄漏英文 (AC-07)
               <StatusBadge cls="badge-slate" title={classify(cur || { status: active.current_card_status }, t).sem}>
                 {classify(cur || { status: active.current_card_status }, t).sem}
+              </StatusBadge>
+            )}
+            {/* issue #178: 投递失败徽标 —— 独立于上方互斥三元状态链, 保证
+                「投递失败」与「当前状态」并存可见 (红线: 不挤掉已有状态徽标)。
+                数据源 = 轻量轮询端点 team_work_active.current_card_delivery_failed;
+                可选链读法 ⇒ 无活跃 run / 无当前卡时字段缺省为假值, 空态安全。 */}
+            {active?.current_card_delivery_failed && (
+              <StatusBadge cls="badge-red" title={t('tboard.delivery_failed_badge')}>
+                {t('tboard.delivery_failed_badge')}
               </StatusBadge>
             )}
             {(isHandoff || displayState === 'HANDOFF') && (

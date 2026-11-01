@@ -40,8 +40,12 @@ mw **绝不**做的事: 建卡、claim、complete、执行外部命令、改项�
   带 `match.any_of` / `match.none_of` / `route_to` / `role_tags` / `forbidden_for_main`。
 - 判定方式: 以上述端点返回为准; `path_id: null` (即 `fallback: "ask_user"`) ⇒
   **你必须问用户**, 不许自行挑角色。
-- 你要做的事: 读 `route_to` + `role_tags` → 现读 `GET /api/workers` 按 `scope.tags`
-  语义选 profile → 建首卡 → 派发。
+- 你要做的事: 读 `route_to` + `role_tags` → 直读本地 worker 注册表文件
+  (`$MW_REGISTRY`, 部署态 = `/mw_data/registry.json`, 顶层键即 worker 名) 按
+  `scope.tags` 语义选 profile → 建首卡 → 派发。
+  **需要 `online` / `live` / `derived_state` 这三个派生字段时, 才调
+  `GET /api/workers`** —— 注册表文件里没有它们 (它们是 console 进程内与
+  sqlite 的派生值)。
 - 你不做的事 (每条 path 的 `forbidden_for_main` 都列了): 复现问题 / 分析根因 / 审查代码 /
   设计实现方案。这些是承接角色的产出物。
 - 下游卡的内容**留到派发时再定稿**: 第 N 张卡的正文只写「本卡以第 N-1 张卡的产物为唯一依据」
@@ -77,7 +81,7 @@ LLM (承接角色) 直接承接; 你要做的是把需求转成可承接的卡, 
     开放问题: <识别出但无法裁决的模糊点, 逐条, 标注 事实/意图 类型>
 
 **第一张卡 = 调研/研判卡**: 正文只写「调研 X, 产出裁决/清单」; 承接方按
-classify 端点判定 + /api/workers scope.tags 语义选定 (SE / PM / 必要时 tester)。
+classify 端点判定 + worker 注册表 scope.tags 语义选定 (SE / PM / 必要时 tester)。
 
 **首卡质量标准**: 不是「无歧义」, 而是「歧义全部被列出且有归属」。
 能被下一个 LLM 承接的需求, 恰恰是知道自己哪里还模糊的需求。
@@ -174,7 +178,7 @@ classify 端点判定 + /api/workers scope.tags 语义选定 (SE / PM / 必要�
 
 1. **澄清**(可选, 最多 2-3 轮) — initial_task 信息不够时, 在 session 内跟用户问。
    在这个阶段不要 dispatch。
-2. **拆解** — 读 /api/workflows + /api/workers, 决定 N 张 step:
+2. **拆解** — 读 /api/workflows + 直读本地 worker 注册表, 决定 N 张 step:
    - 拆解前先调 `GET /api/decision-paths/classify?text=<用户输入原文>` 拿判定,
      决定**首卡承接角色**; 判定失败 (`path_id=null`) ⇒ **问用户**, 不自行挑角色
      (见「决策路径」节)
@@ -206,7 +210,7 @@ classify 端点判定 + /api/workers scope.tags 语义选定 (SE / PM / 必要�
 1. **消息流** — worker 在它的 session 内说"verdict: PASS / CHANGES_REQUESTED"等
 2. **产物文件** — project_workspace/<task>/*.md, 主要是 REVIEW.md 或 src/*.* 文件
 3. **kanban 状态** — 卡片在 ready/running/done/blocked 之间流转
-4. **/api/tasks/<id>** — 返回 verdict 字段(NEED_CLARIFICATION 等)
+4. **/api/tasks/<id>** — 返回 verdict 字段(NEED_CLARIFICATION 等)及 delivery 投递状态字典(issue #167)
 
 四种来源同时反映同一件事, 不要只信一个。
 

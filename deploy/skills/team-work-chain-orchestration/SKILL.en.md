@@ -1,7 +1,7 @@
 ---
 name: team-work-chain-orchestration
 description: "Run Team Work chains as main: launch, spawn, settle."
-version: 1.1.0
+version: 1.2.0
 platforms: [linux]
 metadata:
   hermes:
@@ -335,16 +335,20 @@ side sees it.
 
 ## Flow (one round per card)
 
-1. **Plan**: `GET /api/workflows` +
-   `GET /api/workers` — both endpoints echo back up to
-   hundreds of KB verbatim (workers each carry a base64
-   avatar); piping them raw into context can blow the
-   current round. Always filter through a pipe, keeping
-   only name/api_url/online/scope.tags etc.
-   ★ Parsing recipe: the body contains raw control chars
-   and base64 — `json.loads` on curl stdout throws
-   Invalid control character. Fixed path: `curl -o
-   /tmp/w.json` then `json.load(open(...), strict=False)`.
+1. **Plan**: `GET /api/workflows` + **the local worker registry
+   file** (`$MW_REGISTRY`, deployed at `/mw_data/registry.json`;
+   the top-level keys ARE the worker names) — the registry holds
+   static fields only (`runner` / `api_url` / `api_key` /
+   `scope.tags`), so it is only KB-sized and it carries **no
+   embedded avatar data** (avatars became separate files; see
+   `GET /api/workers/<name>/avatar`); still keep just the fields
+   you need. Use `GET /api/workers` only when you need the derived
+   `online` / `live` / `derived_state` fields (they are derived from
+   console process memory and sqlite, not from the registry file).
+   ★ Parsing recipe: the body contains raw control chars —
+   `json.loads` on curl stdout throws Invalid control character.
+   Fixed path: `curl -o /tmp/w.json` then
+   `json.load(open(...), strict=False)`.
    Shapes: `{"workflows":{"<name>":{steps}}}`,
    `{"workers":{"<assignee>":{api_url,api_key,scope.tags}}}`;
    outer keys are the ids (the inner `name` field is null

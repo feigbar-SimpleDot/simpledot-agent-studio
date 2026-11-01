@@ -105,7 +105,13 @@ curl -s -X POST http://127.0.0.1:8700/api/relay/confirm \
 - 错误形态：400（缺 `task_id`）/ 404（`task not found`）——与内部错误（500）可区分。
 - 语义：置 `notify_confirmed_at` 并清退避/死信字段（`notify_attempts` → 0、
   `notify_dead_until` → NULL、`notify_last_failed_at` / `notify_last_error` → NULL）。
-  死信卡（`notify_attempts >= 8`、`notify_dead_until` = now + 1 年）回执一次即恢复。
+  死信卡回执一次即恢复——死信有两类，两类都适用这条恢复方式：
+  1. 临时失败（网络抖动 / 5xx / 429）退避满 8 次：`notify_attempts >= 8`、
+     `notify_dead_until` = now + 1 年；
+  2. 永久失败（HTTP 404，目标会话不存在：派生 sid / 会话已回收）**首败即死信**：
+     `notify_attempts = 1`、`notify_dead_until` = now + 1 年，并发
+     `relay.notify_permanent_failure` 事件（reason=`session_not_found`）
+     （issue #167）。这一类**不满足** `notify_attempts >= 8`，按旧口径 grep 会漏掉。
 - 幂等：同一张卡重复回执安全——结果一致、不报错、不重复发事件；只对显式点名的
   `task_id` 生效，绝不批量扫描全表。
 - 与旧信号的关系：旧路径「relay 收到 HTTP 200 ⇒ 已确认」原样不动；本端点是给 main 的

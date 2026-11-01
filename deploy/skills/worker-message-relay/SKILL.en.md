@@ -109,8 +109,16 @@ curl -s -X POST http://127.0.0.1:8700/api/relay/confirm \
   internal errors (500).
 - Semantics: sets `notify_confirmed_at` and clears the backoff/dead-letter fields
   (`notify_attempts` → 0, `notify_dead_until` → NULL, `notify_last_failed_at` /
-  `notify_last_error` → NULL). A dead-letter card (`notify_attempts >= 8`,
-  `notify_dead_until` = now + 1 year) recovers with one confirm call.
+  `notify_last_error` → NULL). A dead-letter card recovers with one confirm call
+  — there are **two** kinds of dead-letter card, and the recovery applies to both:
+  1. Transient failures (network jitter / 5xx / 429) dead-letter after 8 retries:
+     `notify_attempts >= 8`, `notify_dead_until` = now + 1 year;
+  2. Permanent failures (HTTP 404 — the target session does not exist: derived sid
+     / session already reclaimed) dead-letter on the **first** failure:
+     `notify_attempts = 1`, `notify_dead_until` = now + 1 year, plus a
+     `relay.notify_permanent_failure` event (reason=`session_not_found`)
+     (issue #167). This kind does **not** satisfy `notify_attempts >= 8`, so
+     grepping by the old rule misses it.
 - Idempotent: confirming the same card repeatedly is safe — same result, no error, no
   duplicate events. It only affects the explicitly named `task_id`; it never batch-scans
   the table.

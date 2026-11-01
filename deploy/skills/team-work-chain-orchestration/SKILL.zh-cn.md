@@ -1,7 +1,7 @@
 ---
 name: team-work-chain-orchestration
 description: "Run Team Work chains as main: launch, spawn, settle."
-version: 1.1.0
+version: 1.2.0
 platforms: [linux]
 metadata:
   hermes:
@@ -224,8 +224,8 @@ advance task_description —— 两处都写, 否则只有一方看得到 (口�
 
 ## 流程（每张卡一轮）
 
-1. **规划**：`GET /api/workflows` + `GET /api/workers`——两接口原样回显可达数十万字符（workers 每人带 base64 avatar），直接进上下文会把当轮模型响应拖超时中断；必须管道过滤只留 name/api_url/online/scope.tags 等必要字段。
-   ★ 解析配方: 响应体含裸控制字符与 base64, 对 curl stdout 字符串直接 `json.loads` 会报 Invalid control character——固定 `curl -o /tmp/w.json` 落盘后 `json.load(open(...), strict=False)`。形状: `{"workflows":{"<workflow名>":{steps}}}`、`{"workers":{"<assignee名>":{api_url,api_key,scope.tags}}}`, 外层键即 id/assignee 名 (workers 条目内 name 字段为 null, 别按它取值)。按 worker scope.tags 语义匹配
+1. **规划**：`GET /api/workflows` + **直读本地 worker 注册表**（`$MW_REGISTRY`，部署态 = `/mw_data/registry.json`；顶层键即 worker 名）—— 注册表只含静态字段（`runner` / `api_url` / `api_key` / `scope.tags`），体积只有 KB 级，**不含内嵌头像数据**（头像早已改为独立文件，见 `GET /api/workers/<name>/avatar`），直接进上下文不会拖超时；仍建议只取 `api_url` / `api_key` / `scope.tags` 等必要字段。需要 `online` / `live` / `derived_state` 这三个派生字段时，才调 `GET /api/workers`（它们是 console 进程内与 sqlite 的派生值，不在注册表文件里）。
+   ★ 解析配方: 响应体含裸控制字符, 对 curl stdout 字符串直接 `json.loads` 会报 Invalid control character——固定 `curl -o /tmp/w.json` 落盘后 `json.load(open(...), strict=False)`。形状: `{"workflows":{"<workflow名>":{steps}}}`、`{"workers":{"<assignee名>":{api_url,api_key,scope.tags}}}`, 外层键即 id/assignee 名 (workers 条目内 name 字段为 null, 别按它取值)。按 worker scope.tags 语义匹配
    每张卡的步骤角色（中文标签按含义对：产品需求分解→req-analysis，架构设计→design，
    code-write→implementation，浏览器使用/测试报告→testing，review→code-review）。
    ★ **assignee 名字必须现读注册表再写死, 不要凭记忆或按 workflow 默认值抄**: 注册表键名即
@@ -368,7 +368,7 @@ advance 端点有内置守卫生效：派发前必查项目根 TODO.md『当前�
   `curl -o file.json` 落盘后 `open(f, encoding='utf-8', errors='replace')` 再
   `json.load`——不要在内存里对 curl stdout 直接 loads，会炸且丢全部消息。
 
-- 探测：worker API 地址与 api_key 一律现读 GET /api/workers 的 api_url/api_key——
+- 探测：worker API 地址与 api_key 一律现读本地 worker 注册表（`$MW_REGISTRY`，部署态 = `/mw_data/registry.json`）的 api_url/api_key——
   端口↔角色映射**不是固定的**，同一批端口在不同注册表重建下名字/主机/key 全变过，
   绝不硬编码 port→角色 映射或沿用旧 key（旧 key 对新 worker 全 401）。
   worker 网关认证头必须是 `Authorization: Bearer <api_key>`——裸 key（无 Bearer 前缀）
@@ -661,7 +661,7 @@ advance 端点有内置守卫生效：派发前必查项目根 TODO.md『当前�
   反复试参数形态，直接 background=true + poll。
 - **worker 注册表在链期间被外部重建（名字/主机/key 全变）**：/mw_data/registry.json
   随时可能被外部进程整体替换——worker 名可变成中文（产品经理/系统架构师）、api 主机
-  与 api_key 全换。对策：① launch 前重读 GET /api/workers 确认注册表已稳定；注册表
+  与 api_key 全换。对策：① launch 前重读本地 worker 注册表（`$MW_REGISTRY`，部署态 = `/mw_data/registry.json`）确认已稳定；注册表
   为空时 launch 会跳过 assignee 校验、派单时才失败，故空表/变动中要先轮询几十秒
   到稳定再定承接方；② launch 报 422『assignee 不在 registry』时，按报错里的
   available_assignees 用 scope.tags 语义重映射，`hermes kanban assign <task_id> <新名>`

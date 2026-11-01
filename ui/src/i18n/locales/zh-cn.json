@@ -31,7 +31,8 @@
     "toggle_theme_title": "切换明暗",
     "worker_chat_title": "Worker · {name}",
     "workers_subtitle": "注册路由 / 生成 compose / 查看运行元数据",
-    "workflows_subtitle": "工作流模板 · 决定协作任务拆解粒度"
+    "workflows_subtitle": "工作流模板 · 决定协作任务拆解粒度",
+    "subtitle_schedule": "收件箱 · 任务队列自动衔接执行"
   },
   "chat": {
     "commands": {
@@ -133,8 +134,8 @@
       "auto_select": "Auto-select (LLM 自动选)",
       "cancel_btn": "取消",
       "inherit_option": "继承当前对话({name})",
-      "start_btn": "确定并启动",
-      "start_busy_btn": "启动中…",
+      "start_btn": "确定并启用",
+      "start_busy_btn": "加入中…",
       "subtitle": "多个执行者分工协作 —— 每人领取一个子任务。",
       "task_placeholder": "例:给后台加上用户登录功能...",
       "task_requirement": "任务需求",
@@ -144,7 +145,8 @@
       "workflows_unreachable": "后端 workflow 列表暂不可达,只显示 Auto-select",
       "workspace_hint": "本任务所有执行者在此目录产出文件。留空则继承当前对话的工作目录;需要新目录可在顶栏「工作目录」处创建。",
       "workspace_label": "工作目录",
-      "workspace_placeholder": "(可选)"
+      "workspace_placeholder": "(可选)",
+      "queued_toast": "已加入收件箱队列"
     },
     "team_work_prompt_label": "【Team Work 多智能体任务】",
     "tool_args_truncated": "… (截断, 共 {n} 字符)",
@@ -212,7 +214,8 @@
     "settings": "设置",
     "tasks_board": "任务看板",
     "workers": "Worker 管理",
-    "workflows": "Workflow 管理"
+    "workflows": "Workflow 管理",
+    "schedule": "收件箱"
   },
   "cron": {
     "action": {
@@ -376,6 +379,7 @@
     "current_step_block_label": "当前步骤",
     "current_step_pending": "步骤切换中，等待平台调度",
     "current_step_unreplyable": "该步骤暂不可回复",
+    "delivery_failed_badge": "投递失败",
     "empty_initial_task": "(无初始需求)",
     "empty_subtitle": "到「对话」页面向主助手发起需求，任务会自动出现在这里。",
     "empty_title": "(无标题)",
@@ -681,6 +685,16 @@
   "chat.session.readonly_badge": "只读",
   "chat.session.load_history_aria": "加载历史消息",
   "chat.errors.upload_failed": "上传失败 HTTP {status}",
+  "chat.errors.image_compress_failed": "图片压缩失败: {reason}",
+  "chat.errors.image_too_large": "图片过大, 压缩后仍超出限制",
+  "chat.errors.image_unsupported": "不支持的图片格式或文件已损坏",
+  "chat.errors.pillow_unavailable": "图片压缩服务暂不可用, 请稍后重试",
+  "chat.errors.image_missing_data": "缺少图片附件数据",
+  "chat.errors.image_bad_base64": "图片附件数据不是合法 base64",
+  "chat.errors.image_payload_too_large": "图片附件请求体超过上限",
+  "chat.errors.image_compress_failed_generic": "图片压缩失败",
+  "chat.input.image_meta": "[图片附件: {name} —— 原始格式 {originalFormat}; {resolution}, {bytes} 字节 ({mb} MB); 未重压缩 (已在 1MB 以内)。]",
+  "chat.input.image_meta_compressed": "[图片附件: {name} —— 原始 {originalResolution}, {originalBytes} 字节 ({originalMb} MB); 压缩为 {compressedResolution}, {compressedBytes} 字节 ({compressedMb} MB); 原始格式 {originalFormat}; 压缩节省 {savedPct}%。]",
   "chat.team_work_dispatch_marker": "【Team Work 多智能体任务】",
   "chat.team_work_dispatch_field_requirement": "需求: {task}",
   "chat.team_work_dispatch_field_workflow_explicit": "参考 workflow: {wf}",
@@ -720,6 +734,22 @@
   "chat.files.err_network": "网络连接失败，请检查后重试",
   "chat.files.err_deleted": "文件已被移动或删除",
   "chat.files.retry": "重试",
+  "chat.files.upload": "上传",
+  "chat.files.upload_hint": "上传到 {path}",
+  "chat.files.uploading": "上传中…",
+  "chat.files.upload_ok": "已上传 {name}",
+  "chat.files.upload_failed": "上传失败: {reason}",
+  "chat.files.upload_conflict": "同名文件已存在, 请先改名或删除",
+  "chat.files.upload_too_large": "文件超过 20MB 上限",
+  "chat.files.delete": "删除",
+  "chat.files.delete_confirm_title": "确认删除",
+  "chat.files.delete_confirm_body": "将永久删除 {path} ({size}), 此操作不可撤销。",
+  "chat.files.delete_cancel": "取消",
+  "chat.files.delete_ok": "已删除 {path}",
+  "chat.files.delete_failed": "删除失败: {reason}",
+  "chat.files.delete_needs_file": "只能删除文件, 不能删除目录",
+  "chat.files.err_conflict": "目标已存在",
+  "chat.files.err_confirm_required": "需要二次确认",
   "workflows.tmpl_header": "# mw platform workflow 定义模板 (v2, 含 description/input/output 字段)",
   "workflows.tmpl_schema_header": "## JSON Schema (workflow body)",
   "workflows.tmpl_field_semantics_header": "## 字段语义",
@@ -761,5 +791,68 @@
   "workflows.tmpl_example_step_review_name": "代码审查",
   "workflows.tmpl_example_step_review_desc": "审查代码质量、安全与可维护性",
   "workflows.tmpl_example_step_review_io_in": "源代码变更, docs/design.md",
-  "workflows.tmpl_example_step_review_io_out": "docs/review-notes.md"
+  "workflows.tmpl_example_step_review_io_out": "docs/review-notes.md",
+  "schedule": {
+    "group": {
+      "running": "执行中",
+      "pending": "未执行",
+      "done": "已完成 / 取消"
+    },
+    "state": {
+      "pending": "待执行",
+      "paused": "暂停",
+      "running": "执行中",
+      "done": "已完成",
+      "cancelled": "取消",
+      "unknown": "未知"
+    },
+    "prio": {
+      "urgent": "紧急",
+      "high": "高",
+      "normal": "普通",
+      "low": "低"
+    },
+    "btn": {
+      "pause": "暂停",
+      "resume": "恢复",
+      "cancel": "取消",
+      "delete": "删除",
+      "edit": "修改",
+      "run_now": "立即执行",
+      "view_board": "查看看板"
+    },
+    "auto_execute": "自动执行",
+    "busy_hint": "当前有任务执行中, 收件箱排队中",
+    "countdown": {
+      "next": "下一条任务自动执行倒计时"
+    },
+    "col_added": "添加时间",
+    "col_executed": "执行时间",
+    "cron_badge": "定时任务",
+    "empty": {
+      "title": "收件箱还是空的",
+      "hint": "点击顶栏「发起多智能体协作」, 任务会加入收件箱队列"
+    },
+    "form": {
+      "edit_title": "修改收件箱任务",
+      "detail": "任务详情",
+      "detail_placeholder": "例:给后台加上用户登录功能...",
+      "detail_required": "任务详情不能为空",
+      "priority": "优先级"
+    },
+    "confirm": {
+      "title": "立即执行确认",
+      "body": "将立刻发起任务「{title}」, 跳过剩余等待时间。确认执行?"
+    },
+    "toast": {
+      "paused": "已暂停",
+      "resumed": "已恢复为待执行",
+      "cancelled": "已取消",
+      "deleted": "已删除",
+      "saved_paused": "已保存, 保持暂停",
+      "auto_on": "自动执行已开启",
+      "auto_off": "自动执行已关闭",
+      "run_started": "已发起执行"
+    }
+  }
 }

@@ -94,7 +94,7 @@ function TreeEntry({ entry, depth, onPick, onToggle, expandedSet, loadingSet,
 }
 
 // 树主体
-export function FileTree({ project, revealPath, onPick, refreshKey }) {
+export function FileTree({ project, revealPath, onPick, onEnterDir, refreshKey }) {
   const { t } = useTranslation()
   // items: 根层条目, 每条带 .path (rel) 用于 TreeEntry 键控
   const [items, setItems] = useState([])
@@ -194,6 +194,9 @@ export function FileTree({ project, revealPath, onPick, refreshKey }) {
   // 展开/折叠: dir (entry 必带 .path, key = entry.path 即父+basename)
   const onToggle = useCallback(async (entry, key) => {
     if (entry.link) return  // symlink 不可进入 (OQ-3 UX 案)
+    // issue #158: 目录点击即"进入"该目录 (外层据此更新上传目标 cwd);
+    // 折叠也算离开, 但外层只在展开时取用, 这里统一回调保持简单。
+    if (onEnterDir) onEnterDir(entry.path || '')
     const k = key || entry.path || entry.name
     setExpanded((s) => {
       const ns = new Set(s)
@@ -222,7 +225,7 @@ export function FileTree({ project, revealPath, onPick, refreshKey }) {
         })
       }
     }
-  }, [project, childrenMap, loadingSet])
+  }, [project, childrenMap, loadingSet, onEnterDir])
 
   if (errKind) {
     return (

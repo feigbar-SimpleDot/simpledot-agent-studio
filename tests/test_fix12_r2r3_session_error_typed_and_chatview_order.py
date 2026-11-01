@@ -25,6 +25,11 @@ R3: ChatView.jsx submitTeamWork (b) 块 (清空 messages + wsKey + workspace)
       localStorage.removeItem(wsKeyFor(sessionId)) 必须在 createSession
       之后 (源码 grep + 行号断言)。这是 fix 与注释一致性的最小
       行为锁定 —— 防止下次手贱又把 (b) 提前到 try 开头。
+  H8  issue #164 入队化 + issue #182 结构化断言: submitTeamWork 必须
+      走 api.scheduleCreate( 入队 (不得再 createSession / runStream),
+      且 workflow / workspace 必须是**实参对象顶层键** —— 不是函数体
+      任意位置的裸子串 (issue #182: 旧裸字面断言在「键改名 + 函数体
+      别处保留该单词」时假绿)。
 
 不在本测试范围:
   - 真实浏览器实测 (R3 完整行为) → 由 t3 在隔离 console + 浏览器跑
@@ -411,6 +416,14 @@ def test_h7_chatview_b_after_createsession():
     body = src[start_idx:end_idx]
     line_base = src[:start_idx].count("\n") + 1
 
+    # issue #164 (F7/ARCH-164 §4#4): submitTeamWork 已改为「入队排期任务」,
+    # 整段 createSession/firstMsg/runStream 结构被合法删除 —— H7 锚定的
+    # 「(b) 块在 createSession 之后」旧结构不复存在, 旧锚按新现实短路;
+    # 新口径 (必须 api.scheduleCreate 入队、禁止回退直接发起) 由 H8 钉住。
+    if "api.scheduleCreate(" in body:
+        print("  SKIP  H7 submitTeamWork 已入队化 (issue #164), 旧结构锚不适用 (H8 接管)")
+        return
+
     def line_of(needle: str, *, after: int = 0) -> int:
         """找第一个出现的行号 (相对文件)。`after` 可跳过前 N 个出现。"""
         idx = -1
@@ -462,6 +475,447 @@ def test_h7_chatview_b_after_createsession():
 
 
 # ============================================================
+# H8: issue #164 后 submitTeamWork 的新口径 (入队化, 取代 H7 的旧结构锚)
+#     + issue #182: H8 的 workflow/workspace 断言结构化 (实参键字面匹配)
+# ============================================================
+
+# issue #182 的结构化扫描器: 提取 JS **对象字面量的顶层键**。
+# 不用 AST (ChatView.jsx 是 JSX, Python ast 不适用), 也不引入新依赖
+# (新增依赖 = 部署面变化, 与「低成本修守护」不匹配) ⇒ 用「括号配平 +
+# 顶层键扫描」的最小 JS 词法扫描。它把「实参对象里的键」与「函数体
+# 别处的同名单词」区分开 —— 后者正是旧裸字面断言的假绿来源。
+
+_JS_IDENT_START = re.compile(r"[A-Za-z_$]")
+_JS_IDENT_PART = re.compile(r"[A-Za-z0-9_$]")
+
+
+def _skip_js_ws(text, i):
+    """跳过空白与注释 (// 行注释 + /* */ 块注释), 返回停下处的下标。"""
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl + 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        break
+    return i
+
+
+def _read_js_string(text, i):
+    """i 指向起始引号 (' / " / `); 返回 (字符串内容, 结束后的下标)。"""
+    quote = text[i]
+    i += 1
+    buf = []
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            buf.append(text[i + 1])
+            i += 2
+            continue
+        if ch == quote:
+            return "".join(buf), i + 1
+        buf.append(ch)
+        i += 1
+    return "".join(buf), i   # 未闭合 (源码坏了) —— 返回已读部分
+
+
+def _read_js_ident(text, i):
+    """读取一个 JS 标识符; 返回 (标识符, 结束后的下标)。"""
+    n = len(text)
+    start = i
+    if i < n and _JS_IDENT_START.match(text[i]):
+        i += 1
+        while i < n and _JS_IDENT_PART.match(text[i]):
+            i += 1
+    return text[start:i], i
+
+
+def _skip_js_value(text, i):
+    """跳过一个 JS 表达式值 (对象/数组/函数/字面量); 返回停下的下标。
+
+    停在**顶层**的 ',' 或 '}' 处 (不消费) —— 那是外层对象的分隔符。
+    """
+    n = len(text)
+    depth = 0
+    while i < n:
+        ch = text[i]
+        if ch in "'\"`":
+            _, i = _read_js_string(text, i)
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] in "/*":
+            i = _skip_js_ws(text, i)
+            continue
+        if ch in "([{":
+            depth += 1
+            i += 1
+            continue
+        if ch in ")]}":
+            if depth == 0:
+                return i      # 顶层收尾 —— 属外层对象, 不消费
+            depth -= 1
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            return i
+        i += 1
+    return i
+
+
+def _extract_call_expr(code, anchor="api.scheduleCreate("):
+    """从 code 中截取 anchor 起的**完整调用表达式** (括号配平扫描)。
+
+    - 字符串字面量内的括号不参与配平;
+    - 注释被跳过 (行注释里的 ')' 不会提前截断);
+    - 截不到 (anchor 不存在 / 括号未配平) 返回 None。
+
+    为什么必须配平而不是固定窗口: 固定窗口对「实参前面多插内容」会误截,
+    对「实参变长」会截断 —— 两者都会让守护失去牙齿。
+    """
+    idx = code.find(anchor)
+    if idx < 0:
+        return None
+    i = idx + len(anchor) - 1   # 指向 anchor 末尾的 '('
+    depth = 0
+    n = len(code)
+    while i < n:
+        ch = code[i]
+        if ch in "'\"`":
+            _, i = _read_js_string(code, i)
+            continue
+        if ch == "/" and i + 1 < n and code[i + 1] in "/*":
+            i = _skip_js_ws(code, i)
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                return code[idx:i + 1]
+        i += 1
+    return None   # 括号未配平 (源码被截断 / 语法坏了)
+
+
+def _first_arg_object(call_expr):
+    """取调用表达式的**第一个实参对象字面量**。
+
+    只认「直接写在调用括号里的那一层 `{...}`」:
+    - `api.scheduleCreate({ a: 1 })` ⇒ 命中;
+    - `api.scheduleCreate(payload)` ⇒ 无对象字面量 ⇒ 返回 "" (⇒ 断言转红,
+      这是对的: 字段被藏进变量时, 源码级守护看不见顶层键);
+    - `api.scheduleCreate(build({ a: 1 }))` ⇒ 第一实参是函数调用而非对象
+      字面量 ⇒ 返回 "" (同理, 不能把内层对象误当实参)。
+
+    不用简单的 find("{") —— 那会把嵌套/内层对象误认成实参对象。
+    """
+    n = len(call_expr)
+    i = call_expr.find("(")
+    if i < 0:
+        return ""
+    i += 1
+    depth = 0          # 调用括号内的嵌套深度
+    while i < n:
+        ch = call_expr[i]
+        if ch in "'\"`":
+            _, i = _read_js_string(call_expr, i)
+            continue
+        if ch == "/" and i + 1 < n and call_expr[i + 1] in "/*":
+            i = _skip_js_ws(call_expr, i)
+            continue
+        if ch == "{" and depth == 0:
+            # 找到了直接作为第一实参的对象字面量 —— 截到配平为止
+            j = i
+            d = 0
+            while j < n:
+                c2 = call_expr[j]
+                if c2 in "'\"`":
+                    _, j = _read_js_string(call_expr, j)
+                    continue
+                if c2 == "/" and j + 1 < n and call_expr[j + 1] in "/*":
+                    j = _skip_js_ws(call_expr, j)
+                    continue
+                if c2 in "([{":
+                    d += 1
+                elif c2 in ")]}":
+                    d -= 1
+                    if d == 0:
+                        return call_expr[i:j + 1]
+                j += 1
+            return call_expr[i:]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return ""     # 调用已结束, 第一实参不是对象字面量
+            depth -= 1
+        elif depth == 0 and ch == ",":
+            return ""         # 第一实参不是对象字面量
+        i += 1
+    return ""
+
+
+def _object_top_keys(obj_text):
+    """提取对象字面量的**顶层**键名列表 (按出现顺序)。
+
+    顶层 = 直接写在 `{...}` 里的一层成员; 嵌套对象/数组里的键**不算**
+    (后端 api_schedule_create 只认顶层 workflow/workspace 字段)。
+    字符串内容与注释里的同名单词**不算键**。
+    """
+    keys = []
+    n = len(obj_text)
+    i = obj_text.find("{")
+    if i < 0:
+        return keys
+    i += 1
+    while i < n:
+        i = _skip_js_ws(obj_text, i)
+        if i >= n:
+            break
+        ch = obj_text[i]
+        if ch == "}":
+            break
+        if ch == ",":
+            i += 1
+            continue
+        if obj_text[i:i + 3] == "...":       # 展开属性 —— 不是字面键名
+            i = _skip_js_value(obj_text, i + 3)
+            continue
+        if ch == "[":                        # 计算属性键 —— 不是字面键名
+            i = _skip_js_value(obj_text, i)
+            j = _skip_js_ws(obj_text, i)
+            if j < n and obj_text[j] == ":":
+                i = _skip_js_value(obj_text, j + 1)
+            continue
+        if ch in "'\"":
+            key, i = _read_js_string(obj_text, i)
+        elif _JS_IDENT_START.match(ch):
+            key, i = _read_js_ident(obj_text, i)
+        else:
+            i += 1
+            continue
+        j = _skip_js_ws(obj_text, i)
+        if j < n and obj_text[j] == ":":
+            keys.append(key)
+            i = _skip_js_value(obj_text, j + 1)
+        else:
+            # 简写属性 / 方法 —— 不是键值对
+            i = _skip_js_value(obj_text, i)
+    return keys
+
+
+def _h8_structured_guard_selftest():
+    """issue #182 的**常驻**变异反证 (AC-182-2)。
+
+    不依赖改生产代码: 用合成片段直接验证「结构化断言 vs 旧裸字面断言」
+    的判定差异, 把 PLAN §4 的 MV-182-a/b/c 语义钉在仓库里, 避免
+    「守护本身悄悄退化」。
+
+    - 旧断言 = `"workflow" in text and "workspace" in text` (函数体裸子串);
+    - 新断言 = 实参对象顶层键里必须真的有 workflow / workspace。
+    """
+    # M2 形态 (PLAN 实测的假绿场景): 键改名 + 函数体别处保留该单词
+    m2 = ("const workspace = twWorkspace\n"
+          "await api.scheduleCreate({ detail: task, workflow: 'auto', ws: '' })")
+    m2_keys = _object_top_keys(_first_arg_object(_extract_call_expr(m2) or ""))
+    check("H8 #182 反证 M2: 旧裸字面假绿",
+          "workflow" in m2 and "workspace" in m2)
+    check("H8 #182 反证 M2: 结构化断言转红 (键改名被抓)",
+          "workflow" in m2_keys and "workspace" not in m2_keys,
+          f"keys={m2_keys}")
+
+    # M3 形态: 两个键都改名 + 别处保留两个单词
+    m3 = ("const workflow = twWorkflow; const workspace = twWorkspace\n"
+          "await api.scheduleCreate({ detail: task, wf: 'auto', ws: '' })")
+    m3_keys = _object_top_keys(_first_arg_object(_extract_call_expr(m3) or ""))
+    check("H8 #182 反证 M3: 结构化断言转红 (两键改名被抓)",
+          "workflow" not in m3_keys and "workspace" not in m3_keys,
+          f"keys={m3_keys}")
+
+    # M1 形态 (负向控制): 简单改名 —— 旧断言已能转红, 新断言不得回退
+    m1 = "await api.scheduleCreate({ detail: task, workflow: 'auto', ws: '' })"
+    m1_keys = _object_top_keys(_first_arg_object(_extract_call_expr(m1) or ""))
+    check("H8 #182 反证 M1: 简单改名仍被结构化断言抓住",
+          "workflow" in m1_keys and "workspace" not in m1_keys,
+          f"keys={m1_keys}")
+
+    # 注释里的同名键不得充数 (否则注释一改守护就假绿)
+    m4 = ("await api.scheduleCreate({ detail: task, "
+          "/* workflow: old */ ws: '' })")
+    m4_keys = _object_top_keys(_first_arg_object(_extract_call_expr(m4) or ""))
+    check("H8 #182 反证: 注释里的 workflow: 不算键",
+          "workflow" not in m4_keys and "workspace" not in m4_keys,
+          f"keys={m4_keys}")
+
+    # 字符串内容里的同名单词不得充数
+    m5 = ("await api.scheduleCreate({ detail: 'workspace: note', "
+          "workflow: 'auto' })")
+    m5_keys = _object_top_keys(_first_arg_object(_extract_call_expr(m5) or ""))
+    check("H8 #182 反证: 字符串里的 workspace: 不算键",
+          "workflow" in m5_keys and "workspace" not in m5_keys,
+          f"keys={m5_keys}")
+
+    # 嵌套对象里的键不算顶层键 (后端只认顶层字段)
+    m6 = ("await api.scheduleCreate({ detail: task, "
+          "meta: { workflow: 'auto', workspace: '' }, wf: 'x' })")
+    m6_keys = _object_top_keys(_first_arg_object(_extract_call_expr(m6) or ""))
+    check("H8 #182 反证: 嵌套对象的键不算顶层键",
+          "workflow" not in m6_keys and "workspace" not in m6_keys,
+          f"keys={m6_keys}")
+
+    # 合规形态: 键在顶层 ⇒ 必须通过 (AC-182-3 不误伤)
+    m7 = ("await api.scheduleCreate({ detail: task, workflow: twWorkflow || 'auto', "
+          "workspace: twWorkspace || '' })")
+    m7_keys = _object_top_keys(_first_arg_object(_extract_call_expr(m7) or ""))
+    check("H8 #182 反证: 合规实参 (顶层键) 通过",
+          "workflow" in m7_keys and "workspace" in m7_keys,
+          f"keys={m7_keys}")
+
+    # ── 表驱动回归锁: 扫描器的假绿漏洞清单 ──────────────────────
+    # 每条 = (片段, 期望顶层键)。期望里**不含** workflow/workspace
+    # 的行, 一旦扫描器退化 (把嵌套键/注释/字符串里的同名单词当成
+    # 顶层键) 就会转红 —— 这些是「结构化」必须守住的不变量。
+    edge_cases = [
+        # 正例: 顶层键必须被认出
+        ("{ detail: task, workflow: 'a', workspace: 'b' }",
+         ["detail", "workflow", "workspace"]),
+        ("{\n  detail: task,\n  workflow: twWorkflow || 'auto',\n"
+         "  workspace: twWorkspace || '',\n}", ["detail", "workflow", "workspace"]),
+        ("{ detail: task, workflow: 'a', workspace: 'b', }",
+         ["detail", "workflow", "workspace"]),
+        ("{ 'detail': task, 'workflow': 'a', 'workspace': 'b' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: `t${x}`, workflow: 'a', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: { a: 1 }, workflow: 'a', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: [1, 2], workflow: 'a', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: f(a, b), workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: 'a)b', workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: () => { return 1 }, workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ ...base, detail: t, workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: t, /* c */ workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: t, // c\n workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        # 反例: 顶层**不得**含 workflow/workspace
+        ("{ detail: t, meta: { workflow: 'a', workspace: 'b' } }",
+         ["detail", "meta"]),
+        ("{ detail: t, items: [{ workflow: 'a' }] }", ["detail", "items"]),
+        ("{ detail: t, /* workflow: x */ ws: '' }", ["detail", "ws"]),
+        ("{ detail: t, // workflow: x\n ws: '' }", ["detail", "ws"]),
+        ("{ detail: 'workflow: x', ws: '' }", ["detail", "ws"]),
+        ("{ detail: t, wf: 'a', ws: '' }", ["detail", "wf", "ws"]),
+        ("{ detail: t, workflow, workspace }", ["detail"]),
+        ("{ [k]: 1, ws: '' }", ["ws"]),
+        ("{ detail: '} (', ws: '' }", ["detail", "ws"]),
+        ("{ detail: t, // )\n workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+        ("{ detail: t, /* ) */ workflow: 'x', workspace: '' }",
+         ["detail", "workflow", "workspace"]),
+    ]
+    bad_edges = []
+    for frag, expect in edge_cases:
+        got = _object_top_keys(
+            _first_arg_object(_extract_call_expr(f"api.scheduleCreate({frag})") or ""))
+        if got != expect:
+            bad_edges.append(f"{frag!r} => {got} (期望 {expect})")
+    check("H8 #182 扫描器边界回归锁 (24 条表驱动用例全对)",
+          not bad_edges,
+          "; ".join(bad_edges[:3]))
+
+    # ── 第一实参不是对象字面量 ⇒ 顶层键不可判定 ⇒ 必须转红 ──────
+    # (旧裸字面断言在这三种形态下都会假绿: 函数体别处保留了该单词)
+    hidden = [
+        "await api.scheduleCreate(payload)",
+        "await api.scheduleCreate(build({ workflow: 'a', workspace: 'b' }))",
+        "await api.scheduleCreate(cfg, { workflow: 'a', workspace: 'b' })",
+    ]
+    bad_hidden = []
+    for src in hidden:
+        obj = _first_arg_object(_extract_call_expr(src) or "")
+        keys_ = _object_top_keys(obj)
+        if obj and ("workflow" in keys_ or "workspace" in keys_):
+            bad_hidden.append(f"{src!r} => 顶层键 {keys_}")
+        if not obj and ("workflow" in src and "workspace" in src):
+            pass   # 预期: 不可判定 ⇒ 断言转红 (正确)
+    check("H8 #182 第一实参非对象字面量时不得误判出顶层键",
+          not bad_hidden,
+          "; ".join(bad_hidden[:3]))
+    check("H8 #182 第一实参非对象字面量时顶层键不可判定 (转红)",
+          all(not _first_arg_object(_extract_call_expr(s) or "")
+              for s in hidden))
+
+
+def test_h8_chatview_submit_enqueues_not_launches():
+    """issue #164 (F7/ARCH-164 §4#4): 「确定并启用」不再直接发起 run ——
+    submitTeamWork 函数体内不得再出现 createSession / runStream /
+    firstMsg 组装, 必须改为 api.scheduleCreate 入队。
+
+    本用例是 H7 的**后继守护**: H7 锚定的是「(b) 块在 createSession 之后」
+    这一旧结构, issue #164 已把整段 createSession/firstMsg/runStream 删除,
+    旧锚随之失效 (H7 已按新现实同步); 这里钉住新口径 —— 防止有人把
+    直接发起 run 的旧链路又加回弹窗提交。
+    """
+    chatview_path = ROOT / "ui" / "src" / "views" / "ChatView.jsx"
+    src = chatview_path.read_text(encoding="utf-8")
+    m_start = re.search(r"const submitTeamWork = async \(\) => \{", src)
+    check("H8 找到 submitTeamWork 函数", m_start is not None)
+    if not m_start:
+        if TEST_FAILED[0]:
+            raise AssertionError("H8 失败")
+        return
+    start_idx = m_start.end()
+    next_decl = re.search(r"\n  const \w+ = ", src[start_idx:start_idx + 4000])
+    end_idx = (start_idx + next_decl.start()) if next_decl else (start_idx + 4000)
+    body = src[start_idx:end_idx]
+    # 去掉注释行后再查代码字面 (注释里提到 createSession 属历史说明)
+    code = "\n".join(ln for ln in body.splitlines()
+                     if not ln.strip().startswith("//"))
+    check("H8 不再直接建 session (issue #164 入队化)",
+          "g.createSession()" not in code)
+    check("H8 不再直接 runStream 发起 run",
+          "runStream(" not in code)
+    check("H8 提交落点 = api.scheduleCreate 入队",
+          "api.scheduleCreate(" in code)
+    # issue #182 (AC-182-1): 断言结构化 —— 必须在 api.scheduleCreate(
+    # 的**实参对象顶层键**里真的存在 workflow / workspace, 而不是
+    # 「函数体任意位置出现这两个子串」。后者是旧裸字面断言的假绿来源
+    # (PLAN §2.5 实测 M2/M3: 键改名 + 别处保留该单词 ⇒ 旧断言仍绿)。
+    call_expr = _extract_call_expr(code)
+    check("H8 截取到 api.scheduleCreate( 完整实参 (括号配平)",
+          call_expr is not None,
+          f"截取={'成功' if call_expr else '失败(锚点缺失或括号未配平)'}")
+    arg_obj = _first_arg_object(call_expr) if call_expr else ""
+    top_keys = _object_top_keys(arg_obj)
+    check("H8 scheduleCreate 第一实参是对象字面量 (结构化前提)",
+          bool(arg_obj),
+          f"第一实参={'对象字面量' if arg_obj else '非对象字面量(顶层键不可判定)'}")
+    check("H8 workflow 键在 scheduleCreate 实参顶层 (A14, 结构化)",
+          "workflow" in top_keys,
+          f"top_keys={top_keys}")
+    check("H8 workspace 键在 scheduleCreate 实参顶层 (A14, 结构化)",
+          "workspace" in top_keys,
+          f"top_keys={top_keys}")
+    # 常驻变异反证 (AC-182-2): 结构化断言 vs 旧裸字面断言的判定差异。
+    _h8_structured_guard_selftest()
+    if TEST_FAILED[0]:
+        raise AssertionError("H8 失败")
+
+
+# ============================================================
 # 入口
 # ============================================================
 
@@ -474,6 +928,7 @@ def main():
         test_h5_session_reuse_409_zero_side_effect,
         test_h6_active_run_block_no_session_reused,
         test_h7_chatview_b_after_createsession,
+        test_h8_chatview_submit_enqueues_not_launches,
     ]
     for t in tests:
         print(f"\n=== {t.__name__} ===")

@@ -352,11 +352,17 @@ ssh <host> 'docker cp /tmp/registry.json hermes_main:/opt/mwroot/mw/registry.jso
 | Force container CLI (skip auto-detect) | n/a — install.sh calls `docker` directly. On macOS the docker-for-apple-container shim exposes the same `docker` surface; pick a different binary by editing `deploy/install.sh` only if your host does not have `docker` on PATH |
 | Change model / endpoint / Hermes behaviour | **Hermes's own config** (`hermes config` or `config.yaml` inside the container); this platform does not proxy it. After change, `docker restart <container>` to apply |
 | reaper period | add `MW_REAPER_INTERVAL` in compose (default 15s) |
+| stuck-detection threshold | add `MW_REAPER_STUCK_MIN` in compose (deployment default 10min — raised from 5min on 2026-10-05 after the 5min threshold showed a 12.5% false-trigger rate on long reasoning turns; the built-in fallbacks differ: `mw/cli.py` sets 5, `mw/reaper.py` falls back to 30, so the deployment value is the authoritative one) |
+| card-binding-mismatch alarm dedup window | add `MW_BINDING_EVENT_DEDUP_MIN` in compose (default 30min — the window in which a repeated `harvest.card_binding_mismatch` event is suppressed after the first report; deliberately independent of `MW_REAPER_STUCK_MIN`, which has several different defaults across the code and the deployment script) |
 | subagent waiting timeout (issue#13) | add `MW_REAPER_SUBAGENT_MIN` in `.env` (the default is defined by `mw/reaper.py::_subagent_wait_min` — read that function for the current value; `0` disables new behavior — reaper falls back to the old stuck threshold; note: even when `0`, reaper still classifies a `waiting_sub` card as in-progress per the contract timeout, so the 5-min TODO-missing cleanup does NOT apply to it) |
+| harvest freshness tolerance (issue #172) | declare `- MW_FRESH_EPSILON_S=${MW_FRESH_EPSILON_S:-2.0}` in `deploy/main.compose.yaml` `environment:` and set the value in `.env` (a bare `.env` entry alone does NOT reach the container — the compose file has no `env_file:` section, so an undeclared variable is silently dropped) (default `2.0` s — tolerance absorbed by the physical-check freshness rule `mtime + epsilon < baseline`; on NFS / cross-machine deployments where the file mtime and the ledger process clock skew by more than 2 s, raise it to the measured skew (e.g. `10`); invalid or negative values fall back to `2.0`) |
+| undelivered-knock cap (issue #177) | declare `- MW_REAPER_UNDELIVERED_KNOCK_MAX=${MW_REAPER_UNDELIVERED_KNOCK_MAX:-3}` in `deploy/main.compose.yaml` `environment:` and set the value in `.env` (same `env_file:` caveat as the row above) (default `3` — after this many "harvested-but-undelivered" fallback knocks for a run without main confirming, the reaper stops knocking and emits one `team_work.undelivered_knock_exhausted` event; a new worker report re-arms the counter; invalid or non-positive values fall back to `3`) |
+| kanban stranded-diagnostic threshold (issue #165) | not an env var — set `kanban.diagnostics.stranded_threshold_seconds` in the container's `config.yaml` (deployment value `86400` = 24 h, already applied; the platform runs serial Team Work chains where queued cards legitimately sit in `ready` for the whole chain duration, so the upstream default produced false "stranded ready" alarms). Disposal discipline (the rule is purely advisory — it never changes card state or triggers actions): 1) never manually advance/claim a card on a `stranded_in_ready` alarm alone — that creates card-slot conflicts (409/422); 2) first check the mw run state (`GET /api/team-work/<run_id>` or the ledger): chain ACTIVE and `current_card` running ⇒ the queued card is a false alarm, ignore it; 3) only when the chain is not ACTIVE / `current_card` is empty / the card has been stuck beyond the threshold (86400 s) escalate to a real-lost-card investigation. Full runbook lives in the task workspace `docs/RUNBOOK-stranded-ready-false-positive.md` (process doc, deliberately not repo-tracked — the `docs/` tracked set is gated to exactly the two SOUL files by `tools/i18n_docs_sync.py` F3') |
 | SSE drain budget after a downstream disconnect (issue#63) | add `MW_PROXY_DRAIN_MAX_S` in compose (default 3600 s — upper bound on how long the console keeps draining the upstream gateway stream after the browser drops; `0` disables draining altogether — the rollback switch for issue#63) |
 | Python interpreter for the console's subprocess bridges | add `PYTHON_BIN` in compose (default `/opt/hermes/.venv/bin/python3` — the interpreter the console uses for the cron bridge and the reaper probes; it must be the Hermes venv, because the console's own interpreter cannot import `cron.*`) |
+| Image attachment compression (issue #159) | the `POST /api/attachments/image` endpoint needs **Pillow** in the interpreter that runs the console (the Hermes venv ships 12.3.0 today). Pillow is a *runtime-optional* dependency: if `import PIL` fails the endpoint answers `503 pillow_unavailable` (it never falls back to inlining the raw image), so a swapped interpreter or a slimmer image degrades image compression silently — keep Pillow installed in whatever interpreter starts the console |
 | Hermes home directory (job store + ticker heartbeat) | add `MW_HERMES_HOME` in compose (default `/opt/data` — the per-profile Hermes home that holds `cron/jobs.json` and `cron/executions.db`; the cron bridge overrides `HERMES_HOME` for its subprocess so it reads the same store as the scheduler ticker) |
-| hermes-webui port (optional WebUI embed; NOT this platform's console port — that one is `CONSOLE_PORT`, default 8700) | add `HERMES_WEBUI_PORT` in compose (default 8787 — one instance per host must pick a distinct port when running isolated consoles side by side; see §3.1 / the port-mapping notes below) |
+| hermes-webui port (optional WebUI embed; container-internal only since issue #131 — NOT a host port; this platform's console port is `CONSOLE_PORT`, default 8700) | add `HERMES_WEBUI_PORT` in compose (default 8787 — the webui binds `127.0.0.1` inside the main container and is reached through the console's same-origin `/webui` proxy; the value only needs to avoid clashing with other listeners *inside* the container, see §3.1) |
 | Worker needs a browser | see design.md §9: bring up a Chromium CDP container, worker sets `browser.cdp_url` |
 | Worker needs a desktop GUI | see design.md §9: bare metal + peekaboo MCP / Hermes peer |
 | Need a fuller WebUI | embed hermes-webui, see §3.1 below |
@@ -369,6 +375,13 @@ workflow entry"; if you need Hermes's **full Web frontend** (session
 management, skill editing, model config, etc.), you can one-shot embed
 [hermes-webui](https://github.com/nesquena/hermes-webui) running in the
 same container as main.
+
+Since issue #131 (option B) the embed is **same-origin**: the webui no
+longer publishes a host port. It binds `127.0.0.1` inside the main
+container and the console reverse-proxies it under the `/webui` path,
+so the browser only ever talks to the single console entry
+`http://<host>:8700/webui/`. The webui keeps its own password
+(`HERMES_WEBUI_PASSWORD`) — the proxy does not touch or inject auth.
 
 ```bash
 # 1. Clone wherever you like
@@ -388,13 +401,27 @@ What happens automatically after enabling:
 - `entry.sh` detects `/webui/start.sh` exists -> auto-starts it as a
   watchdog (`HERMES_WEBUI_FOREGROUND=1` foreground mode, auto-restart on
   crash)
-- Port mapping `HERMES_WEBUI_PORT` (default 8787), open
-  `http://<host>:8787/` in browser
-- `verify.sh` adds a "hermes-webui online" check
+- The console serves it at `http://<host>:8700/webui/` (same-origin
+  path proxy; the proxy auto-enables exactly when `/webui/start.sh`
+  exists, i.e. whenever the entry starts the webui — zero extra config).
+  Override with `WEBUI_PROXY_ENABLED=0|1` in compose env, or the
+  `webui_proxy_enabled` key in `settings.json` (manual final control)
+- `verify.sh` probes the webui from **inside** the container
+  (`docker exec ... http://127.0.0.1:${HERMES_WEBUI_PORT}/health`)
 
 When not enabled (`HERMES_WEBUI_DIR` empty) nothing is touched: a
 placeholder empty dir is mounted, entry detects no `start.sh` and skips,
-zero overhead.
+and `/webui` answers `404 {"error": "webui proxy disabled"}`.
+
+> **Migration note (existing users of the old `:8787` host port):** the
+> host port mapping is gone. If you previously opened
+> `http://<host>:8787/`, switch to `http://<host>:8700/webui/` after
+> `git pull + ./deploy/install.sh`. If you had set the console setting
+> `hermes_webui_url` to an absolute `http://<host>:8787` address, either
+> clear it (the top-bar entry then hides) or point it at
+> `http://<host>:8700/webui/`. Direct host access to the webui port is
+> intentionally no longer possible — that is the attack-surface win of
+> this change.
 
 > Note: hermes-webui's first start builds its own Python venv (start.sh
 > does this automatically); the first start may take an extra 1-2

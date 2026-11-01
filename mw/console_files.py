@@ -1,9 +1,13 @@
-# mw/console_files.py — 只读文件浏览 API (issue #46)
+# mw/console_files.py — 文件浏览 API (issue #46 只读面 + issue #158 写面)
 #
 # 提供 GET /api/fs/list 与 GET /api/fs/file 两个端点的纯函数实现:
 #   - api_fs_list(project, path): 单层目录 + 排序 + 截断1000 + size/mtime/link 元数据
 #   - api_fs_file(project, path, mode): 流式回源 (64KB chunk) + 按 mode 出响应头
 #   - handle_fs_get(handler, p, qs): 路由分发 + 错误码映射
+# issue #158 追加写面 (上传/删除, 全部复用 _fs_resolve 五层链, 零旁路):
+#   - api_fs_upload(payload): base64 上传 (双次 _fs_resolve + O_EXCL 落盘)
+#   - api_fs_delete(payload): 硬删文件 (服务端 confirm 闸门 + 只允许删文件)
+#   - handle_fs_post(handler, p, payload, body_bytes): 写面路由分发 + 错误码映射
 #
 # 安全核心 _fs_resolve 五层链 (§3.2):
 #   1. project 形状 (FS_PROJECT_RE)
@@ -480,5 +484,179 @@ def handle_fs_get(handler, path: str, qs) -> None:
             handler.end_headers()
             # issue #62/64: 统一使用 pacing 循环写全
             handler._write_paced(handler.wfile, body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+
+# ══════════════════════════════════════════════════════════════════
+# issue #158: 写面 (上传 / 删除)
+#
+# ★ 红线 (PLAN-L §2.1): 目标路径**必须且只能**经 `_fs_resolve` 五层链取得,
+#   本段零新增取路径通道 —— 所有落盘/删除目标都由 _fs_resolve 锚定后才使用;
+#   本段零新增项目根常量拼接 (grep 命中数与只读面基线一致)。
+# ★ 错误响应零回显 (AC-G2/F1 口径): FsPathError.msg 一律固定英文短语。
+# ★ 传输: base64 JSON (与 /api/upload 惯例对齐, 不引入 multipart)。
+# ══════════════════════════════════════════════════════════════════
+
+# 与 mw/console.py 的 UPLOAD_MAX_BYTES 刻意等值 (同 WS_* 根常量的"复制读取
+# + 测试防漂移"模式, 见本文件头部注释); 防漂移断言在
+# tests/test_issue158_fs_write.py T-158-K (MV-158-J 的牙齿)。
+FS_UPLOAD_MAX_BYTES = 20 * 1024 * 1024   # 解码后原始文件上限 (20MB, 对齐 /api/upload)
+FS_UPLOAD_MAX_BODY = 28 * 1024 * 1024    # 请求体原始字节上限 (base64 膨胀 4/3 的兜底闸)
+FS_NAME_MAX_LEN = 200                    # 消毒后文件名长度上限 (防 ENAMETOOLONG)
+
+
+def _sanitize_fs_name(name: str) -> str:
+    """文件名消毒 (PLAN §2.6, 沿用 api_upload 口径):
+    非 [A-Za-z0-9_.-] 一律替换为 _ (天然剥掉路径分隔符), 剥前后 ._- (不产生
+    隐藏文件), 超长截断 200, 空名兜底 "file"。
+    ★ 消毒后仍含 ".." 子串的名字 (如 "a..b") **不静默改名** —— 交由
+      _fs_resolve 第 2 层以 400 拒绝, 这是方案明文的正确行为。
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("._-")
+    if len(safe) > FS_NAME_MAX_LEN:
+        safe = safe[:FS_NAME_MAX_LEN]
+    return safe or "file"
+
+
+def _decode_upload_b64(data_url: str) -> bytes:
+    """剥 data URL 前缀后解码 base64 (与 api_upload 同逻辑); 非法输入 → 400。"""
+    import base64
+    if not data_url:
+        raise FsPathError(400, "missing data")
+    if data_url.startswith("data:") and "," in data_url[:128]:
+        b64 = data_url.split(",", 1)[1]
+    else:
+        b64 = data_url
+    try:
+        return base64.b64decode(b64)
+    except Exception:
+        raise FsPathError(400, "bad base64")
+
+
+def _rel_out(path: str, extra: str = "") -> str:
+    """响应用 rel 归一化 (纯字符串运算, 不触碰项目根常量, 零回显)。"""
+    rel = f"{path}/{extra}" if path else extra
+    rel = os.path.normpath(rel) if rel else ""
+    return "" if rel == "." else rel
+
+
+def api_fs_upload(project: str, path: str, name: str, raw: bytes) -> dict:
+    """POST /api/fs/upload 纯函数面: 上传文件到锚定目录内。
+
+    安全链 (PLAN §2.1/§2.3, 每一步取路径都经 _fs_resolve, 零旁路):
+      ① 体积闸 (解码后 ≤ FS_UPLOAD_MAX_BYTES, 超限 413, 先于任何路径运算)
+      ② 目标目录 _fs_resolve (五层链; 目录必须存在)
+      ③ 文件名消毒 _sanitize_fs_name
+      ④ 最终路径再过一次 _fs_resolve —— ★ 双查是硬要求: 只查目录不查最终
+         路径 = 可穿越缺口 (MV-158-B 的牙齿)。_fs_resolve 的五层校验全部
+         先于存在性检查执行, 故 404 = "五层全过、仅文件尚不存在" = 可安全
+         落盘; 正常返回 = 目标已存在 → 409 拒绝 (同名不覆盖, REQ §2.3)。
+      ⑤ O_EXCL ('xb') 原子独占落盘 —— TOCTOU 窗口被撞上也绝不覆盖已有文件
+    """
+    # ① 体积闸
+    if len(raw) > FS_UPLOAD_MAX_BYTES:
+        raise FsPathError(413, "file too large")
+    # ② 目标目录经五层链
+    dir_abs = _fs_resolve(project, path)
+    if not os.path.isdir(dir_abs):
+        raise FsPathError(400, "bad request")
+    # ③ 文件名消毒
+    safe = _sanitize_fs_name(name)
+    # ④ 最终路径复核 (第二次 _fs_resolve)
+    target_rel = _rel_out(path, safe)
+    try:
+        _fs_resolve(project, target_rel)
+        # 正常返回 = 目标已存在 (文件或目录) → 拒绝, 永不覆盖
+        raise FsPathError(409, "conflict")
+    except FsPathError as e:
+        if e.code != 404:
+            raise  # 400/403 = 五层链拦截, 原样上抛
+        # 404 = 五层链全过、目标不存在 → 可落盘。dir_abs 已锚定 + safe 为
+        # 单段消毒名 (无分隔符), join 结果必在项目内 (与 _fs_resolve 的
+        # normpath 结果同值; 安全判定已由 ④ 完成, 此处仅物化路径)。
+        target = os.path.normpath(os.path.join(dir_abs, safe))
+    # ⑤ O_EXCL 独占落盘 (TOCTOU 兜底: 并发同名也绝不覆盖)
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        raise FsPathError(409, "conflict")
+    except OSError:
+        raise FsPathError(500, "internal error")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+    except OSError:
+        # 写失败: 清掉半成品, 不留残留文件 (T-158-E 断言无残留)
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise FsPathError(500, "internal error")
+    return {"ok": True, "name": safe, "path": target_rel, "size": len(raw)}
+
+
+def api_fs_delete(project: str, path: str, confirm) -> dict:
+    """POST /api/fs/delete 纯函数面: 硬删单个文件 (PLAN §2.4/§2.5)。
+
+    安全链:
+      ① 服务端独立二次确认: confirm 必须**严格布尔真** (is True)。缺失 /
+         false / "true" 字符串一律 400 —— 防绕过 UI 直接 curl 误删 (MV-158-D)。
+      ② 目标经 _fs_resolve 五层链 (symlink 终判 403 在此生效, MV-158-I)。
+      ③ 只允许删文件: isfile 判定, 目录 → 400 (防误删整树, MV-158-E/F)。
+      ④ os.unlink 硬删 (裁决: 不实现回收站; 已知边界 = 不可恢复)。
+    """
+    if confirm is not True:
+        raise FsPathError(400, "confirm required")
+    target = _fs_resolve(project, path)
+    if not os.path.isfile(target):
+        raise FsPathError(400, "bad request")
+    try:
+        os.unlink(target)
+    except OSError:
+        raise FsPathError(500, "internal error")
+    return {"ok": True, "path": _rel_out(path)}
+
+
+def handle_fs_post(handler, p: str, payload, body_bytes: int = 0) -> None:
+    """console.py do_POST 唯一写面入口: 路由分发 + 错误码映射 (与
+    handle_fs_get 的只读面结构对称; 错误体只含固定英文短语, 零回显)。"""
+    try:
+        if p == "/api/fs/upload":
+            # 请求体上限在解码前卡 (do_POST 预读无上限, 超大 body 先在此拦)
+            if body_bytes > FS_UPLOAD_MAX_BODY:
+                raise FsPathError(413, "payload too large")
+            if not isinstance(payload, dict):
+                raise FsPathError(400, "bad request")
+            raw = _decode_upload_b64(str(payload.get("data") or ""))
+            data = api_fs_upload(str(payload.get("project") or ""),
+                                 str(payload.get("path") or ""),
+                                 str(payload.get("name") or ""), raw)
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            _send_headers(handler, 200,
+                          {"Content-Type": "application/json; charset=utf-8"},
+                          body)
+            return
+        if p == "/api/fs/delete":
+            if not isinstance(payload, dict):
+                raise FsPathError(400, "bad request")
+            data = api_fs_delete(str(payload.get("project") or ""),
+                                 str(payload.get("path") or ""),
+                                 payload.get("confirm"))
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            _send_headers(handler, 200,
+                          {"Content-Type": "application/json; charset=utf-8"},
+                          body)
+            return
+        # /api/fs/<other> 的 POST → 404 (与只读面兜底形态一致)
+        _send_headers(handler, 404,
+                      {"Content-Type": "application/json; charset=utf-8"},
+                      b'{"error":"not found"}')
+    except FsPathError as e:
+        body = json.dumps({"error": e.msg}, ensure_ascii=False).encode("utf-8")
+        try:
+            _send_headers(handler, e.code,
+                          {"Content-Type": "application/json; charset=utf-8"},
+                          body)
         except (BrokenPipeError, ConnectionResetError):
             return

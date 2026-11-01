@@ -72,6 +72,54 @@ def test_prompt_templates_contain_protocol_markers():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# s8 审查回流 P2-3: 卡绑定核对条款不得自相矛盾
+# (REVIEW-M-20261030 §5 P2-3: 旧文案「禁止写」与「在『结果』里说明」冲突,
+#  后者会写进已轮转的他卡块 = 与坑 3 同型的跨卡污染)
+# ──────────────────────────────────────────────────────────────────────
+SOUL_ZH = PROMPT_DIR / "soul_template.zh-cn.md"
+SOUL_EN = PROMPT_DIR / "soul_template.en.md"
+
+
+def test_card_binding_clause_no_self_contradiction():
+    """P2-3: 四份模板的卡绑定条款统一为「不写任何字段, 立即退出,
+    在会话输出中说明」; 旧矛盾文案 (在『结果』里说明) 必须清零。"""
+    files = [ZH_TEMPLATE, EN_TEMPLATE, SOUL_ZH, SOUL_EN]
+    for f in files:
+        assert f.exists(), f"missing {f}"
+        text = f.read_text(encoding="utf-8")
+        assert "卡绑定核对" in text or "Card-binding check" in text, \
+            f"{f.name} 缺卡绑定条款"
+        # 旧矛盾指令必须消失 (zh: 在『结果』里说明; en: explain in ... result)
+        assert "在『结果』里说明" not in text, \
+            f"{f.name} 仍含『在结果里说明』(会污染他卡块)"
+        assert "explain in\n  the `result` field" not in text
+        assert "explain in the `result` field" not in text
+        assert "explain in\nthe 'result' field" not in text
+        assert "explain in the 'result' field" not in text
+        # 新口径在场: zh「不写任何字段」/ en "write no fields at all"
+        if "zh" in f.name:
+            assert "不写任何字段" in text, f"{f.name} 缺新口径『不写任何字段』"
+            assert "会话输出" in text, f"{f.name} 缺『会话输出中说明』指引"
+        else:
+            assert "write no fields at all" in text, \
+                f"{f.name} 缺新口径 write no fields at all"
+            assert "session output" in text, f"{f.name} 缺 session output 指引"
+
+
+def test_card_binding_clause_zero_braces():
+    """P2-3 附带红线: 条款文本零花括号 (worker_contract_prompt 走
+    str.format, 花括号会炸派发; PLAN R-3 既有纪律)。"""
+    for f in (ZH_TEMPLATE, EN_TEMPLATE):
+        text = f.read_text(encoding="utf-8")
+        # 定位卡绑定条款段 (到下一个空行为止)
+        marker = "卡绑定核对" if "zh" in f.name else "Card-binding check"
+        i = text.index(marker)
+        clause = text[i:text.index("\n\n", i)]
+        assert "{" not in clause and "}" not in clause, \
+            f"{f.name} 卡绑定条款含花括号, str.format 会炸"
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 渲染层守护: zh byte-equal baseline
 # ──────────────────────────────────────────────────────────────────────
 def test_zh_prompt_byte_equal_baseline(monkeypatch):

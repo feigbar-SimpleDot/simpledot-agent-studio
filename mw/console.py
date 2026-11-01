@@ -2,14 +2,19 @@
 
 与中间件同容器部署(main), 只读数据源:
   kanban.db(/opt/data/kanban.db) + mw ledger + registry.json
-写操作仅限 registry.json(worker 增删改, 原子写)。
+写操作: registry.json(worker 增删改, 原子写) + 工作区文件浏览写面
+  (/api/fs/upload|delete, 经 _fs_resolve 五层链锚定, issue #158)
+  + 附件落盘(/api/upload; /api/attachments/image 无落盘)。
 
 启动: python3 -m mw.console  (端口 MW_CONSOLE_PORT, 默认 8700)
 
 # [en] mw.console — Web console backend (stdlib, zero new deps).
 # Deployed in the same container as the middleware (main); read-only data
 # sources: kanban.db (/opt/data/kanban.db) + mw ledger + registry.json
-# Write is limited to registry.json (worker CRUD, atomic write).
+# Writes: registry.json (worker CRUD, atomic write) + the workspace
+# file-browser write surface (/api/fs/upload|delete, anchored by the
+# five-layer _fs_resolve chain, issue #158) + attachment uploads
+# (/api/upload; /api/attachments/image does not touch disk).
 # Startup: python3 -m mw.console  (port MW_CONSOLE_PORT, default 8700)
 #
 # i18n v1.0 (2026-10-14): SOUL_TEMPLATE default is now language-aware
@@ -103,12 +108,21 @@ SETTINGS_DEFAULTS = {
     "default_image": "nousresearch/hermes-agent:v2026.9.24",
     "hermes_webui_url": "",   # hermes-webui 跳转地址(外部完整 WebUI/Agent 管理); 留空则顶栏不显示入口
     "pixel_office_enabled": False,  # 像素办公室(pixel-agents)开关: 控制控制台 /pixel 代理 + iframe tab
+    # issue #131 方案B 注记: webui 同源代理开关 webui_proxy_enabled **刻意不进**
+    # 本键集 —— api_settings_save 会把全部默认键落盘, 若在此登记则任何一次设置页
+    # 保存都会把 False 钉进 settings.json, 永久压掉 webui_proxy 的自动探测兜底
+    # (entry 起了 webui 则代理自动可用)。开关口径 = env WEBUI_PROXY_ENABLED
+    # 显式覆盖 > /webui/start.sh 自动探测; settings.json 手工加键仍可作最终控制。
 }
 
 from .ledger import Ledger
 from .ledger import SessionAlreadyBoundError
 from . import pixel_proxy
+from . import webui_proxy
 from . import todo as _todo
+# issue #164: 任务排期服务 (独立 schedule.db + ticker 引擎, ARCH-164 §2)。
+# 只 import 转发, 不触碰 run 执行主体逻辑 (红线 R2)。
+from . import schedule as _schedule
 
 
 def pixel_enabled() -> bool:
@@ -166,6 +180,226 @@ def api_upload(payload: dict) -> dict:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(raw)
     return {"ok": True, "path": str(target), "name": name, "bytes": len(raw)}
+
+
+# ── issue #159: 图片附件服务端压缩端点 ──────────────────────────────
+# 背景: 图片此前直接以 data URL 内联进 chat 请求体, 大图 base64 后撞
+# Hermes gateway 的 10MB 上限 ⇒ 413 ⇒ 用户侧表现为「图片静默丢失」。
+# 本端点在 console 侧把图片压到限额之下再回给前端内联, 且任何失败路径
+# 都返回可判别错误码 —— 绝不静默丢图、绝不回退裸内联原图。
+# Pillow 是运行时可选依赖 (mw 运行时实测 12.3.0 可用): import 失败 ⇒
+# 503 pillow_unavailable, 这是可诊断的运维故障, 优于不可见的数据丢失。
+ATTACH_IMG_MAX_BODY = 32 * 1024 * 1024          # 原始请求体上限 (base64 膨胀 4/3 的兜底)
+ATTACH_IMG_MAX_DECODED = 24 * 1024 * 1024       # 解码后图片字节上限
+ATTACH_IMG_MAX_OUT = 2 * 1024 * 1024            # 压缩产物上限 (留足 10MB gateway 余量)
+ATTACH_IMG_PASSTHROUGH_MAX = 1 * 1024 * 1024    # 小图直通阈值 (零重编码, 零画质损失)
+ATTACH_IMG_MAX_EDGE = 2048                      # 压缩后长边上限
+ATTACH_IMG_JPEG_QUALITY = 82                    # 主压缩质量 (MV-159-J 由单测锁下限)
+ATTACH_IMG_MAX_PIXELS = 100_000_000             # 解压炸弹防线: 像素数上限 (open 后 load 前判)
+# 可直送的静态格式 (多模态接口通用); 动图/其他格式一律重编码为 JPEG
+ATTACH_IMG_PASSTHROUGH_FORMATS = {"PNG", "JPEG", "WEBP", "GIF"}
+ATTACH_IMG_FORMAT_MIME = {"PNG": "image/png", "JPEG": "image/jpeg",
+                          "WEBP": "image/webp", "GIF": "image/gif"}
+
+# issue #166: do_POST 全局 body 预读上限 (64MB)。
+# 层级关系 (勿误读为可下调端点级阈值):
+#   本常量是 **最外层兜底闸** —— 拦「客户端声明了一个荒谬的 Content-Length」
+#   这一形态, 防止超大 body 在 json.loads 之前就被整体读进内存。
+#   端点级闸 (attachments/image 32MB :186 / fs upload 20MB / upload 20MB)
+#   阈值都 **低于** 本值 ⇒ 正常流量永远先撞端点级闸, 本闸不改变端点语义;
+#   本闸只在「端点级闸之前」这一层兜底 (超大 body 根本不进端点)。
+#   64MB 取值理由: 远高于任何合法 JSON 端点 body (实测最大 <1MB),
+#   又远低于「直接吃进内存」的不可接受量级。
+POST_BODY_MAX_BYTES = 64 * 1024 * 1024             # do_POST 请求体预读上限 (64MB)
+
+
+def _attach_img_error(code: int, error: str, detail: str) -> dict:
+    """错误响应统一形态: 固定英文短码 + 固定英文短语 (零回显纪律)。
+
+    detail 一律是写死的短语, 不回显 str(e)/绝对路径/请求 URL ——
+    Pillow 异常文本可能带内部状态, 只映射固定码, 原始异常进日志。
+    """
+    return {"code": code, "ok": False, "error": error, "detail": detail}
+
+
+def api_attachments_image(payload: dict, body_bytes: int = 0) -> dict:
+    """图片附件压缩: base64 入 → 压缩后 data URL + 压缩元信息出。
+
+    请求体 {"name", "data": dataURL 或裸 base64}, 与 /api/upload 的
+    base64 惯例完全对齐 (不引入 multipart)。返回 dict 含 "code" 键,
+    由路由层 pop 后作 HTTP 状态码 (与 api_resume 同口径)。
+
+    压缩策略 (docs/PLAN-L-20261029.md §1.3):
+      小图 (<=1MB 且静态可直送格式) 直通零重编码; 否则 EXIF 校正 →
+      长边 2048 LANCZOS → 透明合成白底 → JPEG q82, 超限降质降尺寸,
+      仍超限 ⇒ 413 明确错误 (绝不返回原图)。
+    """
+    import base64
+    from io import BytesIO
+
+    # ① 请求体上限在解码前卡: do_POST 预读无上限, 100MB 上传会先打满内存
+    if body_bytes > ATTACH_IMG_MAX_BODY:
+        return _attach_img_error(413, "payload_too_large",
+                                 "request body exceeds 32MB limit")
+    data_url = str(payload.get("data") or "")
+    if not data_url:
+        return _attach_img_error(400, "missing_data",
+                                 "attachment data is required")
+    # 剥 data URL 前缀 (与 api_upload 同逻辑); 保留原 mime 供直通复用
+    src_mime = ""
+    if data_url.startswith("data:") and "," in data_url[:128]:
+        head, b64 = data_url.split(",", 1)
+        if ";" in head:
+            src_mime = head[len("data:"):].split(";", 1)[0].strip().lower()
+    else:
+        b64 = data_url
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        return _attach_img_error(400, "bad_base64",
+                                 "attachment data is not valid base64")
+    if len(raw) > ATTACH_IMG_MAX_DECODED:
+        return _attach_img_error(413, "image_too_large",
+                                 "image exceeds 24MB limit")
+    # ② Pillow 缺失 ⇒ 503 可诊断故障; 禁止回退裸内联 (那正是本 issue 根因)
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        logging.getLogger("mw.console").warning(
+            "issue #159: Pillow 不可用, 图片压缩端点返回 503")
+        return _attach_img_error(503, "pillow_unavailable",
+                                 "image compression service unavailable")
+    # ③ 解码识别: 认不出格式 = 非图片; load 失败 = 损坏
+    # 魔数嗅探: 带图片魔数但 Pillow 认不出 ⇒ 判"损坏"而非"非图片",
+    # 与方案 §1.4 错误语义对齐 (截断 PNG 归 decode_failed 族)
+    _MAGICS = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a",
+               b"BM", b"II*\x00", b"MM\x00*", b"RIFF")
+    looks_like_image = raw.startswith(_MAGICS) or raw[12:16] == b"WEBP"
+    try:
+        im = Image.open(BytesIO(raw))
+        fmt = (im.format or "").upper()
+    except Exception:
+        if looks_like_image:
+            return _attach_img_error(400, "decode_failed",
+                                     "unsupported or corrupted image")
+        return _attach_img_error(400, "not_an_image",
+                                 "payload is not a supported image")
+    if not fmt:
+        return _attach_img_error(400, "decode_failed" if looks_like_image
+                                 else "not_an_image",
+                                 "unsupported or corrupted image"
+                                 if looks_like_image else
+                                 "payload is not a supported image")
+    # 解压炸弹: 像素数在 load 前判, 避免解码巨图先打满内存
+    if im.width * im.height > ATTACH_IMG_MAX_PIXELS:
+        return _attach_img_error(400, "image_too_large",
+                                 "image dimensions exceed limit")
+    # 动图 (GIF/TIFF 多页): 只取首帧 —— 多模态接口只吃静态帧, 动图体积爆炸
+    try:
+        n_frames = int(getattr(im, "n_frames", 1) or 1)
+    except Exception:
+        n_frames = 1
+    animated = n_frames > 1 and fmt in ("GIF", "TIFF")
+    if animated:
+        im.seek(0)
+    try:
+        im.load()
+    except Exception:
+        return _attach_img_error(400, "decode_failed",
+                                 "unsupported or corrupted image")
+    orig_w, orig_h = im.size   # 源图真实像素 (EXIF 校正前, 供元信息对照)
+    orig_fmt = f"{fmt}(animated)" if animated else fmt
+    # ④ 小图直通: 零重编码 ⇒ 零画质损失 (AC-159-2)
+    if (len(raw) <= ATTACH_IMG_PASSTHROUGH_MAX
+            and fmt in ATTACH_IMG_PASSTHROUGH_FORMATS and not animated):
+        mime = src_mime if src_mime.startswith("image/") \
+            else ATTACH_IMG_FORMAT_MIME.get(fmt, "image/png")
+        return _attach_img_ok(payload, raw, mime, orig_w, orig_h, len(raw),
+                              orig_fmt, compressed=False,
+                              animated_frames=0)
+    # ⑤ 压缩路径
+    out_w, out_h = orig_w, orig_h
+    try:
+        im = ImageOps.exif_transpose(im)  # 手机原片朝向校正 (真实缺陷)
+        w, h = im.size
+        if max(w, h) > ATTACH_IMG_MAX_EDGE:  # 长边 2048 等比缩放
+            ratio = ATTACH_IMG_MAX_EDGE / float(max(w, h))
+            w, h = int(w * ratio), max(1, int(h * ratio))
+            im = im.resize((w, h), Image.LANCZOS)
+        # 透明通道合成白底: RGBA 直接存 JPEG 会抛 "cannot write mode RGBA"
+        if im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info:
+            rgba = im.convert("RGBA")
+            base = Image.new("RGB", rgba.size, (255, 255, 255))
+            base.paste(rgba, mask=rgba.split()[-1])
+            im = base
+        else:
+            im = im.convert("RGB")
+        out = _attach_img_jpeg(im, ATTACH_IMG_JPEG_QUALITY)
+        if len(out) > ATTACH_IMG_MAX_OUT:      # 降质一档
+            out = _attach_img_jpeg(im, 70)
+        if len(out) > ATTACH_IMG_MAX_OUT:      # 再缩长边 1600 + q75
+            w2, h2 = im.size
+            if max(w2, h2) > 1600:
+                ratio = 1600 / float(max(w2, h2))
+                im = im.resize((int(w2 * ratio), max(1, int(h2 * ratio))),
+                               Image.LANCZOS)
+            out = _attach_img_jpeg(im, 75)
+        if len(out) > ATTACH_IMG_MAX_OUT:
+            # 明确失败, 绝不回退原图裸内联 (那会原样复现静默丢图根因)
+            return _attach_img_error(413, "still_too_large",
+                                     "compressed image still exceeds 2MB limit")
+        out_w, out_h = im.size
+    except Exception:
+        # 只映射固定码; 原始异常进日志, 不进响应 (零回显)
+        logging.getLogger("mw.console").warning(
+            "issue #159: 图片压缩失败 fmt=%s", orig_fmt, exc_info=True)
+        return _attach_img_error(400, "decode_failed",
+                                 "unsupported or corrupted image")
+    return _attach_img_ok(payload, out, "image/jpeg", orig_w, orig_h,
+                          len(raw), orig_fmt, compressed=True,
+                          animated_frames=n_frames if animated else 0,
+                          out_w=out_w, out_h=out_h)
+
+
+def _attach_img_jpeg(im, quality: int) -> bytes:
+    """JPEG 编码单点 (quality 由调用方给, 便于降质重压阶梯)。"""
+    from io import BytesIO
+    buf = BytesIO()
+    im.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def _attach_img_ok(payload: dict, out: bytes, mime: str,
+                   orig_w: int, orig_h: int, orig_bytes: int,
+                   orig_fmt: str, compressed: bool, animated_frames: int,
+                   out_w: int = 0, out_h: int = 0) -> dict:
+    """成功响应: 顶层扁平字段给前端, meta 子对象给模型 (同源派生防漂移)。"""
+    import base64
+    name = str(payload.get("name") or "image")
+    data_url = f"data:{mime};base64,{base64.b64encode(out).decode()}"
+    out_w = out_w or orig_w
+    out_h = out_h or orig_h
+    saved = round(1 - len(out) / float(orig_bytes), 3) if orig_bytes else 0.0
+    meta = {
+        "originalResolution": f"{orig_w}x{orig_h}",
+        "compressedResolution": f"{out_w}x{out_h}",
+        "originalBytes": orig_bytes,
+        "compressedBytes": len(out),
+        "savedRatio": saved,
+        # issue #169 第3条 (P3-1): originalFormat 并入 meta —— 模型可见元信息
+        #   的 format 字段取自 meta 子对象 (同源派生, 防漂移)。顶层同名字段
+        #   保留 (向后兼容, 前端既有消费点不动)。
+        "originalFormat": orig_fmt,
+    }
+    if animated_frames:
+        meta["animatedFrames"] = animated_frames
+    return {"code": 200, "ok": True, "name": name, "mime": mime,
+            "dataUrl": data_url, "bytes": len(out),
+            "width": out_w, "height": out_h,
+            "originalBytes": meta["originalBytes"],
+            "originalWidth": orig_w, "originalHeight": orig_h,
+            "compressed": compressed, "originalFormat": orig_fmt,
+            "meta": meta}
 
 
 def _ui_stamp() -> dict:
@@ -2262,7 +2496,10 @@ def api_task_detail(task_id: str) -> dict:
     h = {}
     for r in _ro_query(LEDGER_DB,
                        "SELECT task_id,harvest_status,exit_code,harvest_log,"
-                       "team_work_run_id FROM harvest_contracts "
+                       "team_work_run_id,notify_attempts,notify_dead_until,"
+                       "notify_last_failed_at,notify_last_error,"
+                       "notify_confirmed_at,last_notified_at "
+                       "FROM harvest_contracts "
                        "WHERE task_id=?", (task_id,)):
         h = r
     s = {}
@@ -2281,6 +2518,24 @@ def api_task_detail(task_id: str) -> dict:
     t["runner_kind"] = s.get("runner_kind")
     t["workspace"] = s.get("workspace")
     t["team_work_run_id"] = h.get("team_work_run_id")
+    # issue #167: 投递可观测性 —— 账本早就有 notify_* 留痕 (issue #103),
+    #   但此前**无任何 HTTP 查询面** ⇒ main 侧看不到「WAITING + 投递失败」
+    #   的组合状态 (issue #167 实案: 派生 sid 投递 404, 两边都不管)。
+    #   详情端点是 AC2 的**主判据面**: 5s 常驻轮询走 fields=active 轻量
+    #   端点读不到 per-task 字段, 只有本端点能一次操作直接读出投递状态。
+    #   只增字段不删不改 ⇒ 既有 UI 消费者零破坏。
+    _dead_until = h.get("notify_dead_until")
+    t["delivery"] = {
+        "notify_attempts": h.get("notify_attempts") or 0,
+        "notify_confirmed_at": h.get("notify_confirmed_at"),
+        "notify_last_failed_at": h.get("notify_last_failed_at"),
+        "notify_last_error": h.get("notify_last_error"),
+        "notify_dead_until": _dead_until,
+        "last_notified_at": h.get("last_notified_at"),
+        # 派生: 一眼可读的组合状态 (AC2 的"直接看到"要求)
+        "delivery_failed": bool(h.get("notify_last_error")),
+        "delivery_dead": bool(_dead_until and _dead_until > time.time()),
+    }
     # issue #104 期望 2: 卡片上要能看出「已被 X 于 HH:MM 答复」。
     # 从账本的 resume 请求历史读最近一条 (含 actor), 双通道 (main 走 CLI /
     # operator 走 console) 共用这张表 ⇒ 两侧都能从详情端点读到对方已答复。
@@ -2322,6 +2577,18 @@ def _api_tasks_active() -> dict:
     约 1KB。
 
     字段与 api_tasks() 的 team_work_active 逐字一致 (前端零改即可切换)。
+    issue #178 起新增 current_card_delivery_failed: 同源判据 = 详情端点
+    delivery.delivery_failed (`bool(notify_last_error)`), 两侧必须同时加。
+
+    issue #190: 「当前卡无 harvest_contracts 行」边界上, 本端点原本只在
+    查询命中循环体内才赋值 ⇒ 两键缺失, 与全量端点 (无条件赋值, 缺行语义
+    = None/False) 分叉。修法 = 循环之前先置缺省值, 命中时覆盖。
+    同一循环之前一并补齐其余 current_card_* 缺省键, 使本端点在
+    「无 kanban 行 / 无 task_sessions 行」边界上也与全量端点逐字一致。
+
+    issue #141 (ADJUDICATION-O §s3): 补 state + holder_state 两个键 ——
+    run 级派生态 (derive_run_overview)。**无条件赋值, 缺省 None**,
+    派生异常 fail-open 置 None (不阻断摘要返回)。
     """
     led_obj = Ledger(LEDGER_DB)
     active_info = None
@@ -2341,9 +2608,33 @@ def _api_tasks_active() -> dict:
                 "created_at": active_run["created_at"],
                 "status": active_run["status"],
             }
+            # issue #141: run 级派生态 (state / holder_state) —— 补两个键,
+            # 供前端 runExtraBadge 分支消费 (HANDOFF / WAITING_ACTIVE /
+            # ACTIVE_BLOCKED / CLOSED + WAITING_SUB 单列一态)。
+            # 无条件赋值 + 缺省 None: 派生失败 fail-open, 键集仍与全量端点
+            # 逐字一致 (#178 键集守护 + AC-141-4)。
+            _run_state, _holder_state = None, None
+            try:
+                _overview = led_obj.derive_run_overview(active_run["run_id"])
+                _run_state = _overview.get("state")
+                _holder_state = _overview.get("holder_state")
+            except Exception:
+                pass  # fail-open: 派生不可用 ⇒ 两键保持 None
+            active_info["state"] = _run_state
+            active_info["holder_state"] = _holder_state
             # 补当前卡的 assignee / session / workspace / title / status
             cur_id = active_run["current_card_id"]
             if cur_id:
+                # issue #190: 先无条件置缺省键, 再由下面的查询命中覆盖 ——
+                # 缺行时键仍在 (缺省 None/False), 与全量端点
+                # (cur_t/cur_sess/cur_hc 的 .get 缺省语义) 逐字对齐。
+                active_info["current_card_title"] = None
+                active_info["current_card_status"] = None
+                active_info["current_card_assignee"] = None
+                active_info["current_card_session_id"] = None
+                active_info["current_card_workspace"] = None
+                active_info["current_card_harvest_status"] = None
+                active_info["current_card_delivery_failed"] = False
                 for r in _ro_query(KANBAN_DB,
                                    "SELECT title,status,assignee FROM tasks "
                                    "WHERE id=?", (cur_id,)):
@@ -2362,11 +2653,16 @@ def _api_tasks_active() -> dict:
                     active_info["current_card_workspace"] = r.get("workspace")
                     break
                 for r in _ro_query(LEDGER_DB,
-                                   "SELECT harvest_status "
+                                   "SELECT harvest_status, notify_last_error "
                                    "FROM harvest_contracts WHERE task_id=?",
                                    (cur_id,)):
                     active_info["current_card_harvest_status"] = r.get(
                         "harvest_status")
+                    # issue #178: 投递失败投影上轻量轮询面 —— 扩展既有查询
+                    # 顺带取 notify_last_error (AC-178-4 红线: 不新增查询),
+                    # 判据与详情端点 :2519 / 全量列表 :2684 同一表达式。
+                    active_info["current_card_delivery_failed"] = bool(
+                        r.get("notify_last_error"))
                     break
     finally:
         try:
@@ -2412,7 +2708,8 @@ def api_tasks(fields: str = "") -> dict:
     led = {}
     for r in _ro_query(LEDGER_DB,
                        "SELECT task_id,harvest_status,exit_code,harvest_log,"
-                       "team_work_run_id FROM harvest_contracts"):
+                       "team_work_run_id,notify_attempts,notify_dead_until,"
+                       "notify_last_error FROM harvest_contracts"):
         led[r["task_id"]] = r
     sess = {}
     for r in _ro_query(LEDGER_DB,
@@ -2437,6 +2734,13 @@ def api_tasks(fields: str = "") -> dict:
         t["runner_kind"] = s.get("runner_kind")
         # ★ T4: 每条 task 暴露所属 team work run (供 TasksView 分组显示)
         t["team_work_run_id"] = h.get("team_work_run_id")
+        # issue #167: 投递失败辅助投影 —— 只加两个布尔, 不加长文本
+        #   (notify_last_error 可达 500 字符, 列表体积纪律 issue #75 R1)。
+        #   ⚠ 辅助面非 AC2 主判据: 5s 常驻轮询走 fields=active 轻量端点,
+        #   不经过此处; 主判据面是 GET /api/tasks/<id> 的 delivery 字段。
+        _du = h.get("notify_dead_until")
+        t["delivery_failed"] = bool(h.get("notify_last_error"))
+        t["delivery_dead"] = bool(_du and _du > time.time())
     # M6: 活动性独立注入 (只读 sse_bridge 内存, 零 health 探测成本)。
     # 按 session_id 匹配; 拿不到 bridge 时全 None, 前端按"无活动证据"渲染。
     for t in tasks:
@@ -2482,6 +2786,19 @@ def api_tasks(fields: str = "") -> dict:
                 "created_at": active_run["created_at"],
                 "status": active_run["status"],
             }
+            # issue #141 (ADJUDICATION-O §s3): 与 _api_tasks_active() 同源
+            # 补 state + holder_state 两个键 (run 级派生态)。无条件赋值,
+            # 缺省 None; 派生异常 fail-open ⇒ 两端点键集逐字一致
+            # (#178 键集守护 + AC-141-4)。
+            _run_state, _holder_state = None, None
+            try:
+                _overview = led_obj.derive_run_overview(active_run["run_id"])
+                _run_state = _overview.get("state")
+                _holder_state = _overview.get("holder_state")
+            except Exception:
+                pass  # fail-open: 派生不可用 ⇒ 两键保持 None
+            active_info["state"] = _run_state
+            active_info["holder_state"] = _holder_state
             # 补当前卡的 assignee / session / workspace (worker + 工作目录)
             if active_run["current_card_id"]:
                 cur_t = next((t for t in tasks
@@ -2496,6 +2813,11 @@ def api_tasks(fields: str = "") -> dict:
                 cur_hc = led.get(active_run["current_card_id"], {})
                 active_info["current_card_harvest_status"] = cur_hc.get(
                     "harvest_status")
+                # issue #178 同源纪律: 与 _api_tasks_active() 同名同义字段,
+                # 从既有 led 缓存直取 (led 查询已含 notify_last_error,
+                # 零新增查询); 判据与 :2519 / :2684 同一表达式。
+                active_info["current_card_delivery_failed"] = bool(
+                    cur_hc.get("notify_last_error"))
     finally:
         try:
             led_obj.close()
@@ -4726,10 +5048,18 @@ class Handler(BaseHTTPRequestHandler):
                 _code, _body = api_cron_runs(
                     m.group(1), (_rq.get("limit") or [None])[0])
                 return self._send(_code, _body)
+            # issue #164: 任务排期只读面 (ARCH-164 §2.3)。前缀 /api/schedule/
+            # 与既有全部路由无交集; 返回 (code, body) 元组, 与 cron 分支同风格。
+            if p == "/api/schedule/tasks":
+                _code, _body = _schedule.api_schedule_tasks()
+                return self._send(_code, _body)
+            if p == "/api/schedule/state":
+                _code, _body = _schedule.api_schedule_state()
+                return self._send(_code, _body)
             if p == "/api/workspaces":
                 return self._send(200, api_workspaces())
-            # Issue #46 / docs/ARCH-FILEBROWSER.md §3.5: fs 只读路由
-            # (POST/PUT/DELETE 不注册 → 落入既有 404 等效拒绝; AC-F4)
+            # Issue #46 / docs/ARCH-FILEBROWSER.md §3.5: fs 的 GET 面路由
+            # (写面见 do_POST 的 /api/fs/ 分支, issue #158 起 fs 面不再只读)
             if p.startswith("/api/fs/"):
                 from .console_files import handle_fs_get, FsPathError
                 qs = parse_qs(urlparse(self.path).query, keep_blank_values=True)
@@ -4789,6 +5119,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(404, {"error": "pixel office disabled"})
                 return pixel_proxy.proxy_http(
                     self, self.path[len("/pixel"):])
+            # issue #131 方案B: hermes-webui 同源代理 /webui/* → 容器内 webui
+            # (保留 Host 头)。webui 不再发布宿主端口, 浏览器只见 :8700 单入口。
+            # 未启用时 404 语义明确 (与 pixel disabled 分支同口径)。
+            if p == "/webui" or p.startswith("/webui/"):
+                if not webui_proxy.webui_proxy_enabled():
+                    return self._send(404, {"error": "webui proxy disabled"})
+                return webui_proxy.proxy_http(
+                    self, self.path[len("/webui"):])
             # pixel-agents SPA 的 WS 硬编码连 location.host/ws(根路径,
             # 不在 /pixel 前缀下), 控制台自身不用 /ws, 直接让给它做隧道。
             if p == "/ws":
@@ -4842,6 +5180,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._proxy_to_worker(p)
             if p.startswith("/api/sessions") or p.startswith("/v1/runs"):
                 return self._proxy_to_gateway(p)
+            # issue #131 方案B: /webui 代理同样先于 body 预读 (proxy_http 自读
+            # rfile 转发; 登录/会话创建等 POST 都带 body, 预读会饿死上游读)。
+            if p == "/webui" or p.startswith("/webui/"):
+                if not webui_proxy.webui_proxy_enabled():
+                    return self._send(404, {"error": "webui proxy disabled"})
+                return webui_proxy.proxy_http(
+                    self, self.path[len("/webui"):])
             # ── cron 写操作 (s4 / t_da1c3a64) ────────────────────────
             # ★ 必须放在 body 预读**之前**: 本批三个写端点无 body,
             #   若先走 json.loads(self.rfile.read(n)) 会等一个永不到来的
@@ -4851,7 +5196,29 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 _code, _body = api_cron_action(m.group(1), m.group(2))
                 return self._send(_code, _body)
+            # issue #164: 排期任务动作端点 (pause/resume/cancel/delete) 与
+            # run-now 均无 body ⇒ 照抄上方 cron 纪律, 放在 body 预读之前;
+            # id 段白名单正则前置 (ARCH-164 §2.3)。前缀 /api/schedule/
+            # 与既有路由零交集。
+            m = re.match(r"^/api/schedule/tasks/([A-Za-z0-9_-]{1,64})"
+                         r"/(pause|resume|cancel|delete)$", p)
+            if m:
+                _code, _body = _schedule.api_schedule_action(
+                    m.group(1), m.group(2))
+                return self._send(_code, _body)
+            if p == "/api/schedule/run-now":
+                _code, _body = _schedule.api_schedule_run_now()
+                return self._send(_code, _body)
+            # issue #166: 全局 body 预读上限闸 —— 在 json.loads 之前拦掉
+            # 超大 Content-Length, 避免超大 body 整体进内存 (DoS 面)。
+            # 端点级闸 (attachments/image / fs upload) 阈值更低, 正常流量
+            # 仍先撞端点级闸 ⇒ 本闸不改变任何端点语义 (见 POST_BODY_MAX_BYTES)。
             n = int(self.headers.get("Content-Length", 0))
+            if n > POST_BODY_MAX_BYTES:
+                logging.getLogger("mw.console").warning(
+                    "issue #166: do_POST %s body 超限 n=%d > %d ⇒ 413",
+                    p, n, POST_BODY_MAX_BYTES)
+                return self._send(413, {"error": "payload_too_large"})
             payload = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/resume":
                 # issue #104: 答复来源 (operator = 控制台人工答复; main 走
@@ -4869,8 +5236,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(_code, _res)
             if p == "/api/compose/generate":
                 return self._send(200, api_compose_generate(payload))
+            # issue #158: fs 写面 (upload/delete) —— 插在 /api/upload 分支之前
+            # (X-2 锚点裁决, 与 s3 的 /api/attachments/image 插入点物理分离);
+            # 实现全部在 console_files.handle_fs_post (错误映射含内部, 本分支
+            # 只做转发, 与 do_GET 的 handle_fs_get 结构对称)。
+            if p.startswith("/api/fs/"):
+                from .console_files import handle_fs_post
+                return handle_fs_post(self, p, payload, body_bytes=n)
             if p == "/api/upload":
                 return self._send(200, api_upload(payload))
+            # issue #159: 图片附件服务端压缩 (插在 /api/upload 之后,
+            # 两个附件端点相邻; X-2 要求 s4 的 /api/fs/ 分支插在本分支之前)
+            if p == "/api/attachments/image":
+                _res = api_attachments_image(payload, body_bytes=n)
+                _code = _res.pop("code", 200)
+                return self._send(_code, _res)
             if p == "/api/team-work/launch":
                 # 错误码按 payload 里 code 字段透传,不是 HTTP 状态码
                 return self._send(200, api_team_work_launch(payload))
@@ -4945,15 +5325,40 @@ class Handler(BaseHTTPRequestHandler):
             # 问题7D: webhook 注册
             if p == "/api/webhooks":
                 return self._send(201, api_webhook_register(payload))
+            # issue #164: 排期写端点(有 body 的三个) — 在预读之后 (ARCH-164 §2.3)。
+            if p == "/api/schedule/tasks":
+                _code, _body = _schedule.api_schedule_create(payload)
+                return self._send(_code, _body)
+            if p == "/api/schedule/settings":
+                _code, _body = _schedule.api_schedule_settings(payload)
+                return self._send(_code, _body)
+            m = re.match(r"^/api/schedule/tasks/([A-Za-z0-9_-]{1,64})/update$", p)
+            if m:
+                _code, _body = _schedule.api_schedule_update(m.group(1), payload)
+                return self._send(_code, _body)
             return self._send(404, {"error": "not found"})
         except ValueError as e:
+            # 422 分支 **保留** str(e): 这是端点主动抛出的用户可读校验文案
+            # (如 _clean_webui_url), 不是内部信息泄漏面。
             return self._send(422, {"error": str(e)})
         except Exception as e:
-            return self._send(500, {"error": str(e)})
+            # issue #176: 外层兜底不再回显 str(e) —— 异常原文可能含绝对路径 /
+            # 栈信息 / 内部标识, 回显给客户端即泄漏面。客户端只拿固定文案,
+            # 全量异常 (含栈) 留服务端日志 (mw.console logger ⇒ console.log
+            # + docker logs), 排障改看日志。
+            logging.getLogger("mw.console").exception(
+                "do_POST %s failed: %s", p, e)
+            return self._send(500, {"error": "internal_error"})
 
     def do_PUT(self):
         p = self.path.split("?")[0]
         try:
+            # issue #131 方案B: /webui 代理全方法透传 (webui 服务端支持 PUT)。
+            if p == "/webui" or p.startswith("/webui/"):
+                if not webui_proxy.webui_proxy_enabled():
+                    return self._send(404, {"error": "webui proxy disabled"})
+                return webui_proxy.proxy_http(
+                    self, self.path[len("/webui"):])
             n = int(self.headers.get("Content-Length", 0))
             payload = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/workers":
@@ -4972,9 +5377,29 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(500, {"error": str(e)})
 
+    def do_PATCH(self):
+        # issue #131 方案B: webui 前端 (kanban 面) 有 PATCH 调用; 控制台自身
+        # 无 PATCH 端点, 故本方法只服务 /webui 代理, 其余路径保持默认 501。
+        p = self.path.split("?")[0]
+        if p == "/webui" or p.startswith("/webui/"):
+            try:
+                if not webui_proxy.webui_proxy_enabled():
+                    return self._send(404, {"error": "webui proxy disabled"})
+                return webui_proxy.proxy_http(
+                    self, self.path[len("/webui"):])
+            except Exception:
+                return self._send(500, {"error": "internal error"})
+        return self._send(501, {"error": "not implemented"})
+
     def do_DELETE(self):
         p = self.path.split("?")[0]
         try:
+            # issue #131 方案B: /webui 代理全方法透传 (webui 前端有 DELETE 调用)。
+            if p == "/webui" or p.startswith("/webui/"):
+                if not webui_proxy.webui_proxy_enabled():
+                    return self._send(404, {"error": "webui proxy disabled"})
+                return webui_proxy.proxy_http(
+                    self, self.path[len("/webui"):])
             if p.startswith("/api/w/"):
                 return self._proxy_to_worker(p)
             if p.startswith("/api/workers/"):
@@ -5186,6 +5611,9 @@ def main():
     except Exception as e:
         print(f"[console] avatar migration skipped: {e}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    # issue #164: 排期 ticker daemon (ARCH-164 §2.2); serve_forever 前起线程,
+    # daemon 属性保证不阻塞进程退出。
+    _schedule.get_engine().start()
     # issue #143 (改 B-4): 「console 起来了」也落固定文件, 排障时可用文件
     # 自证进程存活; print 保留给 docker logs 面 (StreamHandler 兜底时同源)。
     print(f"[console] listening on :{PORT}")

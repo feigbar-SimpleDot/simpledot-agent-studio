@@ -184,12 +184,19 @@ else
 fi
 
 # hermes-webui (optional): only checked when .env sets HERMES_WEBUI_DIR
+# issue #131 方案B: webui 不再发布宿主端口 (容器内只绑 127.0.0.1), 探活改走
+# docker exec 容器内探测 —— 与 gateway 段 (issue #109) 同一先例口径;
+# 容器内无 curl 依赖保证, 同样用镜像自带的 python3 urllib。
 if [ -n "${HERMES_WEBUI_DIR:-}" ]; then
   WPORT="${HERMES_WEBUI_PORT:-8787}"
-  if curl -sf --max-time 5 "http://127.0.0.1:${WPORT}/health" >/dev/null 2>&1; then
-    ok "hermes-webui online (:${WPORT})" "hermes-webui 在线 (:${WPORT})"
+  if docker exec -e WPORT="${WPORT}" "${MAIN_CONTAINER_NAME}" python3 -c '
+import os, urllib.request
+port = os.environ.get("WPORT", "8787")
+print(urllib.request.urlopen("http://127.0.0.1:" + port + "/health", timeout=5).read().decode())
+' 2>/dev/null | grep -q '"status": *"ok"'; then
+    ok "hermes-webui online (inside ${MAIN_CONTAINER_NAME}, :${WPORT})" "hermes-webui 在线 (${MAIN_CONTAINER_NAME} 容器内 :${WPORT})"
   else
-    bad "hermes-webui not responding (:${WPORT}) — check docker logs ${MAIN_CONTAINER_NAME} for webui output" "hermes-webui 未响应 (:${WPORT}) — 查 docker logs ${MAIN_CONTAINER_NAME} 里的 webui 输出"
+    bad "hermes-webui not responding inside ${MAIN_CONTAINER_NAME} (:${WPORT}) — check docker logs ${MAIN_CONTAINER_NAME} for webui output" "hermes-webui 在 ${MAIN_CONTAINER_NAME} 容器内未响应 (:${WPORT}) — 查 docker logs ${MAIN_CONTAINER_NAME} 里的 webui 输出"
   fi
 fi
 

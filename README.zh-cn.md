@@ -36,6 +36,10 @@ cp .env.example .env && vi .env    # 填 API_SERVER_KEY / 模型端点
 open http://<host>:8700            # 控制台：聊天 / 看板 / 文件 / worker
 ```
 
+## 安全提示
+
+本工具不含访问安全策略。建议在局域网内使用。如果需要开放外网访问，请自行配置安全策略。
+
 ## 延伸阅读
 
 | 主题 | 文档 |
@@ -75,4 +79,6 @@ open http://<host>:8700            # 控制台：聊天 / 看板 / 文件 / work
 
 ## 支持
 
-喜欢这个项目？欢迎 [请作者喝杯咖啡](https://buymeacoffee.com/feigbar) 支持它的持续开发。
+喜欢这个项目？欢迎支持它的持续开发：
+
+<a href="https://www.buymeacoffee.com/feigbar" target="_blank" rel="noopener noreferrer"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="请作者喝杯咖啡" style="height: 60px !important;width: 217px !important;" ></a>

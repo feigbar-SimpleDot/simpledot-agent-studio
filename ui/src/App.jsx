@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from './api.js'
 import ChatView from './views/ChatView.jsx'
+import ScheduleView from './views/ScheduleView.jsx'
 import TasksBoardView from './views/TasksBoardView.jsx'
 import WorkersView from './views/WorkersView.jsx'
 import WorkflowsView from './views/WorkflowsView.jsx'
@@ -21,6 +22,9 @@ import { BRAND_EN, BRAND_ZH } from './brand.js'
 //        按 pixelStatus.enabled 条件显示(交互设计 §3.1)。2026-10-15 按 R3.1
 //        调整顺序 — 任务看板(多智能体协作成果主视图)置顶,对话次位,尾部不变。
 const NAV = [
+  // issue #164: 收件箱 TAB (原任务排期) 置顶 (AC-1.1 —— 菜单第一位); 日历+时钟图标 (heroicons
+  // outline calendar-clock)。[en] Task schedule takes the lead slot.
+  { id: 'schedule',    icon: 'M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2zm5-6h.01M12 15l2 2 3-3' },
   // 2026-10-06 改版:合并原「任务看板」(扁平 task 列表) +「Team Works」
   // 为新版「任务看板」(run→task 树状结构)。Team Works 概念不再单独 tab 暴露。
   // [en] Tasks board (folded runs into tasks tree). i18n label picks short word.
@@ -40,6 +44,7 @@ const NAV = [
 // NAV label i18n key table — keyed by id, resolved by t() per render.
 // Sorted by NAV order so adding a tab only touches this table + NAV list.
 const NAV_LABEL_KEYS = {
+  'schedule':    'nav.schedule',
   'tasks-board': 'nav.tasks_board',
   'chat':        'nav.chat',
   'workers':     'nav.workers',
@@ -326,6 +331,7 @@ export default function App() {
             })}
             {view !== 'chat' && (
               <>
+                {view === 'schedule' && <ScheduleView onNavigate={setView} />}
                 {view === 'tasks-board' && <TasksBoardView onChanged={pollStatus} />}
                 {view === 'workers' && <WorkersView onChanged={pollStatus} onChat={openWorkerChat} />}
                 {view === 'workflows' && <WorkflowsView onChanged={pollStatus} />}
@@ -454,6 +460,7 @@ export default function App() {
             <p className="text-[11.5px] text-dim leading-tight mt-0.5">
               {view === 'chat' && activeChat === 'main' && t('app.subtitle_chat_main')}
               {view === 'chat' && activeChat !== 'main' && t('app.subtitle_chat_worker', { name: activeChat })}
+              {view === 'schedule' && t('app.subtitle_schedule')}
               {view === 'tasks-board' && t('app.subtitle_tasks_board', { total: counts.total, attention: counts.attention, running: counts.running, finished: counts.finished })}
               {view === 'workers' && t('app.subtitle_workers')}
               {view === 'workflows' && t('app.subtitle_workflows')}
@@ -498,6 +505,7 @@ export default function App() {
                       })}
           {view !== 'chat' && (
             <>
+              {view === 'schedule' && <ScheduleView onNavigate={setView} />}
               {view === 'tasks-board' && <TasksBoardView onChanged={pollStatus} />}
               {view === 'workers' && <WorkersView onChanged={pollStatus} onChat={openWorkerChat} />}
               {view === 'workflows' && <WorkflowsView onChanged={pollStatus} />}

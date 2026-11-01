@@ -196,7 +196,7 @@ if [ -n "${HERMES_WEBUI_DIR:-}" ]; then
   [ -f "${HERMES_WEBUI_DIR}/start.sh" ] \
     || fail "HERMES_WEBUI_DIR=${HERMES_WEBUI_DIR} has no start.sh — first clone: git clone https://github.com/nesquena/hermes-webui ${HERMES_WEBUI_DIR}" \
             "HERMES_WEBUI_DIR=${HERMES_WEBUI_DIR} 里没有 start.sh — 先 clone: git clone https://github.com/nesquena/hermes-webui ${HERMES_WEBUI_DIR}"
-  say "hermes-webui enabled: ${HERMES_WEBUI_DIR} -> /webui in container (port ${HERMES_WEBUI_PORT:-8787})" "hermes-webui 已启用: ${HERMES_WEBUI_DIR} → 容器 /webui (端口 ${HERMES_WEBUI_PORT:-8787})"
+  say "hermes-webui enabled: ${HERMES_WEBUI_DIR} -> /webui in container (inside-container port ${HERMES_WEBUI_PORT:-8787}, browser entry via console /webui same-origin proxy)" "hermes-webui 已启用: ${HERMES_WEBUI_DIR} → 容器 /webui (容器内端口 ${HERMES_WEBUI_PORT:-8787}, 浏览器入口走控制台 /webui 同源代理)"
 fi
 
 # Pixel office enable check (optional): when PIXEL_OFFICE_ENABLED=1, validate the mounted directory.

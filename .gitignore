@@ -49,3 +49,7 @@ deploy/.runtime-soul/
 
 # i18n 改造期间的临时翻译/转换工具产物(卡级一次性工具,任务完成后失效)
 parts/
+
+# issue#169: 运行时用例 (ui/tests) 的临时 esbuild bundle 目录兜底
+# (正常 finally 里 rmSync 清理, 异常退出会残留在 ui/ 下)
+.d1-tmp-*

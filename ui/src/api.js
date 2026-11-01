@@ -259,6 +259,42 @@ export const api = {
     '/api/soul-template'),
 
   // ──────────────────────────────────────────────────────────────────
+  // issue #164 收件箱 TAB (原任务排期, ARCH-164 §4#5): schedule 端点封装, 照抄 cron 组
+  // 纪律 —— 端点标签用路径模板 (稳定、不带用户可控串); 无 body 的 POST
+  // 不带 Content-Type/body (服务端在预读前分支处理)。
+  // ──────────────────────────────────────────────────────────────────
+  scheduleList: () => net(
+    fetch('/api/schedule/tasks').then((r) => j(r, '/api/schedule/tasks')),
+    '/api/schedule/tasks'),
+  scheduleState: () => net(
+    fetch('/api/schedule/state').then((r) => j(r, '/api/schedule/state')),
+    '/api/schedule/state'),
+  scheduleCreate: (body) => net(
+    fetch('/api/schedule/tasks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then((r) => j(r, '/api/schedule/tasks')),
+    '/api/schedule/tasks'),
+  scheduleSettings: (auto_execute) => net(
+    fetch('/api/schedule/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auto_execute }),
+    }).then((r) => j(r, '/api/schedule/settings')),
+    '/api/schedule/settings'),
+  // action ∈ pause|resume|cancel|delete (无 body)
+  scheduleAction: (id, action, body) => net(
+    fetch(`/api/schedule/tasks/${encodeURIComponent(id)}/${action}`, {
+      method: 'POST',
+      ...(body ? { headers: { 'Content-Type': 'application/json' },
+                   body: JSON.stringify(body) } : {}),
+    }).then((r) => j(r, '/api/schedule/tasks/:id/' + action)),
+    '/api/schedule/tasks/:id/' + action),
+  scheduleRunNow: () => net(
+    fetch('/api/schedule/run-now', { method: 'POST' })
+      .then((r) => j(r, '/api/schedule/run-now')),
+    '/api/schedule/run-now'),
+
+  // ──────────────────────────────────────────────────────────────────
   // Issue #46 (s4-impl, ARCH-FILEBROWSER §4.5): 文件浏览器 fs 接口
   //   - FsHttpError 只带 status, 不解析 body (UX 约束 3 + AC-G2 零回显)
   //   - AbortSignal 透传, FilePreview 切换选择时 abort 上一次请求
@@ -292,3 +328,31 @@ api.fsText = async (project, path, signal) => {
   const r = await fsGet(api.fsFileUrl(project, path, 'embed'), signal)
   return r.text()
 }
+
+// ── issue #158: fs 写面 (上传/删除) ────────────────────────────────
+// 复用 FsHttpError 形态: 只带 status, 不解析 body (零回显纪律), 前端按
+// status 映射 chat.files.err_* 文案。base64 JSON 传输与 /api/upload 惯例一致。
+const fsPost = async (url, obj) => {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(obj),
+  })
+  if (!r.ok) throw new FsHttpError(r.status)
+  return r.json()
+}
+// 文件读成 data URL (FileReader.readAsDataURL, 与 ChatView 上传同口径)
+const fileToDataUrl = (file) =>
+  new Promise((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(String(fr.result))
+    fr.onerror = () => reject(fr.error || new Error('read failed'))
+    fr.readAsDataURL(file)
+  })
+api.fsUpload = async (project, path, file) =>
+  fsPost('/api/fs/upload', {
+    project, path, name: file.name, data: await fileToDataUrl(file),
+  })
+// confirm: true 是服务端独立二次确认闸门 (严格布尔), 前端确认框点"确认"才发
+api.fsDelete = (project, path) =>
+  fsPost('/api/fs/delete', { project, path, confirm: true })

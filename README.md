@@ -47,6 +47,11 @@ cp .env.example .env && vi .env    # fill API_SERVER_KEY / model endpoint
 open http://<host>:8700            # console: chat / kanban / files / workers
 ```
 
+## Security Notice
+
+This tool does not include an access security policy. It is recommended to use it on a local network.
+If you need to expose it to the public internet, configure your own security policy.
+
 ## Where to read more
 
 | Topic | Doc |
@@ -84,4 +89,6 @@ Thanks to all their maintainers.
 
 ## Support
 
-Enjoying this project? Consider [Buy Me a Coffee](https://buymeacoffee.com/feigbar) to support its development.
+Enjoying this project? Consider supporting its development:
+
+<a href="https://www.buymeacoffee.com/feigbar" target="_blank" rel="noopener noreferrer"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee" style="height: 60px !important;width: 217px !important;" ></a>

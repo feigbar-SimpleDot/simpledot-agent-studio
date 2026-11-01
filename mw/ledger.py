@@ -912,6 +912,63 @@ class Ledger:
             (task_id,)).fetchone()
         return cur["session_id"] if cur else None
 
+    # ── issue #170 坑 1: 产物新鲜度基准 (2026-10-30) ────────────────
+    def get_freshness_baseline(self, task_id: str) -> tuple[float, str]:
+        """返回 (基准时间戳, 基准来源标签); 取不到返回 (0.0, "")。
+
+        基准语义 = "本卡 worker 真正开跑的时刻"。取**最晚**的那个候选:
+          - task_sessions.created_at  —— session 建立时刻 (一卡一次, 不被重置)
+          - team_work_runs.created_at  —— run 建立时刻 (一次性写, 不被重置)
+        兜底 = harvest_contracts.created_at。
+
+        ⚠️ 基准**不能用** harvest_contracts.created_at 作主基准:
+        put_contract 用 INSERT OR REPLACE 整行替换 (mw/ledger.py:581-594),
+        created_at 每次 dispatch 都被重置为 now ⇒ 基准退化成
+        "最近一次 dispatch 时刻" ⇒ worker 若在 dispatch 后很久才写产物,
+        仍会被判陈旧 ⇒ **假阳性**。故它只作兜底。
+
+        取 max(sessions, runs) 而非 min: 产物的"新鲜"应相对于本卡
+        worker 何时开始干活, 取最晚值 ⇒ 最不容易假阳性 (只有"worker
+        跑完后产物 mtime 比 worker 开跑还早"才判陈旧 —— 物理上即产物陈旧)。
+
+        纯读零副作用 (AC6)。
+        """
+        candidates: list[tuple[float, str]] = []
+        try:
+            row = self.conn.execute(
+                "SELECT created_at FROM task_sessions WHERE task_id=?",
+                (task_id,)).fetchone()
+            if row and row["created_at"]:
+                candidates.append((float(row["created_at"]),
+                                   "task_sessions.created_at"))
+        except Exception:
+            pass
+        try:
+            row = self.conn.execute(
+                "SELECT r.created_at AS created_at "
+                "FROM harvest_contracts hc "
+                "JOIN team_work_runs r ON hc.team_work_run_id = r.run_id "
+                "WHERE hc.task_id=?", (task_id,)).fetchone()
+            if row and row["created_at"]:
+                candidates.append((float(row["created_at"]),
+                                   "team_work_runs.created_at"))
+        except Exception:
+            pass
+        if candidates:
+            # 同一来源取最新; 不同来源取最晚
+            best = max(candidates, key=lambda c: c[0])
+            return best[0], best[1]
+        # 兜底: 非 team-work 卡 (无 run) 时唯一可取的字段
+        try:
+            row = self.conn.execute(
+                "SELECT created_at FROM harvest_contracts WHERE task_id=?",
+                (task_id,)).fetchone()
+            if row and row["created_at"]:
+                return float(row["created_at"]), "harvest_contracts.created_at"
+        except Exception:
+            pass
+        return 0.0, ""
+
     def should_notify(self, task_id: str, min_interval_s: float = 0.0) -> bool:
         """通知去重: 同卡 min_interval_s 内只叫醒 main 一次。
 

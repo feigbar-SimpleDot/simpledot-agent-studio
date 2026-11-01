@@ -28,7 +28,9 @@ services:
       # main<->worker 自 issue #82 起全部走容器内网别名 (http://hermes_<name>:8642),
       # 宿主映射属冗余; 浏览器/宿主侧一律经 console(:8700) 同源代理访问 gateway。
       - "${CONSOLE_PORT:-8700}:8700"   # Web console
-      - "${HERMES_WEBUI_PORT:-8787}:${HERMES_WEBUI_PORT:-8787}"   # hermes-webui (optional, idle port harm-free when disabled)
+      # issue #131 方案B: hermes-webui 不再发布宿主端口。容器内 console 经
+      # /webui 同源代理转发 (webui_proxy_enabled 开关), 攻击面收敛一个端口;
+      # webui 在容器内只绑 127.0.0.1 (见下方 HERMES_WEBUI_HOST)。
     volumes:
       # 2026-10-22 issue #82: /opt/data is a NAMED VOLUME, not the ./data/main bind.
       # Root cause: on a virtiofs host mount (lima/Colima on macOS) a socket inode
@@ -98,7 +100,7 @@ services:
       - MW_ALLOWED_WS_PREFIX=/share_workspace
       - MW_HERMES_HOME=/opt/data                 # ★ unify main kanban, prevent dual-db split
       - MW_KANBAN_DB=/opt/data/kanban.db
-      - HERMES_WEBUI_HOST=0.0.0.0                # webui binds all interfaces (inside container)
+      - HERMES_WEBUI_HOST=127.0.0.1                # issue #131 方案B: webui 只绑容器内回环, 仅 console 同源代理可达 (不再对外)
       - HERMES_WEBUI_PORT=${HERMES_WEBUI_PORT:-8787}
       - HERMES_WEBUI_PASSWORD=${HERMES_WEBUI_PASSWORD:-}
       - PIXEL_OFFICE_ENABLED=${PIXEL_OFFICE_ENABLED:-0}   # pixel office switch (entry conditionally launches by this)

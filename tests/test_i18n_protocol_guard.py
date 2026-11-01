@@ -5,7 +5,9 @@
   G2. resolve_lang() 缺省 = 'en';非法值 → 'en' (AC §5.2)
   G3. `mw/todo.py` 不 import i18n,不调用 t() (协议字段不被翻译,架构 §2.3)
   G4. `mw/reaper.py` 协议字面量未改 (架构 §8.1 step 5)
-  G5. mw/*.py 内 t("...") 字面 key 都在 en.json 里存在 (typos gate)
+  G5. mw/*.py 内 t("...") / _t("...") 字面 key 都在 en.json 里存在 (typos gate;
+      #184 修正正则, 旧版对 `_t(` 完全空转)
+  G5b. mw/i18n 键数锚: en/zh-cn 顶层键数 >= 232, schedule.* >= 24 (#184)
   G6. tools/i18n_allowlist.txt 存在且非空
   G7. GET /api/lang 返回 {"lang": "<en|zh-cn>"},Cache-Control: no-store,
       无鉴权 (design.md §10)
@@ -77,6 +79,9 @@ def test_resolve_lang_defaults(monkeypatch):
 
 # ──────────────────────────────────────────────────────────────────
 # G3: mw/todo.py 不 import i18n,不调 t() (协议字段不被翻译)
+#     ⚠ G3 与 G5 的正则族不同: G5 (#184) 已收紧为 (?<!\w)_?t\s*\(,
+#     G3 保持 \bt\s*\( 不动 (实测 todo.py 两种正则均 0 命中, 收紧不会
+#     误伤, 但收紧 G3 超出 #184 授权范围 —— 见 PLAN §2.6 裁决)。
 # ──────────────────────────────────────────────────────────────────
 def test_todo_does_not_import_i18n():
     todo_src = (ROOT / "mw" / "todo.py").read_text(encoding="utf-8")
@@ -105,26 +110,91 @@ def test_protocol_literals_intact():
 
 
 # ──────────────────────────────────────────────────────────────────
-# G5: mw/*.py 内 t("...") 字面 key 都在 en.json 里存在
+# G5: mw/*.py 内 t("...") / _t("...") 字面 key 都在 en.json 里存在
+#     #184 修正: 旧正则 `\bt\s*\(` 因 `\b` 前是 `_`(单词字符) 对 `_t(`
+#     永不成立, 而 mw/ 里根本没有裸 `t(` 调用 ⇒ 守护完全空转 (实测 0 命中)。
+#     现用 (?<!\w)_?t\s*\( : lookbehind 不消费字符 ⇒ 无相邻调用漏匹配风险,
+#     且 `foo_t(` 这类标识符结尾仍被正确排除。
+#     ⚠ 固有盲区: 只扫**字面量** key。`mw/schedule.py` 的 `_t(key)`(key 为
+#     变量, 值来自 _RUN_NOW_ERRORS) 任何静态正则都扫不到 —— 设计如此,
+#     不是缺键, 由 G1 双表相等 + 键数锚兜底。
 # ──────────────────────────────────────────────────────────────────
+_T_CALL_RE = re.compile(r'(?<!\w)_?t\s*\(\s*["\']([^"\']+)["\']\s*')
+
+
 def test_t_call_keys_exist_in_en_json():
     en_keys = set(json.loads(
         (ROOT / "mw" / "i18n" / "en.json").read_text(encoding="utf-8")
     ).keys())
     mw_dir = ROOT / "mw"
     bad: list[str] = []
+    scanned = 0
     for py in mw_dir.glob("*.py"):
         text = py.read_text(encoding="utf-8", errors="ignore")
-        # 抓 `t("...key...")` 或 `t('...key...')` 形式:
-        for m in re.finditer(r'\bt\s*\(\s*["\']([^"\']+)["\']\s*', text):
+        # 抓 `t("...key...")` / `_t('...key...')` 形式 (#184: 旧正则漏抓全部 `_t(`):
+        for m in _T_CALL_RE.finditer(text):
+            scanned += 1
             key = m.group(1)
             if key in en_keys:
                 continue
             # 模板占位 / 测试 fixture 不算
             if key.startswith("{") or key.startswith("__"):
                 continue
-            bad.append(f"{py.name}: t({key!r}) not in en.json")
+            bad.append(f"{py.name}: {m.group(0).strip()} key={key!r} not in en.json")
     assert not bad, "missing i18n keys:\n  " + "\n  ".join(bad)
+    # #184 空转守卫: 修正后必须真的扫到调用 (工作树实测 67 处), 否则说明正则又退化了
+    assert scanned >= 67, (
+        f"G5 扫描命中 {scanned} 处 < 67 (工作树基线) ⇒ 正则疑似退化, 守护空转")
+
+
+# ──────────────────────────────────────────────────────────────────
+# G5b: #184 键数锚 —— mw/i18n 两套 locale 键数不得回退 (防删键回归)
+#      口径: 顶层 len(keys()) (mw 侧 locale 是扁平点号键, 无嵌套 dict);
+#      与 UI 侧 (ui/src/i18n/locales, 嵌套结构扁平化 765 键) 是两套口径,
+#      各钉各的。用 >= 不用 ==: 允许合法新增 (新增键的合法性由 G1 双表
+#      相等 + G5 键存在性覆盖), 锚只防"删键/换键"。照抄 UI 侧 INV-09 先例。
+# ──────────────────────────────────────────────────────────────────
+MW_LOCALE_KEY_FLOOR = 232      # 工作树实测 (2026-10-31), 合法新增时同步上调
+MW_SCHEDULE_KEY_FLOOR = 24     # schedule.* 子树实测键数
+
+
+def test_mw_locale_key_count_anchor():
+    en = json.loads(
+        (ROOT / "mw" / "i18n" / "en.json").read_text(encoding="utf-8"))
+    zh = json.loads(
+        (ROOT / "mw" / "i18n" / "zh-cn.json").read_text(encoding="utf-8"))
+    assert len(en) >= MW_LOCALE_KEY_FLOOR, \
+        f"en.json 键数 {len(en)} < 锚 {MW_LOCALE_KEY_FLOOR} (疑似删键回归)"
+    assert len(zh) >= MW_LOCALE_KEY_FLOOR, \
+        f"zh-cn.json 键数 {len(zh)} < 锚 {MW_LOCALE_KEY_FLOOR} (疑似删键回归)"
+    # schedule.* 子树: 计数锚 + 关键键存在性 (防"键数达标但关键键被换掉")
+    sched = {k for k in en if k.startswith("schedule.")}
+    assert len(sched) >= MW_SCHEDULE_KEY_FLOOR, \
+        f"schedule.* 键数 {len(sched)} < 锚 {MW_SCHEDULE_KEY_FLOOR}"
+    for must in ("schedule.dispatch_marker",
+                 "schedule.err_no_pending_task",
+                 "schedule.err_detail_required"):
+        assert must in en, f"关键 schedule 键缺失: {must}"
+
+
+# ──────────────────────────────────────────────────────────────────
+# G5c: #184 正则常驻反证 —— 锁住新正则的捕获语义 (退化即转红)
+# ──────────────────────────────────────────────────────────────────
+def test_g5_regex_capture_semantics_selftest():
+    def hits(src: str) -> list[str]:
+        return _T_CALL_RE.findall(src)
+    # 1) `_t("key")` 必须被抓 (#184 核心: 旧正则 0 命中)
+    assert hits('_t("nonexistent.key.xyz")') == ["nonexistent.key.xyz"]
+    # 2) 裸 `t("key")` 仍被抓 (原捕获能力不回退)
+    assert hits('t("some.key")') == ["some.key"]
+    # 3) 零间隔相邻调用两个都命中 (lookbehind 不消费前导字符)
+    assert hits('_t("a")_t("b")') == ["a", "b"]
+    # 4) `foo_t(` 标识符结尾不算 (不误伤同名后缀函数)
+    assert hits('foo_t("x")') == []
+    # 5) `obj.t(` 属性调用仍命中 (与旧 \b 语义一致, 保守不误放)
+    assert hits('self.t("k")') == ["k"]
+    # 6) 空格/单双引号变体
+    assert hits("_t ( 'k1' )") == ["k1"]
 
 
 # ──────────────────────────────────────────────────────────────────

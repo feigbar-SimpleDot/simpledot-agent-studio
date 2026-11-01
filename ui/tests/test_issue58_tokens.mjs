@@ -115,11 +115,39 @@ test('i18n: 顶层全量 flatten 键集合 en == zh (基线 639 → 643 → 644)
   // 双语同 commit, INV-09 先例口径)。
   // 688 → 693: issue #146 新增 tboard.todo_status_* 五键 (TODO 状态 chip
   // 文案 i18n 化, 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
-  assert(fe.size === 693 && fz.size === 693,
-    `期望 688+5=693 键, 实际 en=${fe.size} zh=${fz.size}`)
+  // 693 → 699: issue #159 新增 6 键 (chat.errors.image_compress_failed /
+  // image_too_large / image_unsupported / pillow_unavailable +
+  // chat.input.image_meta / image_meta_compressed —— 图片附件服务端压缩的
+  // 错误文案与元信息模板; 元信息按直通/压缩拆两模板故比方案表多 1 键),
+  // 双语同 commit (INV-09 先例口径)。
+  // 699 → 715: issue #158 新增 16 键 (chat.files.upload/upload_hint/uploading/
+  // upload_ok/upload_failed/upload_conflict/upload_too_large + delete/
+  // delete_confirm_title/delete_confirm_body/delete_cancel/delete_ok/
+  // delete_failed/delete_needs_file + err_conflict/err_confirm_required ——
+  // 文件浏览器上传/删除的文案与错误映射; 双语同 commit, INV-09 先例口径,
+  // 键数锚按工作树实测值 699 上调 —— X-3 纪律, 未假设 693/709 基线)。
+  // 715 → 719: issue #169 第1条新增 4 键 (chat.errors.image_missing_data /
+  // image_bad_base64 / image_payload_too_large / image_compress_failed_generic
+  // —— 图片压缩错误映射补齐三码专属文案 + 兜底不再回显裸码; 双语同 commit,
+  // INV-09 先例口径, 键数锚按工作树实测值 719 上调 —— X-3 纪律)。
+  // 719 → 768: issue #164 任务排期新增 49 键 (nav.schedule +
+  // app.subtitle_schedule + chat.team_work_modal.queued_toast +
+  // schedule.* 子树 46 键 (现 43 键 —— btn 7 / form 5 / toast 8;
+  // eb874fd 删 3 死键后, 历史链保留不删史 —— issue #188) —— 分组 3 /
+  // 状态 6 / 优先级 4 / 按钮 8 /
+  // 开关与提示 2 / 倒计时 1 / 列名 2 / cron 徽标 1 / 空态 2 / 表单 6 /
+  // 二次确认 2 / toast 9; 双语同 commit, INV-09 先例口径)。
+  // 768 → 765: issue #164 追加 (排期唯一入口) 删除 3 死键 (schedule.btn.new /
+  // schedule.form.new_title / schedule.toast.created —— 排期页「新建任务」
+  // 入口移除后无任何调用点; 双语同 commit, INV-09 先例口径, 键数锚随合法
+  // 删除同步下调)。
+  // 765 → 766: issue #178 新增 tboard.delivery_failed_badge (列表常驻轮询面
+  // 的「投递失败」徽标文案, 双语同 commit, INV-09 先例口径)。
+  assert(fe.size === 766 && fz.size === 766,
+    `期望 768-3+1=766 键, 实际 en=${fe.size} zh=${fz.size}`)
 })
 
-test('i18n: tboard 子 dict 键集合差集为空 (124+5=129)', () => {
+test('i18n: tboard 子 dict 键集合差集为空 (124+5=129, +1=130)', () => {
   const te = en.tboard, tz = zh.tboard
   const ke = new Set(Object.keys(te)), kz = new Set(Object.keys(tz))
   eq([...ke].filter((k) => !kz.has(k)), [], 'tboard only-in-en')
@@ -130,8 +158,10 @@ test('i18n: tboard 子 dict 键集合差集为空 (124+5=129)', () => {
   // 124 → 129: issue #146 新增 todo_status_working / todo_status_blocked /
   // todo_status_completed / todo_status_failed / todo_status_waiting_sub
   // (双语同 commit)。
-  assert(ke.size === 129 && kz.size === 129,
-    `期望 tboard 129 键, 实际 en=${ke.size} zh=${kz.size}`)
+  // 129 → 130: issue #178 新增 delivery_failed_badge (投递失败徽标文案,
+  // 双语同 commit)。
+  assert(ke.size === 130 && kz.size === 130,
+    `期望 tboard 130 键, 实际 en=${ke.size} zh=${kz.size}`)
 })
 
 test('i18n: 4 个 token 新键双边存在且在 tboard.* 下', () => {
@@ -306,6 +336,32 @@ test('runTokenTitle: 缺失 → token_missing; 有值 → 模板 source 透传',
     estimated_cost_usd: 0.5, captured: 1, missing: 2, source: 'partial' })
   const opts = JSON.parse(out.split('|').slice(1).join('|'))
   eq(opts.total, 1801); eq(opts.cost, '$0.50'); eq(opts.source, 'partial')
+})
+
+// ═════════ E. issue #178 / #188 守护 (s6) ═════════
+test('issue #178: tboard.delivery_failed_badge 双边存在且非空', () => {
+  for (const [loc, dict] of [['en', en], ['zh-cn', zh]]) {
+    const v = dict.tboard && dict.tboard.delivery_failed_badge
+    assert(typeof v === 'string' && v.length > 0,
+      `${loc}.tboard.delivery_failed_badge 缺失或为空`)
+  }
+})
+test('issue #178: TasksBoardView 消费 current_card_delivery_failed (可选链读法)', () => {
+  // 徽标必须挂在列表常驻轮询面 (CurrentTaskCard), 数据源来自
+  // team_work_active.current_card_delivery_failed; 空态安全要求可选链
+  // 读法 (active?.current_card_delivery_failed), 不得直接解引用。
+  assert(src.includes('active?.current_card_delivery_failed'),
+    'TasksBoardView.jsx 未以可选链消费 active?.current_card_delivery_failed')
+  assert(src.includes("t('tboard.delivery_failed_badge')"),
+    'TasksBoardView.jsx 未渲染 delivery_failed_badge 徽标文案')
+})
+test('issue #188: 键数注释链含 schedule.* 现值口径「现 43 键」', () => {
+  // MV-188-a: 若注释被改回「46」而删掉现值括注, 本守护转红。
+  // 历史链 719→768→765→766 保留不删史, 只要求现值括注在位。
+  const self = readFileSync(new URL('./test_issue58_tokens.mjs',
+    import.meta.url), 'utf8')
+  assert(/schedule\.\* 子树 46 键 \(现 43 键 —— btn 7 \/ form 5 \/ toast 8/.test(self),
+    '注释链缺少「现 43 键 —— btn 7 / form 5 / toast 8」现值括注 (issue #188)')
 })
 
 // ── runner ──────────────────────────────────────────────────────────

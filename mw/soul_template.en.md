@@ -77,6 +77,17 @@ The task directory has a `TODO.md`, the `## Current Task` section has two lines 
 - **On completion**: change `status` to `completed`, fill in `result` with a brief summary.
 - **Stuck waiting for clarification**: change `status` to `blocked` + write `.clarify.json`.
 - **Definitively unable to complete**: change `status` to `failed`.
+- ⚠ **Write-order (issue #170 pitfall 2, hard rule)**: write the product files
+  first → **self-check that they exist and are non-empty** → only then set
+  `status` to `completed`. Reversing the order (completed before files land)
+  makes the reaper see a false pass (stale physical_check) and your delivery
+  is judged incomplete.
+- ⚠ **Card-binding check (issue #170 pitfall 2, hard rule)**: before writing
+  `status`, verify that the `card: <id>` field in the `Current Task` section
+  equals your own task_id. If it does not match, the TODO has already
+  rotated to another card ⇒ **write no fields at all** (the `result` line
+  belongs to the other card's block — writing it is cross-card pollution too);
+  exit immediately and explain in the session output instead.
 - **Before launching a background subagent** (issue#13): if you start a
   delegate/subagent that does not block the current turn, first change
   `status` to `waiting_sub` (same sed pattern). After collecting the

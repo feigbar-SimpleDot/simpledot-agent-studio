@@ -405,6 +405,125 @@ CREATE TABLE task_resume_requests (
 > edit status / result two lines") replaces cryptographic verification,
 > to avoid the ContractTampered deadlock.
 
+### 4.3 Inbox task queue store (self-built, `/mw_data/schedule.db`)
+
+Second self-built store, introduced by issue #164. It holds the
+cross-restart state of the inbox task queue — the console tab was
+renamed from "Task schedule" to "Inbox" on 2026-10-31 (issue #141 /
+the O-batch rename), and the store itself is unchanged by that rename
+(the countdown itself stays in engine memory and is recomputed after a
+restart — see §4.4).
+
+Path: `${MW_HOME}/schedule.db`; `MW_SCHEDULE_DB` overrides it (same env
+style as `MW_LEDGER_DB`, both optional). The store is created
+idempotently by `ScheduleStore` (mkdir of the parent directory plus a
+one-time `ensure_schema()` that runs the DDL below and seeds the switch
+row), so no deployment step is required — the file and its tables appear
+on first use. The schema is created **once**, not on every connection:
+read and write connections are separate (issue #183 — see the connection
+discipline below).
+
+```sql
+-- one queued schedule task
+CREATE TABLE IF NOT EXISTS schedule_tasks (
+    id           TEXT PRIMARY KEY,
+    title        TEXT NOT NULL,
+    detail       TEXT NOT NULL,
+    priority     TEXT NOT NULL DEFAULT 'normal'
+                 CHECK(priority IN ('urgent','high','normal','low')),
+    status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK(status IN ('pending','paused','running','done','cancelled')),
+    added_at     REAL NOT NULL,
+    executed_at  REAL,
+    added_by     TEXT NOT NULL DEFAULT '',
+    workflow     TEXT NOT NULL DEFAULT 'auto',
+    workspace    TEXT NOT NULL DEFAULT '',
+    session_id   TEXT,
+    run_id       TEXT,
+    last_error   TEXT,
+    updated_at   REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sched_status_added
+    ON schedule_tasks(status, added_at DESC);
+
+-- key/value settings (the only key today: auto_execute_enabled)
+CREATE TABLE IF NOT EXISTS schedule_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+```
+
+Connection discipline matches the ledger store on the shared pragmas
+(`timeout=30`, `PRAGMA busy_timeout=30000`), but the schedule store
+separates reads from writes (issue #183). `ensure_schema()` applies the
+DDL and the seed row idempotently **once**, guarded by an in-process
+lock with a double check, so a concurrent first use (the ticker thread
+and an API thread in the same process) creates the schema exactly once;
+a read-only probe (`sqlite_master` plus the seed row) decides whether
+the schema is ready. A **read connection** issues only `SELECT` plus the
+read-only busy-timeout pragma — no DDL, no seed insert, no commit, and
+no `PRAGMA journal_mode=WAL` (that pragma is itself a write). A **write
+connection** ensures the schema first, then sets the busy timeout and
+WAL; WAL is fixed when the database is first created, so read
+connections never set it. The seed row `auto_execute_enabled='1'` is
+inserted with `INSERT OR IGNORE`, so the auto-execute switch defaults to
+**on** and survives restarts.
+
+State machine (every transition is a conditional `UPDATE` with the
+expected source status in the `WHERE` clause, so a concurrent change
+loses the race instead of corrupting the row — the API then answers
+`409`):
+
+- `pending -> paused` (pause)
+- `paused -> pending` (resume)
+- `pending|paused -> cancelled` (cancel)
+- `cancelled ->` deleted (delete; only a cancelled row may be deleted)
+- `paused ->` paused (the update endpoint rewrites the fields and
+  **keeps** the row paused)
+- `pending -> running` (the engine takes the head of the queue; the
+  queue order is `added_at DESC`, i.e. the most recently added pending
+  task goes first, and the take is a two-step select + conditional
+  update, so two engines cannot take the same row)
+- `running -> done` (the run finished)
+- `running -> pending` (the trigger failed; `last_error` is recorded)
+
+Editing a task is allowed **only** in the `paused` state; a delete is
+allowed **only** in the `cancelled` state — both rejected with `409`.
+
+### 4.4 Schedule countdown state (in memory, not persisted)
+
+The countdown is deliberately **not** in `schedule.db`: it is engine
+state (`ScheduleEngine.countdown_ends_at`) guarded by an in-process
+lock, so it disappears on restart while the queued tasks themselves
+survive (§4.3).
+
+The ticker (a daemon thread, one tick per second) starts the countdown
+only while the trigger condition holds: auto-execute **on** ∧ at least
+one `pending` task ∧ no active Team Work run ∧ the gateway probe reports
+itself free. When the condition stops holding the countdown is
+cancelled (not paused); when it holds again a **new** countdown starts.
+The length is five minutes (`COUNTDOWN_S = 300`).
+
+The gateway probe result is cached for three seconds so a blocked probe
+cannot stall the ticker; the cache timestamp is taken **after** the probe
+returns, not before it starts (issue #180), so a probe that takes longer
+than the TTL still fills the cache instead of leaving it permanently
+stale. The probe reports three distinct busy reasons — `gateway_busy`
+(the gateway is busy **or** reports active agents), `gateway_probe_unavailable`
+(the probe itself failed) and "not busy" — and they never overwrite each
+other (issue #181); the `busy_reason` enumeration is registered in
+§11.7.
+
+Turning the auto-execute switch off cancels the countdown; turning it
+back on explicitly zeroes it (`restart_countdown`) so the next tick
+starts a **full** five-minute countdown instead of resuming the
+remaining time of the previous one. A process restart therefore
+restarts the countdown from the beginning.
+
+Two trigger sources exist — the countdown expiring and the run-now
+button — and they share one fire lock (`_fire_lock`), so exactly one run
+can be started per countdown even when both fire at the same moment.
+
 ---
 
 ## 5. Reaping flow (session anchor + TODO.md status driven)
@@ -430,8 +549,15 @@ worker writes TODO.md protocol status = completed / blocked / failed (atomic ren
   +-- polling fallback (15s) - fsnotify miss / file delete-rebuild repair path
   |     +-- reap_once() full logic retained (unchanged)
   |
-  +-- stuck detection (5min) - replaces the original 30min threshold
-  |     +-- PENDING hanging > 5min -> actively chat-wake main
+  +-- stuck detection (deployment env MW_REAPER_STUCK_MIN; main_entry.sh
+  |     default 10min) - replaces the original 30min threshold
+  |     +-- PENDING hanging beyond the threshold -> actively chat-wake main
+  |
+  |     Threshold sources (three built-in defaults, do NOT assume they agree):
+  |       deploy/main_entry.sh  -> MW_REAPER_STUCK_MIN default 10 (deployment)
+  |       mw/cli.py             -> setdefault 5 (CLI-only launch path)
+  |       mw/reaper.py          -> built-in fallback 30 (no env at all)
+  |     The deployment value is authoritative: 10min.
   |
   +-- relay: chat POST worker_report to task_initiators.session_id
        -> wake main LLM to start a turn
@@ -460,7 +586,7 @@ faster exposed the fundamental flaw of the original design:
 |---|---|---|---|
 | **fsnotify primary path** | 100ms-level | mtime change triggers reap+relay | not stuck fallback |
 | **Polling fallback** | 15s | fsnotify miss-event fix / file rebuild | not real-time notification |
-| **stuck detection** | 5min fallback | PENDING hang wakes main | not completion notification |
+| **stuck detection** | `MW_REAPER_STUCK_MIN` fallback (deployment default 10min; `mw/cli.py` setdefault 5; `mw/reaper.py` built-in 30) | PENDING hang wakes main | not completion notification |
 
 **Dependency**: `watchdog` Python package (Linux `inotify` / macOS
 `FSEvents`). Add to the main container image's dependency list;
@@ -470,6 +596,18 @@ faster exposed the fundamental flaw of the original design:
 `team_work_runs.project_workspace` is the fsnotify subscription root
 (only ACTIVE runs have a watcher). Release the watcher when the run
 closes.
+
+> **TODO.md path resolution (issue #174 + REVIEW-O F-1 ruling,
+> 2026-10-31)**: reaper and harvest resolve a card's TODO.md through
+> the single implementation `mw/harvest.py::todo_path_for`. Project
+> cards (workspace path contains `/.tasks/` after `_map_path`) take
+> `product_workspace/TODO.md` first; **non-project cards take the
+> workspace-root TODO.md as the authoritative source, with
+> `product_workspace/TODO.md` only as a fallback** — the reaper's
+> status source for non-project cards is deliberately unchanged from
+> the pre-#174 behaviour (the "shape D" state flip introduced by the
+> first #174 landing was reverted by the F-1 ruling; do not re-promote
+> `product_workspace` to unconditional priority).
 
 **Threading model**: the fsnotify Observer + three daemon threads
 (harvest / relay / stuck) share one `Ledger` connection
@@ -516,9 +654,17 @@ effect when callers like `stuck_notify` explicitly pass an interval
   true 200 (an explicit main-side receipt via `POST /api/relay/confirm`,
   issue #119, is the second legal setter) +
   on failure rollback `last_notified_at=NULL` so backoff can re-dispatch.
-- `notify_dead_until` dead-letter backoff retained (dead-letter after
-  at most 8 retries, `notify_dead_until=1` year); this is a
-  **retry-count gate**, not a real-time gate.
+- `notify_dead_until` dead-letter backoff retained. Two dead-letter paths
+  exist, and they differ in **how many retries** they allow:
+  - **Transient failures** (network jitter / 5xx / 429) dead-letter after
+    **at most 8 retries** (`notify_dead_until` = now + 1 year); this is a
+    **retry-count gate**, not a real-time gate.
+  - **Permanent failures** (HTTP 404 — the target session does not exist:
+    derived sid / reclaimed / closed session) dead-letter on the **first
+    failure** (`notify_attempts` = 1) and additionally emit the
+    `relay.notify_permanent_failure` event with the machine-readable reason
+    `session_not_found` (issue #167). Re-sending to a dead address is
+    pointless, so the retry loop is skipped entirely on this path.
 
 **Second edge check**: the sending thread, after receiving the
 response, **re-queries `should_notify`** — if in the meantime it was
@@ -568,7 +714,34 @@ the exact literal):
 | `blocked` + `.clarify.json` | harvest, NEED_CLARIFICATION |
 | `blocked` without clarify | wait (worker may be writing) |
 | `working` (and other in-progress forms) | no action; on timeout physical reap |
-| missing | wait for start; physical reap after 5min |
+| missing | wait for start; physical reap after 5min (hardcoded 300s in `mw/reaper.py` — a separate timeout from the stuck-detection threshold, which follows the deployment env `MW_REAPER_STUCK_MIN`) |
+
+**Physical acceptance has a freshness dimension (issue #170)**: the
+physical check returns one of three states, not two:
+
+| Physical state | Meaning |
+|---|---|
+| `physical_ok` | every required file exists **and** its mtime is not older than this card's dispatch baseline |
+| `physical_missing` | a required file does not exist |
+| `physical_stale` | the file exists but its mtime predates this card's dispatch baseline (the leftover of an earlier round, or a late write) |
+
+`physical_stale` is strictly distinguished from `physical_missing` (a
+separate i18n reason key, plus `physical_check.stale` / `baseline` /
+`baseline_source` in the worker report). The physical check stays pure
+**evidence** — it never overrides the worker's own `completed` verdict
+(the verdict is still `COMPLETE`, the harvest status is still
+`HARVESTED`); main decides what to do with a stale report.
+
+**Reuse carve-out (F-M-4, issue #170 pitfall 1)**: a stale output file is
+downgraded from "failure" to "warning" when the worker explicitly declares
+the reuse source in the TODO.md `result` field (`复用来源: <path>` /
+`reuse source: <path>`). The declaration is read at harvest time; the
+stale fact is still recorded (`physical_check.stale` stays true) but
+`physical_check.passed` stays true, so a continuation round that reuses the
+previous round's product no longer trips a stable false failure. The
+preferred path is still to refresh the product's mtime before reuse
+(`touch` / rewrite) — the declaration only covers the "the product lives
+elsewhere and cannot be touched" case.
 
 Worker MUST write `working` at start, and `completed` immediately on
 completion (atomic rename: write `.tmp` then `mv`, avoid reaper seeing
@@ -704,7 +877,7 @@ TODO, works, writes `completed` -> reaper scans TODO, harvests ledger
 | Signal | Verification |
 |---|---|
 | (a) TODO.md end state | `completed` + result summary |
-| (b) ledger worker_report | non-empty, verdict=COMPLETE, physical OK |
+| (b) ledger worker_report | non-empty, verdict=COMPLETE, physical OK (`physical_ok` / `physical_missing` / `physical_stale` — the freshness dimension of issue #170; the physical check is evidence only and never overrides the worker's verdict) |
 | (c) kanban card | `done` (main itself verdicts) |
 | (d) main session received relay | chat message delivered, main starts a turn and reads the report |
 
@@ -1036,6 +1209,21 @@ Main LLM reads the notification and decides:
   - chain end -> summarize "done" to the user + POST /api/team-work/<run>/close
 ```
 
+> **Schedule entry note (issue #164)** — the chain above is unchanged, but
+> the **entry edge** now has one more hop. The Team Work dialog no longer
+> calls `createSession` + a run directly: it posts the requirement to
+> `POST /api/schedule/tasks` (queue), and the schedule engine creates the
+> gateway session and streams the first message when the countdown
+> expires (or when the operator hits run-now). From the main session
+> onwards the chain is identical — same `launch` payload, same cards,
+> same `sid` binding, and the dispatch message is built line by line
+> equivalent to the old direct one. In short:
+> `User -> [Enable Team Work -> queue the schedule] -> (countdown
+> expires / run-now) -> createSession -> main session`. The engine
+> never calls `/api/team-work/launch` itself: main still owns the
+> decomposition, the cards and the launch call — only the *timing* of
+> the session creation moved earlier.
+
 Only the shared protocol literals (`- 跳过: 是`, the two `【…】` markers)
 stay Chinese verbatim in every deployment — they are protocol, not copy
 (see §10 hard guarantees). TODO.md field keys follow the deployment
@@ -1078,6 +1266,14 @@ for its own background subagent (issue #13). The reaper gives that state
 its own threshold (`MW_REAPER_SUBAGENT_MIN`; the default lives in
 `mw/reaper.py::_subagent_wait_min`) and its own
 knock text, instead of treating the card as a stuck one.
+
+The card-binding-mismatch alarm has its **own** dedup window
+(`MW_BINDING_EVENT_DEDUP_MIN`; default 30 min, defined in
+`mw/reaper.py::_binding_event_dedup_min`). It deliberately does **not**
+reuse `MW_REAPER_STUCK_MIN`: the stuck threshold has three different
+built-in defaults (deployment `deploy/main_entry.sh` 10 / `mw/cli.py`
+setdefault 5 / `mw/reaper.py` built-in 30), so tying the alarm cadence to
+it made the two drift apart (F-L-hist-1).
 
 ### 11.5 Workflow schema (v2) and registry schema
 
@@ -1166,21 +1362,34 @@ force-skipped by main as an explicit product decision.
 | `/api/workspaces` | GET / POST | list / create project workspaces (allowlist) | frontend |
 | `/api/fs/list` | GET | list one directory level under a project workspace (read-only, allowlist-anchored, 1000-row cap) | frontend |
 | `/api/fs/file` | GET | stream a project file (mode=embed\|open\|download, read-only, symlinks blocked) | frontend |
-| `/api/tasks` | GET | task status (kanban + ledger); the list is a whitelist projection (`result` reduced to a `has_result` boolean, `harvest_log` / `workspace` / `exit_code` / `question` / `options` stripped, `block_kind` kept); `?fields=active` returns the active-run summary only | frontend |
-| `/api/tasks/<id>` | GET | single task detail with the full record (`result` / `harvest_log` / `workspace` / `exit_code`); 404 when the task does not exist | frontend |
+| `/api/fs/upload` | POST | upload one file into a project workspace (base64 JSON body, ≤20 MB, same-name is a 409 reject, `O_EXCL` atomic create; path anchored through the same `_fs_resolve` five-layer chain — see issue #158) | frontend |
+| `/api/fs/delete` | POST | permanently delete one file (not a directory) from a project workspace; requires `"confirm": true` (strict boolean) in the body; hard delete, not recoverable (issue #158) | frontend |
+| `/api/tasks` | GET | task status (kanban + ledger); the list is a whitelist projection (`result` reduced to a `has_result` boolean, `harvest_log` / `workspace` / `exit_code` / `question` / `options` stripped, `block_kind` kept); `?fields=active` returns the active-run summary only and carries the derived boolean `current_card_delivery_failed` (same criterion as the detail `delivery.delivery_failed`, issue #178); each entry additionally carries the two derived delivery booleans `delivery_failed` / `delivery_dead` (auxiliary surface only — issue #167); the active-run summary additionally carries the derived run-level keys `state` / `holder_state` (issue #141 — fail-open `null` when derivation fails, the key is always present) and the `current_card_*` keys are always present with defaults when the current card has no contract row (issue #190) | frontend |
+| `/api/tasks/<id>` | GET | single task detail with the full record (`result` / `harvest_log` / `workspace` / `exit_code`); plus the `delivery` dictionary (`notify_attempts` / `notify_confirmed_at` / `notify_last_failed_at` / `notify_last_error` / `notify_dead_until` / `last_notified_at` + the derived booleans `delivery_failed` / `delivery_dead`); 404 when the task does not exist. **The detail endpoint remains the full delivery-observability surface** (the 5s console polling goes through `?fields=active`, which since issue #178 carries only the derived `current_card_delivery_failed` boolean — the badge surface) — issue #167 | frontend |
 | `/api/heartbeat` | GET | reaper liveness heartbeat (`reaper_alive` + `reaper_heartbeat_age_s`); the liveness rule is identical to the one in `/api/workers` | frontend |
 | `/api/settings` | GET / PUT | public settings | frontend |
 | `/api/compose/generate` | POST | generate worker compose | frontend |
 | `/api/upload` | POST | upload files | frontend |
+| `/api/attachments/image` | POST | server-side image compression for chat attachments (base64 in, compressed data URL + metadata out; long edge 2048 / JPEG q82 / ≤2 MB target, `413` when still too large — never falls back to the raw image; `503 pillow_unavailable` when Pillow is missing — issue #159) | frontend |
 | `/api/gwconfig` | GET | gateway config | frontend |
 | `/api/lang` | GET | deployment language (see §10) | frontend |
 | `/api/w/<path>` | GET/PUT/POST | passthrough to worker gateway | frontend |
+| `/webui` (+ `/webui/<path>`) | GET/POST/PUT/PATCH/DELETE | same-origin reverse proxy to the container-internal hermes-webui (prefix stripped; 302 never followed; SSE passed through line by line; enabled by the `webui_proxy_enabled` settings key > env `WEBUI_PROXY_ENABLED` > auto-detect of `/webui/start.sh`; answers `404 webui proxy disabled` when off) — issue #131 option B | user's browser |
 | `/api/sessions/<sid>/messages` | GET | proxy to the gateway session transcript; with `want`/`before` the console serves a windowed page itself (tail-anchored, cursor `o:<n>`), without those parameters it stays a plain passthrough (the rollback switch) | frontend |
 | `/api/cron/jobs` | GET | list cron jobs plus ticker liveness; the data plane is a JSON bridge to a venv subprocess (the console interpreter cannot import `cron.*`), and `state` is the derived `effective_job_state` | frontend |
 | `/api/cron/jobs/<id>/runs` | GET | recent executions of one job (`?limit=`, clamped to 1..10, default 3) | frontend |
 | `/api/cron/jobs/<id>/pause` | POST | pause one job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
 | `/api/cron/jobs/<id>/resume` | POST | resume one paused job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
 | `/api/cron/jobs/<id>/trigger` | POST | queue one job for the next scheduler tick (action whitelist; next-tick semantics, not a forced fire; 409 on a terminal job) | frontend |
+| `/api/schedule/tasks` | GET / POST | list the schedule queue (GET), pre-ordered server-side (running first, then not-yet-run `pending`+`paused`, then finished+cancelled), plus `next_task_id` (the head of the queue) — the only schedule read surface that carries the whole list; and queue one schedule task (POST, 201): `detail` is required (400), `priority` must be one of `urgent`/`high`/`normal`/`low` (400), the title is derived from the first non-empty line of `detail`, and the write triggers an immediate re-evaluation of the engine — issue #164 | frontend |
+| `/api/schedule/state` | GET | the schedule engine snapshot: the persisted `auto_execute` switch, the countdown block (`active` / `ends_at` / `remaining_s` / `next_task_id` / `next_task_title`, `null` when no countdown is running), the `busy_reason` (`active_run` / `gateway_busy` / `gateway_probe_unavailable` / `null`) and the `running_task_id` — issue #164; the `gateway_busy` reason covers both a busy gateway and a gateway reporting active agents, and the probe-unavailable case is kept distinct (issue #181) | frontend |
+| `/api/schedule/settings` | POST | persist the `auto_execute` switch; turning it **off** cancels the running countdown (the ticker drops it within its next tick, because the trigger condition no longer holds); turning it **on** again explicitly zeroes the countdown and starts a **full** five-minute countdown — it does not resume the remaining time of the previous one — issue #164 | frontend |
+| `/api/schedule/tasks/<id>/update` | POST | edit a queued task; only a `paused` task may be edited (409 otherwise) and the row stays `paused` after the edit; `detail` (400 when blank) and `priority` (400 when invalid) are validated — issue #164 | frontend |
+| `/api/schedule/tasks/<id>/pause` | POST | `pending -> paused`; a task that does not exist is a 404, an illegal transition is a 409 — issue #164 | frontend |
+| `/api/schedule/tasks/<id>/resume` | POST | `paused -> pending` and re-arms the countdown; 404 when the task is gone, 409 on a state conflict — issue #164 | frontend |
+| `/api/schedule/tasks/<id>/cancel` | POST | `pending`/`paused -> cancelled`; 404 when the task is gone, 409 on a state conflict — issue #164 | frontend |
+| `/api/schedule/tasks/<id>/delete` | POST | permanently delete a task; **only** a `cancelled` task may be deleted (409 otherwise, 404 when the task is gone) — issue #164 | frontend |
+| `/api/schedule/run-now` | POST | run the head of the queue right now instead of waiting for the countdown; the server re-checks every condition inside the fire lock (auto-execute off / an active Team Work run / a busy gateway / an unreachable gateway / no active countdown / no pending task — each a 409 with its own reason) so the button cannot double-fire against the ticker — issue #164; the no-pending case carries its own message instead of a generic "operation not allowed" one (issue #179) | frontend |
 | `/health` | GET | health check | monitoring |
 | `/` | GET | serve React UI | user's browser |
 

@@ -37,6 +37,19 @@ After completion (both steps are required; missing either means the coordinator 
      mv '{todo_path}.tmp' '{todo_path}'
 Terminal states must use the canonical English values (completed / failed / blocked); the platform also accepts Chinese variants (已完成/已失败/已阻塞) but English is the standard.
 
+⚠ Write-order (issue #170 pitfall 2, hard rule): write the product files
+first → **self-check that they exist and are non-empty** → only then set
+'status' to completed. Reversing the order (completed before files land)
+makes the reaper see a false pass (stale physical_check) and your delivery
+is judged incomplete.
+
+⚠ Card-binding check (issue #170 pitfall 2, hard rule): before writing
+'status', verify that the 'card: <id>' field in the 'Current Task' section
+equals your own task_id. If it does not match, the TODO has already
+rotated to another card ⇒ **write no fields at all** (the 'result' line
+belongs to the other card's block — writing it is cross-card pollution too);
+exit immediately and explain in the session output instead.
+
 ⚠ Modification boundary (strict):
 - You may **only** change the `status` and `result` lines of `## Current Task`.
 - Do NOT change `goal` / `assignee` / `product_workspace` / `required_files` — those belong to main.
@@ -52,6 +65,10 @@ Terminal states must use the canonical English values (completed / failed / bloc
 - Cannot continue because of missing info / parameters / unclear description / decision needed: STEP 1 — first write `{workspace}/.clarify.json` with `{{"question": "one-sentence description of what main needs to handle"}}` (optional `"options": ["A","B"]`); STEP 2 — then change status to `blocked`, then exit. (clarify file MUST exist before the status flip — when the coordinator sees `blocked` it must be able to read the question immediately. Don't flip status first then write the file later.) Do NOT write the `result` field in this case (leave it for the resume round).
 - Definitively unable to complete: write `.clarify.json` with the reason, then change status to `failed`, then exit.
 - Discover the product was already fully produced by a previous round: do NOT redo it; just exit `completed` with `result` noting the reused path.
+  ⚠ Reuse clause vs the freshness guard (issue #170 pitfall 1 / F-M-4, hard rule): an output file whose mtime is older than this card's dispatch time is judged "stale" (physical_stale). Two legal ways out:
+  (1) Preferred — touch the output file before reusing it (or rewrite it), so its mtime is newer than this card's dispatch baseline;
+  (2) When the file lives elsewhere and cannot be touched — write an explicit line `reuse source: <path>` in the `result` field; the freshness dimension then degrades to a warning instead of a failure (physical_check.stale stays true so main can audit it afterwards).
+  Do neither and the reaper judges the file stale ⇒ this card is wrongly treated as incomplete.
 
 Constraint: do not ask, do not wait for confirmation; just finish the work.
 Your output text doesn't matter; what matters is the files and command results.

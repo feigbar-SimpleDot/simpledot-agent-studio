@@ -71,6 +71,18 @@ def field(led, task_id, col):
         (task_id,)).fetchone()[0]
 
 
+def _events_for(led, task_id):
+    """按 task_id 定向计数 mw_events (issue #163-F6)。
+
+    修复前用 COUNT(*) 全表计数: 断言结果受无关 task 的事件写入干扰
+    (脆性根源)。定向计数把范围收窄到本 task, 断言语义 (回执路径零事件
+    写入) 不变, 但对全库状态免疫。
+    """
+    return led.conn.execute(
+        "SELECT COUNT(*) FROM mw_events WHERE task_id = ?",
+        (task_id,)).fetchone()[0]
+
+
 def sqlite3_cli_shape(db_path, task_id):
     """按 AC 验收口径用独立 sqlite 连接读字段 (模拟 sqlite3 CLI 查询)。"""
     conn = sqlite3.connect(db_path)
@@ -137,21 +149,34 @@ def test_T3_dead_letter_recovery(tmp_path, monkeypatch):
 
 def test_T4_idempotent(tmp_path, monkeypatch):
     """AC-119-5 + AC-157-1: 连续回执两次均成功不抛错, 第二次后确认位仍非空;
-    且回执路径零事件写入 —— mw_events 行数回执前后不变 (#157 观察 1)。"""
+    且回执路径零事件写入 —— 本 task 的 mw_events 计数回执前后不变
+    (#157 观察 1; issue #163-F6: 全表计数改 task_id 定向计数, 免疫无关
+    task 的事件写入)。"""
     led = make_ledger(tmp_path)
     monkeypatch.setattr(console, "LEDGER_DB", led.path)
     seed_card(led, "t_119c")
     # AC-157-1: 把「回执不产生事件」从静态面背书钉到实效。静态背书保留作依据:
     # confirm_delivered (ledger.py:984) 函数体无 emit_event; 全库唯一
     # INSERT INTO mw_events 在 ledger.py:1395 (emit_event 本体, resume 路径),
-    # 不在回执路径上 ⇒ 回执前后行数必须逐字相等。
-    n0 = led.conn.execute("SELECT COUNT(*) FROM mw_events").fetchone()[0]
+    # 不在回执路径上 ⇒ 本 task 的事件计数回执前后必须逐字相等。
+    n0 = _events_for(led, "t_119c")
+    assert n0 == 0, "该场景下本 task 回执前本就无事件 (定向计数下界)"
     r1 = console.api_relay_confirm({"task_id": "t_119c"})
+    assert r1.get("ok") is True and "code" not in r1
+    # issue #163-F6: 可观测行为断言 —— 第一次回执后行实效已落库
+    cols = ("notify_confirmed_at", "notify_attempts", "notify_dead_until",
+            "notify_last_failed_at", "notify_last_error")
+    row_after_first = tuple(field(led, "t_119c", c) for c in cols)
+    assert row_after_first[0] is not None and row_after_first[0] > 0
     r2 = console.api_relay_confirm({"task_id": "t_119c"})
-    assert r1.get("ok") is True and r2.get("ok") is True
-    assert "code" not in r1 and "code" not in r2  # 两次都是成功形态
+    assert r2.get("ok") is True and "code" not in r2  # 两次都是成功形态
     assert field(led, "t_119c", "notify_confirmed_at") is not None
-    n1 = led.conn.execute("SELECT COUNT(*) FROM mw_events").fetchone()[0]
+    # issue #163-F6: 幂等的可观测形态 —— 重复回执后除时间戳外行内容不变
+    # (attempts/dead_until/失败信息保持清零态; 时间戳本身按语义重写, 不比)
+    row_after_second = tuple(field(led, "t_119c", c) for c in cols)
+    assert row_after_second[1:] == row_after_first[1:], (
+        "重复回执不得改变确认位之外的任何字段 (幂等状态位写入)")
+    n1 = _events_for(led, "t_119c")
     assert n1 == n0, "回执是幂等状态位写入, 不得向 mw_events 写事件"
     led.close()
 
@@ -164,25 +189,40 @@ def test_race_window_pinned_current_semantics(tmp_path, monkeypatch):
     走原函数返回行, 回执后重查(第 2 次)返回 None (等价于卡恰被并发删除)。
     现行语义 = ok:true + confirmed_at:null (confirm_delivered 对不存在
     task_id 静默 no-op, 幂等无破坏面); 收紧方案见 console.py 注释块。
+
+    issue #163-F6 加固: 白盒调用次数从 `== 2` 降级为 `>= 2` 下界 (预检 +
+    回执后重查这两次必须发生; 等价重构多查一次不误报, "少查一次"真回归
+    仍转红), 并记录每次调用的 task_id 断言同源 (比裸计数语义化); 竞态形状
+    另以可观测行为补钉: 窗口命中时账本行实效未被动过 (回执 no-op)。
     """
     led = make_ledger(tmp_path)
     monkeypatch.setattr(console, "LEDGER_DB", led.path)
     seed_card(led, "t_119race")
-    calls = {"n": 0}
+    calls: list = []                       # 记录每次 get_contract 的 task_id
     orig_get_contract = Ledger.get_contract
 
     def fake_get_contract(self, task_id):
-        calls["n"] += 1
-        if calls["n"] == 1:
+        calls.append(task_id)
+        if len(calls) == 1:
             return orig_get_contract(self, task_id)  # 预检: 卡还在
         return None  # 回执后重查: 模拟窗口内卡被并发删除
 
     monkeypatch.setattr(Ledger, "get_contract", fake_get_contract)
     r = console.api_relay_confirm({"task_id": "t_119race"})
-    assert calls["n"] == 2, "预检 + 回执后重查, get_contract 应恰被调两次"
+    assert len(calls) >= 2, (
+        "预检 + 回执后重查这两次 get_contract 必须发生 (下界); "
+        "少查一次 = 竞态守护回归")
+    assert set(calls) == {"t_119race"}, (
+        "两次调用必须针对同一 task_id (issue #163-F6: 定向断言)")
     assert r["ok"] is True and r["confirmed_at"] is None, (
         "窗口命中时现行语义为 ok:true + confirmed_at:null;"
         "若本断言转红说明已收紧, 请回读 console.py 竞态注释块再定返回语义")
+    # issue #163-F6: 可观测行为 —— 窗口命中时响应报 null 但 UPDATE 已执行
+    # (confirm_delivered 无条件 UPDATE, 幂等无破坏面) ⇒ 行实效非空且与
+    # 响应口径的偏差正是「登记不收紧」的现行语义形状。
+    assert field(led, "t_119race", "notify_confirmed_at") is not None, (
+        "现行语义: 回执 UPDATE 无条件执行, 行确认位已落库 (响应 null 是"
+        "重查 None 的口径, 不是 no-op)")
     led.close()
 
 

@@ -88,6 +88,15 @@ BILINGUAL_FIELD_ALIASES = {
     "kanban_task_id": ("kanban_task", "kanban_task_id"),
     "卡":       ("kanban_task", "card"),  # 中文 `卡` 同样认, 维持 D1
 }
+# issue #163-F2: 协议键白名单 —— _parse_kv / current_binding 只收协议字段,
+# 非协议键的含冒号行 (如 "12: 普通文本" / "备注: 说明" / "https://x/y")
+# 不再进入 kv ⇒ parse() 不再凭空造出 status=进行中 的 current task。
+# 白名单 = aliases 的 keys ∪ values 的中文侧 (键名经 _canonical_field_key
+# 折算后恒落在中文侧; 并入 keys 是防御性冗余, 折算语义变化时不误伤)。
+_PROTOCOL_FIELD_KEYS = frozenset(
+    set(BILINGUAL_FIELD_ALIASES.keys())
+    | {cn for cn, _en in BILINGUAL_FIELD_ALIASES.values()}
+)
 # 字段名反向表: 中文协议键 → [(中文键, 英文键)]。供 _parse_kv 反查
 # 用, 也供渲染按语言挑选键名。
 _FIELD_CN_KEYS = {cn: (cn, en) for cn, en in BILINGUAL_FIELD_ALIASES.values()}
@@ -348,6 +357,33 @@ def _match_field_line(ln: str) -> "tuple[str, str] | None":
     return m.group(1).strip(), m.group(2).strip()
 
 
+def _find_status_line(section_lines: List[str]) -> "tuple[str, str] | None":
+    """在『当前任务』段内按优先级找状态字段行 (issue #163-F5)。
+
+    优先级口径 (本卡钉死, 四入口同源):
+      1. 规范 bullet 形态 (`- 状态: X` / `* 状态: X` / 缩进 bullet) —— 同类取首行
+      2. no-dash 形态 (裸 `状态: X`) —— 同类取首行
+    同类取首行与 write_status_atomic 的「替换第一处」写面语义同源;
+    规范形态优先于 no-dash, 让陈旧无前缀行不再压过规范行 (修复前
+    parse_status/diagnose 读首行命中 no-dash, 而 current_binding/parse
+    因 dict 后写覆盖读规范行 ⇒ 四入口必然不自洽)。
+
+    ★ 行识别仍走 _match_field_line ⇒ #139-F1 的无冒号短路完好,
+    10 ms 耗时上界机制不受影响 (回归纪律: 不得在此绕过短路)。
+    """
+    fallback = None
+    for ln in section_lines:
+        m = _match_field_line(ln)
+        if not m or _canonical_field_key(m[0]) != "状态":
+            continue
+        s = ln.strip()
+        if s.startswith("- ") or s.startswith("* "):
+            return m                       # 规范形态命中 ⇒ 同类首行立即返回
+        if fallback is None:
+            fallback = m                   # no-dash 形态 ⇒ 暂存, 待规范行扫完
+    return fallback
+
+
 def _is_current_header(raw: str) -> bool:
     """段头字面 raw 是否『当前任务』段头 (中英别名都识别, issue #139)。
 
@@ -363,12 +399,19 @@ def _parse_kv(section_lines: List[str]) -> dict:
 
     issue #139: 行识别收敛到 _match_field_line (缩进 / bullet / 缺 `- `
     前缀容错), 段限定由调用方保证 (全仓唯一调用点只喂当前任务段)。
+
+    issue #163-F2: 只保留**协议键** (折算后过 _PROTOCOL_FIELD_KEYS 白名单)。
+    修复前段内非协议键的含冒号文本行 (`12: 普通文本` / `备注: 说明` /
+    `https://x/y`) 也进 kv ⇒ parse() 凭空造出 status=进行中 的 current
+    task。白名单过滤后 kv 语义 = "协议字段", 与调用方 parse() 的意图对齐。
     """
     out = {}
     for ln in section_lines:
         m = _match_field_line(ln)
         if m:
-            out[m[0]] = m[1]
+            key = _canonical_field_key(m[0])   # 折算到协议键 (issue #163-F2)
+            if key in _PROTOCOL_FIELD_KEYS:    # 非协议键直接丢弃
+                out[key] = m[1]
     return out
 
 
@@ -377,21 +420,31 @@ def _split_sections(text: str) -> dict:
 
     I18N-R3: 段头按 BILINGUAL_HEADER_ALIASES 反查回中文协议字面, 使
     旧调用方 `if CURRENT_HEADER in secs:` 仍命中 (中英段头都识别)。
+
+    issue #163-F3: 段头判定收敛 —— 行先 strip 再判 `## ` 前缀 (缩进段头
+    `  ## 当前任务` 也识别), 『当前任务』的字面判定统一走 _is_current_header
+    (消除 parse 侧的第二份副本; 其余段头仍走 BILINGUAL_HEADER_ALIASES 反查)。
+    段内追加的仍是**原始行** (字段行的缩进/bullet 容错依赖原始行形态)。
     """
     sections = {}
     cur = None
     for ln in text.splitlines():
-        if ln.startswith("## "):
-            raw = ln[3:].strip()
-            # 反查: 中文协议键 或 英文别名 → 中文协议键
-            for cn_key, (zh, en) in BILINGUAL_HEADER_ALIASES.items():
-                if raw == zh or raw == en:
-                    cur = cn_key
-                    break
+        stripped = ln.strip()
+        if stripped.startswith("## "):
+            raw = stripped[3:].strip()
+            if _is_current_header(raw):
+                # 『当前任务』判定收敛到唯一入口 (issue #163-F3 根因)
+                cur = CURRENT_HEADER
             else:
-                cur = raw  # 未知段头保留原样, 不误吃
+                # 反查: 中文协议键 或 英文别名 → 中文协议键
+                for cn_key, (zh, en) in BILINGUAL_HEADER_ALIASES.items():
+                    if raw == zh or raw == en:
+                        cur = cn_key
+                        break
+                else:
+                    cur = raw  # 未知段头保留原样, 不误吃
             sections.setdefault(cur, [])
-        if cur is not None and not ln.startswith("## "):
+        if cur is not None and not stripped.startswith("## "):
             sections[cur].append(ln)
     return sections
 
@@ -456,6 +509,16 @@ def _strip_line_num_prefix(text: str) -> str:
     纯 join 会丢尾部换行, 与 152 守护文件 L194/L296 (钉「无竖线原文逐字
     返回原串」) 冲突, 而 §1.5 要求该文件除 tab 行外全部保持绿 ⇒ 取
     「无任何行被改动 ⇒ 逐字原样返回」的等价写法, 语义严格不宽于纯 join。
+
+    ★ 已知边界 (issue #163-F4, 裁决: 维持现状不收紧): 容错范围
+    `^[ \\t]*\\d+[|\\t]` 会剥掉任何以「数字 + 制表符」开头的**内容行**前缀
+    (如结果值 `2026\\t完成` ⇒ `完成`)。收紧 (要求前缀后紧跟字段行形态)
+    会与 `cat -n` 形态的内容行冲突 —— 该形态与行号前缀在字节层面不可
+    区分。影响面: 仅非状态字段的**值文本**, 不改变任何状态读数。裁决
+    依据: ISSUE-163 F-4 + REQUIREMENTS §3.2 F-4「本批默认维持现状 +
+    登记已知边界」。触发收紧的条件: 出现**值文本被误读导致对外结论翻转**
+    的真实缺陷 (当前无)。钉桩用例: tests/test_issue163_todo_f2_f3.py::
+    test_f4_known_boundary_pinned (将来收紧必转红, 强制走裁决流程)。
     """
     lines = text.splitlines()
     stripped = [_LINE_NUM_PREFIX.sub("", ln) for ln in lines]
@@ -538,6 +601,9 @@ def parse(path: Path) -> Optional[TodoDoc]:
         if kv:
             req_files = [s.strip() for s in kv.get("产出文件", "").split(",")
                         if s.strip()]
+            # issue #163-F5: 状态取值走 _find_status_line 优先级口径
+            # (规范 bullet 行优先于 no-dash 行, 同类取首行), 与其余三入口同源。
+            status_hit = _find_status_line(secs[CURRENT_HEADER])
             doc.current = TodoTask(
                 step_id=kv.get("步骤", ""),
                 title=kv.get("标题", ""),
@@ -545,7 +611,8 @@ def parse(path: Path) -> Optional[TodoDoc]:
                 assignee=kv.get("承接方", ""),
                 product_workspace=kv.get("产物目录", ""),
                 required_files=req_files,
-                status=kv.get("状态", "进行中"),
+                status=(status_hit[1] if status_hit
+                        else kv.get("状态", "进行中")),
                 result=kv.get("结果", RESULT_PLACEHOLDER),
                 # D1 双键名回退: kanban_task 优先, 缺失认 `卡` (本链实际格式)
                 kanban_task_id=(kv.get("kanban_task") or kv.get("卡", "")),
@@ -636,6 +703,11 @@ def parse_status(path: Path) -> str | None:
     issue #139 (2026-10-29): 段内字段行识别收敛到 _match_field_line ——
     缩进 / `*` bullet / 缺 `- ` 前缀 三种形态与 parse / current_binding
     同口径识别 (四入口一致); 容错仍限段内, 状态值仍原样返回。
+
+    issue #163-F5 (2026-10-29): 同段多条状态行的优先级口径 —— 规范 bullet
+    行优先于 no-dash 行, 同类取首行 (见 _find_status_line)。修复前"首行
+    命中"语义让靠前的陈旧 no-dash 行压过后面的规范行, 与 current_binding /
+    parse (dict 后写覆盖 ⇒ 规范行胜出) 相反 ⇒ 四入口不自洽。
     """
     p = Path(path)
     if not p.exists():
@@ -646,20 +718,19 @@ def parse_status(path: Path) -> str | None:
         return None
     text = _strip_line_num_prefix(text)      # issue #152 + #139
     in_current = False
+    section_lines: List[str] = []
     for ln in text.splitlines():
         s = ln.strip()
         if s.startswith("## "):
             in_current = _is_current_header(s[3:].strip())
             continue
-        if not in_current:
-            continue
-        # 双键 + 大小写不敏感: `状态:` / `status:` / `STATUS:` / `sTaTuS:`
-        # 都识别 (§ I18N-R3 M-1, 经 _canonical_field_key 折算)。
-        m = _match_field_line(ln)
-        if m and _canonical_field_key(m[0]) == "状态":
-            v = m[1]
-            return v if v else None
-    return None
+        if in_current:
+            section_lines.append(ln)         # 段外行不收 (T-D 守护保持)
+    hit = _find_status_line(section_lines)   # issue #163-F5 优先级口径
+    if not hit:
+        return None
+    v = hit[1]
+    return v if v else None
 
 
 def write_status_atomic(path: Path, status: str) -> bool:
@@ -812,6 +883,15 @@ def current_binding(path) -> Optional[dict]:
 
     issue #139 (2026-10-29): 字段行识别收敛到 _match_field_line, 与
     parse_status 同口径 (缩进 / bullet / 缺 `- ` 前缀 段内容错)。
+
+    issue #163-F2 (2026-10-29): kv 收集同样过 _PROTOCOL_FIELD_KEYS 白名单
+    —— 本函数**不走** _parse_kv, 只改 _parse_kv 修不到这里 (ISSUE-163 建议
+    修法没写全的一步)。修复前段内非协议键冒号行会造出全空串 dict (verify
+    reason 由 todo_missing 变 no_binding); 修复后无协议键 ⇒ raw_kv 空 ⇒
+    None ⇒ todo_missing, 与 parse() 侧同步回到 fail-closed 原语义。
+
+    issue #163-F5 (2026-10-29): status 取值走 _find_status_line 优先级口径
+    (规范 bullet 行优先于 no-dash 行, 同类取首行), 与其余三入口同源。
     """
     p = Path(path)
     if not p.exists():
@@ -826,6 +906,7 @@ def current_binding(path) -> Optional[dict]:
     text = _strip_line_num_prefix(text)      # issue #152 + #139
     in_current = False
     raw_kv: dict = {}
+    section_lines: List[str] = []
     for ln in text.splitlines():
         s = ln.strip()
         if s.startswith("## "):
@@ -837,20 +918,24 @@ def current_binding(path) -> Optional[dict]:
             continue
         if not in_current:
             continue
+        section_lines.append(ln)
         m = _match_field_line(ln)
         if m:
-            raw_kv[m[0]] = m[1]
+            key = _canonical_field_key(m[0])   # 折算到协议键 (issue #163-F2)
+            if key in _PROTOCOL_FIELD_KEYS:    # 非协议键直接丢弃
+                raw_kv[key] = m[1]
     if not raw_kv:
         return None
     # 键名归一化到中文协议键 (BILINGUAL_FIELD_ALIASES)
     kv = _normalize_kv(raw_kv)
+    status_hit = _find_status_line(section_lines)   # issue #163-F5 优先级口径
     return {
         "step_id": kv.get("步骤", ""),
         # D1 加 kanban_task_id 英文别名: 三键同源, 优先级 kanban_task > kanban_task_id > 卡
         "kanban_task": (kv.get("kanban_task")
                         or kv.get("kanban_task_id")
                         or kv.get("卡", "")),
-        "status": kv.get("状态", ""),
+        "status": (status_hit[1] if status_hit else kv.get("状态", "")),
         "title": kv.get("标题", ""),
     }
 
@@ -933,20 +1018,21 @@ def diagnose(path) -> dict:
     text = _strip_line_num_prefix(text)
     in_current = False
     seen_current = False
+    section_lines: List[str] = []
     for ln in text.splitlines():
         s = ln.strip()
         if s.startswith("## "):
             in_current = _is_current_header(s[3:].strip())
             seen_current = seen_current or in_current
             continue
-        if not in_current:
-            continue
-        m = _match_field_line(ln)
-        if m and _canonical_field_key(m[0]) == "状态":
-            v = m[1]
-            if not v or normalize_status(v) is None:
-                return {"status": v or None, "reason": "unrecognized_value"}
-            return {"status": v, "reason": "ok"}
+        if in_current:
+            section_lines.append(ln)         # 段外行不收 (与 parse_status 同形)
+    hit = _find_status_line(section_lines)   # issue #163-F5 优先级口径
+    if hit:
+        v = hit[1]
+        if not v or normalize_status(v) is None:
+            return {"status": v or None, "reason": "unrecognized_value"}
+        return {"status": v, "reason": "ok"}
     if not seen_current:
         return {"status": None, "reason": "no_current_section"}
     return {"status": None, "reason": "no_status_line"}

@@ -52,6 +52,12 @@ import time
 from pathlib import Path
 
 from .harvest import harvest
+# issue #170 坑 3 (2026-10-30): 收割前卡绑定校验的纯函数放在 harvest.py
+# (reaper → harvest 是既有单向依赖, 无循环导入风险)。
+from .harvest import verify_card_binding_for_harvest
+# issue #174 (2026-10-31): TODO.md 路径定位的单一实现也放 harvest.py,
+# reaper 三处调用全部委托, 与 harvest 同源 (容器路径映射下不再分叉)。
+from .harvest import todo_path_for
 from .i18n import t as _t
 from .ledger import Ledger
 from .todo import (
@@ -92,33 +98,19 @@ def _todo_path_for_task(workspace: str | None, ledger_row=None,
                         contract: dict | None = None) -> str | None:
     """解析任务对应的 TODO.md 路径。
 
+    issue #174 (2026-10-31): 实现已上收到 mw.harvest.todo_path_for
+    (reaper/harvest 唯一同源, 口径: 项目卡 (workspace 含 /.tasks/) pw →
+    _map_path 优先 → .tasks 切分; 非项目卡 workspace 根优先, pw 仅兜底
+    —— REVIEW-O §F-1 分歧口径), 本函数退为薄委托, 签名不变。
+
     布局约定 (1A, 2026-10-03):
       - 项目任务: TODO.md 在 **项目根** <project>/TODO.md;
         task workspace 是 <project>/.tasks/<task_id> (worker scratch)。
-        → 从 /.tasks/ 切出项目根, TODO.md 在项目根。
       - 非项目任务: workspace 即任务目录, TODO.md 在 workspace 根。
       - 兜底: contract.product_workspace/TODO.md。
     """
-    if not workspace:
-        return None
-    # 项目任务: workspace 形如 <project>/.tasks/<task_id>
-    # TODO.md 在项目根 (worker 改的就是项目根那份), 不在 .tasks 子目录
-    if "/.tasks/" in workspace:
-        project_root = workspace.split("/.tasks/")[0]
-        return str(Path(project_root) / "TODO.md")
-    if workspace.rstrip("/").endswith("/tasks"):
-        # /share_workspace/tasks/<id> 平铺: TODO.md 在 workspace 根
-        return str(Path(workspace) / "TODO.md")
-    # project workspace 直接传入 (无 .tasks 段): workspace 根即项目根
-    p = Path(workspace) / "TODO.md"
-    if p.exists():
-        return str(p)
-    # 兜底: contract 里的 product_workspace
-    if contract:
-        pw = contract.get("product_workspace")
-        if pw:
-            return str(Path(pw) / "TODO.md")
-    return str(p)
+    pw = contract.get("product_workspace") if contract else None
+    return todo_path_for(workspace, pw, contract)
 
 
 def _read_todo_status(workspace: str | None, ledger_row=None,
@@ -133,6 +125,173 @@ def _read_todo_status(workspace: str | None, ledger_row=None,
     if not p:
         return None
     return parse_status(p)
+
+
+# ── issue #170 坑 3: 收割前卡绑定校验 (2026-10-30) ────────────────
+def _check_card_binding(task_id: str, contract: dict | None,
+                        workspace: str | None) -> tuple[bool, dict]:
+    """收割前卡绑定校验 (issue #170 坑 3)。返回 (ok, detail)。
+
+    判据: TODO.md『当前任务』段的『卡: <id>』必须 == 本卡 task_id。
+    复用 mw.harvest.verify_card_binding_for_harvest (纯读零副作用,
+    mw.todo.verify_current_task_binding 的窄化包装)。
+
+    窄化 (fail-open 于"无法判定", fail-closed 于"明确冲突"):
+      - mismatch (绑定**明确指向他卡**) ⇒ 拒收 (真污染)
+      - todo_missing / no_binding (判不出绑定) ⇒ 放行 (不误杀正常卡)
+      - 校验异常 ⇒ 放行 (fail-open, 绝不可卡死收割)
+
+    TODO.md 路径定位走 todo_path_for 单一实现 (issue #174: 与 harvest
+    同源; 口径 = 项目卡 pw 优先 / 非项目卡 workspace 根优先, pw 兜底 ——
+    REVIEW-O §F-1 分歧口径)。
+    """
+    try:
+        contract = contract or {}
+        todo_path = todo_path_for(workspace, contract.get("product_workspace"),
+                                  contract)
+        return verify_card_binding_for_harvest(task_id, todo_path)
+    except Exception as e:
+        # fail-open: 校验本身出错 ⇒ 放行 (宁可漏抓, 不可卡死收割)
+        return True, {"reason": "check_error", "card_binding": "unknown",
+                      "error": str(e)[:120]}
+
+
+def _binding_event_dedup_min() -> int:
+    """卡绑定冲突告警的降频窗口 (分钟)。F-L-hist-1 (2026-10-30)。
+
+    **独立 env, 不再隐式依赖 MW_REAPER_STUCK_MIN** —— 该阈值有三个互不相同
+    的内置默认值 (部署 main_entry.sh 10 / cli.py setdefault 5 / reaper.py
+    内置兜底 30), 让「事件去重窗口」随 stuck 阈值漂移, 是 F-L-hist-1 判定的
+    失同步根源。本卡把该窗口独立出来:
+
+      - env: MW_BINDING_EVENT_DEDUP_MIN (默认 30 分钟)
+      - 非法值 ⇒ 回落 30 (与既有 env 容错口径一致)
+
+    部署面: deploy/main_entry.sh 不设该 env ⇒ 走内置默认 30 ⇒ 与
+    旧注释口径一致 (不再随 MW_REAPER_STUCK_MIN 漂到 10/5)。
+    """
+    v = os.environ.get("MW_BINDING_EVENT_DEDUP_MIN", "")
+    try:
+        n = int(v) if v else 30
+    except (TypeError, ValueError):
+        return 30
+    return n if n > 0 else 30
+
+
+def _binding_mismatch_event_suppressed(ledger, task_id: str) -> bool:
+    """P2-1 (s8 审查回流): harvest.card_binding_mismatch 事件去重。
+
+    mismatch 持续时卡不收割、TODO 不变 ⇒ 每轮 reap (15s) 都重发一条
+    事件, 240 条/小时刷屏 (knock 有 should_notify 去重, 事件面原来没有)。
+    口径: 窗口内已有同卡 mismatch 事件 ⇒ 本次静默 —— 首报全量、后续降频,
+    窗口 = MW_BINDING_EVENT_DEDUP_MIN 分钟 (独立 env, 默认 30min;
+    F-L-hist-1: 原先隐式复用 MW_REAPER_STUCK_MIN, 而该阈值有三个互不相同
+    的内置默认值 (部署侧 10 / cli.py setdefault 5 / 内置兜底 30) ⇒ 口径漂移)。
+    查询异常 ⇒ False (fail-open: 宁可多发, 不可丢告警信号)。
+    """
+    try:
+        window = _binding_event_dedup_min() * 60
+        cur = ledger.conn.execute(
+            "SELECT MAX(created_at) AS last_at FROM mw_events "
+            "WHERE task_id=? AND event_type='harvest.card_binding_mismatch'",
+            (task_id,)).fetchone()
+        last_at = cur["last_at"] if cur else None
+        if last_at is None:
+            return False
+        return (time.time() - float(last_at)) < window
+    except Exception:
+        return False
+
+
+def _card_binding_knock_suppressed(ledger, task_id: str, window_s: float) -> bool:
+    """卡绑定 mismatch 敲门的去重判定 (issue #173, 2026-10-31)。
+
+    与 _binding_mismatch_event_suppressed 同型的事件窗口: 最近一条
+    harvest.card_binding_mismatch_notified 事件落在 window_s 内 ⇒ 跳过本次
+    敲门。刻意**不看** should_notify —— 后者在 notify_dead_until 死信期恒
+    False, 会让「死信卡 + 绑定污染」的敲门被静默吞掉 (#173 根因)。
+    查询异常 ⇒ False (fail-open: 宁可多敲, 不可丢告警)。
+    """
+    try:
+        cur = ledger.conn.execute(
+            "SELECT MAX(created_at) AS last_at FROM mw_events "
+            "WHERE task_id=? AND event_type="
+            "'harvest.card_binding_mismatch_notified'",
+            (task_id,)).fetchone()
+        last_at = cur["last_at"] if cur else None
+        if last_at is None:
+            return False
+        return (time.time() - float(last_at)) < window_s
+    except Exception:
+        return False
+
+
+def _knock_main_card_binding_mismatch(task_id: str, ledger, results: list,
+                                       detail: dict,
+                                       registry: dict | None = None):
+    """卡绑定冲突时敲门叫醒 main (issue #170 坑 3, AC4 明文要求)。
+
+    复用既有 _send_to_main (reaper.py:566) 通道; sid = ledger.get_initiator
+    (task_id) ⇒ 无 initiator ⇒ 退化为"只留痕不敲门"。
+
+    ⚠ notify_task=None: 敲门失败**不应**走 relay 的 notify 计数 (那是
+    "报告投递"通道的账) ⇒ 传 None ⇒ _send_to_main 的失败分支不污染
+    relay 计数。**但** ⇒ 失败无留痕 ⇒ 显式记一条
+    harvest.card_binding_knock_failed 事件。
+
+    ⚠ 去重 (issue #173, 2026-10-31): 与 relay 死信解耦 —— 旧版用
+    should_notify 去重, 而它在 notify_dead_until 死信期恒 False ⇒ 死信卡
+    同时发生绑定污染时 main 收不到敲门。改用与
+    _binding_mismatch_event_suppressed 同型的事件窗口: 查最近一条
+    harvest.card_binding_mismatch_notified 事件, 窗口内 (MW_REAPER_STUCK_MIN
+    *60) ⇒ 跳过; 不看 dead_until。mark_notified 保留 (无害, 维持
+    last_notified_at 观测面)。
+
+    ⚠ 文案: 硬编码中文 (与既有【mw 敲门】系列同口径), 不走 i18n,
+    避免 mw/i18n 键面扩大。
+    """
+    try:
+        gw = os.environ.get("MW_GATEWAY_URL", "http://127.0.0.1:8642")
+        key = os.environ.get("API_SERVER_KEY", "")
+        if not key:
+            return
+        sid = ledger.get_initiator(task_id)
+        if not sid:
+            return  # 无 initiator ⇒ 只留痕不敲门
+        # 去重 (issue #173): 事件窗口 —— 最近一条 mismatch_notified 事件在
+        # 窗口内 ⇒ 跳过。不看 should_notify (死信期恒 False 会吞掉敲门)。
+        threshold = int(os.environ.get("MW_REAPER_STUCK_MIN", "30")) * 60
+        if _card_binding_knock_suppressed(ledger, task_id, threshold):
+            return
+        actual = detail.get("actual_kanban_task")
+        msg = (f"【mw 敲门】任务 {task_id} 的 TODO.md『当前任务』绑定的"
+               f"『卡:』是 {actual!r}, 与本卡 task_id 不符 —— 疑似上一张卡"
+               f"的 worker 迟到收尾写污染。本轮**未收割** ("
+               f"SKIP_CARD_BINDING_MISMATCH), 请人工核对 TODO.md 轮转状态"
+               f" 后决定 resume / re-route / cancel。")
+        _send_to_main(sid, msg, gw, key, ledger.path,
+                     registry=registry, notify_task=None,
+                     knock_ctx={"task_id": task_id})
+        try:
+            ledger.mark_notified(task_id)
+        except Exception:
+            pass
+        ledger.emit_event("harvest.card_binding_mismatch_notified", task_id,
+                          {"notified_session": sid,
+                           "actual_kanban_task": actual})
+        results.append({"task_id": task_id,
+                       "trigger": "card_binding_mismatch_notify",
+                       "verdict": "NOTIFIED"})
+    except Exception as e:
+        # 敲门失败 ⇒ 显式留痕 (notify_task=None ⇒ 不进 relay 计数)
+        try:
+            ledger.emit_event("harvest.card_binding_knock_failed", task_id,
+                              {"error": str(e)[:150]})
+        except Exception:
+            pass
+        results.append({"task_id": task_id,
+                       "trigger": "card_binding_mismatch_notify",
+                       "verdict": "ERROR", "error": str(e)[:150]})
 
 
 def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, results):
@@ -213,6 +372,39 @@ def _reap_one_task(row, ledger, hermes_home, base, grace_seconds, registry, resu
             ledger.conn.commit()
         except Exception:
             pass
+
+    # ★ issue #170 坑 3 + s8 审查 P2-2 (2026-10-30): 收割前卡绑定校验
+    #   提到三个终态分支 (completed / failed / blocked) 的公共入口。
+    #   迟到写污染 ⇒ reaper 假收割: 上张卡的 worker 把终态写进**当前卡**
+    #   块 ⇒ 收割的其实是上一张卡的活。P2-2: 迟到写同样可写 failed /
+    #   blocked(+.clarify.json), 只守 completed 路径防御不完整。
+    #   判据 = TODO.md『当前任务』段的『卡: <id>』== 本卡 task_id;
+    #   不匹配 ⇒ 不收割 + 账本留痕 + 敲门告警。
+    #   窄化判据: 只对「明确冲突 (mismatch)」拒收; 判不出
+    #   (todo_missing / no_binding) 一律放行 —— 否则会误杀历史卡与
+    #   本链自身正在跑的卡 (本链正被 reaper 收割!)。
+    #   边界: 纯读零副作用; 异常一律 fail-open (放行, 不卡死收割)。
+    #   注: 校验先于 _stale_marker_guard —— 绑定污染比 marker 串扰更根本,
+    #   两者同时命中时以 SKIP_CARD_BINDING_MISMATCH 定性。
+    if norm in (STATUS_COMPLETED, STATUS_FAILED, STATUS_BLOCKED):
+        bind_ok, bind_detail = _check_card_binding(task_id, contract, ws)
+        if not bind_ok:
+            trigger = {STATUS_COMPLETED: "todo_completed",
+                       STATUS_FAILED: "todo_failed",
+                       STATUS_BLOCKED: "todo_blocked"}[norm]
+            # P2-1: mismatch 持续时每轮 reap 都会走到这里 ⇒ 事件去重,
+            # 窗口内只首报一次 (敲门侧本就有 should_notify 去重)。
+            if not _binding_mismatch_event_suppressed(ledger, task_id):
+                ledger.emit_event("harvest.card_binding_mismatch", task_id,
+                                  dict(bind_detail))
+            results.append({"task_id": task_id, "trigger": trigger,
+                           "verdict": "SKIP_CARD_BINDING_MISMATCH",
+                           "note": (f"TODO.md『卡:』={bind_detail.get('actual_kanban_task')} "
+                                    f"≠ 本卡 {task_id} ({bind_detail.get('reason')}), "
+                                    f"拒绝假收割")})
+            _knock_main_card_binding_mismatch(task_id, ledger, results,
+                                               bind_detail, registry)
+            return          # 不收割
 
     if norm == STATUS_COMPLETED:
         ok, why = _stale_marker_guard()
@@ -563,9 +755,33 @@ def _relay_backoff_cap_s() -> float:
     return max(cap, timeout_s + 1.0)
 
 
+def _gateway_route_healthy(gw: str, key: str):
+    """死信前网关路由探测 (issue #171, 2026-10-31)。返回 True/False/None。
+
+    GET {gw}/api/sessions (timeout 5s):
+      - 任意非 404 响应 (2xx / 401 等) ⇒ True: 路由在, 404 属会话级
+      - 404 ⇒ False: base URL / 路由整体错配
+      - 连接失败 / 超时 ⇒ None: 不可判定 (调用方保守走旧死信)
+    """
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(
+        f"{gw}/api/sessions", method="GET",
+        headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = getattr(r, "status", None) or r.getcode()
+            return status != 404
+    except urllib.error.HTTPError as e:
+        return e.code != 404
+    except Exception:
+        return None
+
+
 def _send_to_main(sid: str, msg: str, gw: str, key: str, db_path: str,
                  registry: dict | None = None,
-                 notify_task: str | None = None):
+                 notify_task: str | None = None,
+                 knock_ctx: dict | None = None):
     """把消息以 chat POST 到 main session, 后台线程发送不阻塞调用方。
 
     2026-10-04 修订 (commit 2 / design.md §5.0.1):
@@ -743,6 +959,117 @@ def _send_to_main(sid: str, msg: str, gw: str, key: str, db_path: str,
                                 "WHERE task_id=?",
                                 (time.time() + 30, t))
                             led.conn.commit()
+                        finally:
+                            led.close()
+                    except Exception:
+                        pass
+                return
+            # ★ issue #167: 404 = 目标会话不存在 (派生 sid / 已回收 / 已关闭
+            # 会话) ⇒ **永久性失败**。重投同一个死地址无意义 —— 旧版与网络
+            # 抖动走同一条指数退避, 要 8 次 (约 2.7h) 才进死信, 期间 main
+            # 侧零信号 (实案: 派生 sid 投递 404 静默卡死, 两边都不管)。
+            # 修法: 首次 404 即死信 (窗口与既有 8 次死信同量级 = 1 年,
+            # 不改变死信量级, 只是不再白耗 8 次退避), 并 emit 语义化事件
+            # relay.notify_permanent_failure, 让账本直接回答「为什么没送达、
+            # 下一步该谁做」。临时失败 (网络抖动 / 5xx) 的指数退避路径逐字
+            # 不动 (下方既有分支)。
+            if code == 404:
+                if t:
+                    # issue #171 (2026-10-31): 死信前一次网关路由探测 ——
+                    # 区分「目标会话不存在」(会话级 404, 首败即死信语义
+                    # 不变) 与「网关整体 404」(MW_GATEWAY_URL 配错 / 路由
+                    # 未就绪, 全路径 404)。后者死信会把配置错误永久静音,
+                    # 改按临时失败退避 (dead_until=now+600, 429 分支同款
+                    # 写法), 给纠错窗口; 探测不可判定 ⇒ 保守走旧死信。
+                    try:
+                        _healthy = _gateway_route_healthy(gw, key)
+                    except Exception:
+                        _healthy = None
+                    if _healthy is False:
+                        try:
+                            led = Ledger(db_path)
+                            try:
+                                led.conn.execute(
+                                    "UPDATE harvest_contracts SET "
+                                    "notify_dead_until=?, last_notified_at=NULL "
+                                    "WHERE task_id=?",
+                                    (time.time() + 600, t))
+                                led.conn.commit()
+                                led.emit_event(
+                                    "relay.notify_gateway_misrouted", t, {
+                                        "session_id": sid,
+                                        "reason": "gateway_route_misrouted",
+                                        "http_status": 404,
+                                        "error": str(e)[:300],
+                                        "next_action": (
+                                            "manual: 网关整体 404 (base URL / "
+                                            "路由错配), 非会话问题; 核对 "
+                                            "MW_GATEWAY_URL 后 600s 自动重试"),
+                                    })
+                            finally:
+                                led.close()
+                        except Exception:
+                            pass
+                        return
+                    try:
+                        led = Ledger(db_path)
+                        try:
+                            cur = led.conn.execute(
+                                "SELECT notify_attempts, harvest_status "
+                                "FROM harvest_contracts WHERE task_id=?",
+                                (t,)).fetchone()
+                            attempts = (cur["notify_attempts"] if cur else 0) + 1
+                            _hs = cur["harvest_status"] if cur else None
+                            # 立即死信: notify_dead_until = now + 1 年,
+                            # should_notify / 入口闸门即刻起效 ⇒ 投递尝试
+                            # 次数有界 (REQ-167-AC4: 首败即止, 不再跨 reap
+                            # 周期反复撞 404)。
+                            led.record_notify_failure(
+                                t, str(e), attempts,
+                                time.time() + 86400 * 365,
+                                last_notified_at=time.time())
+                            # 语义化事件: 既有 relay.notify_failed 只有
+                            # "HTTP Error 404: Not Found", 这里补「目标会话
+                            # 不存在」这一层可机读语义 + 人工处置指引。
+                            led.emit_event("relay.notify_permanent_failure", t, {
+                                "session_id": sid,
+                                "reason": "session_not_found",
+                                "http_status": 404,
+                                "error": str(e)[:300],
+                                "attempts": attempts,
+                                "next_action": ("manual: 目标会话不存在 "
+                                                "(派生 sid / 会话已回收), "
+                                                "需人工改派或改用可达会话; "
+                                                "平台不再自动重投"),
+                                "task_state": _hs,
+                            })
+                        finally:
+                            led.close()
+                    except Exception:
+                        pass
+                elif knock_ctx:
+                    # issue #175 (2026-10-31): notify_task=None 的敲门撞 404
+                    # 原来线程内静默零留痕。knock_ctx 提供留痕用 task_id ⇒
+                    # emit 语义化事件 (channel 标明是卡绑定敲门, 非报告投递);
+                    # **不写** harvest_contracts —— 敲门无契约语义, 不污染
+                    # relay 计数红线。
+                    try:
+                        led = Ledger(db_path)
+                        try:
+                            led.emit_event(
+                                "relay.notify_permanent_failure",
+                                knock_ctx.get("task_id", ""), {
+                                    "session_id": sid,
+                                    "reason": "session_not_found",
+                                    "http_status": 404,
+                                    "channel": knock_ctx.get(
+                                        "channel", "card_binding_knock"),
+                                    "error": str(e)[:300],
+                                    "next_action": (
+                                        "manual: 敲门目标 main 会话不存在 "
+                                        "(派生 sid / 已回收), 需人工核对 "
+                                        "initiator 会话"),
+                                })
                         finally:
                             led.close()
                     except Exception:
@@ -1167,12 +1494,20 @@ def _notify_main_of_stuck(ledger, base, results, registry: dict | None = None,
         # (ValueError, PermissionError) 兜底、打断敲门路径。 先 hasattr
         # 前置判定 (只防「方法缺失」这一种结构性缺位, 不扩宽到业务异常,
         # 防御不过宽), 业务异常仍按原样只吞 ValueError/PermissionError。
+        # issue #167 (AC3): mins 计算提前到 update_worker_state 之前 ——
+        # 纯计算前移, 无副作用; WAITING 的 reason 要带闲置分钟数。
+        mins = round((now - last_progress) / 60, 1)
         try:
             if (row["harvest_status"] in ("PENDING", "WORKING", "BLOCKED")
                     and hasattr(ledger, "update_worker_state")):
                 ledger.update_worker_state(
                     task_id, "WAITING", actor="reaper",
-                    reason="[stuck] SSE 静默超阈, 待 main 介入",
+                    # issue #167 (AC3): 判据可查询 —— 把「为什么被标 WAITING」
+                    #   写进 reason (进 harvest_log trail): 阈值/闲置时长/
+                    #   依据字段直接可读, main 无需比对 mtime/日志推断。
+                    reason=(f"[stuck] SSE 静默超阈 {mins} 分钟 "
+                            f"(阈值 {threshold // 60} 分钟, 依据 last_progress_at="
+                            f"{int(last_progress or 0)}), 待 main 介入"),
                     log="stuck_notify_arming")
                 # 重新读 row (state 已变)
                 row = ledger.current_card_contract(
@@ -1182,7 +1517,7 @@ def _notify_main_of_stuck(ledger, base, results, registry: dict | None = None,
         sid = ledger.get_initiator(task_id)
         if not sid:
             continue
-        mins = round((now - last_progress) / 60, 1)
+        # (issue #167: mins 计算已提前到 update_worker_state 之前)
         # issue#13: waiting_sub 卡超阈敲门用专属文案 (AC-A2). 文案硬
         # 编码中文, 与既有【mw 敲门】系列同口径, 不走 i18n.
         if cur_is_waiting_sub and sub_min > 0:
@@ -1215,6 +1550,16 @@ def _notify_main_of_stuck(ledger, base, results, registry: dict | None = None,
                 "stuck_minutes": mins,
                 "harvest_status": row["harvest_status"],
                 "notified_session": sid,
+                # issue #167 (AC3): WAITING 判据入事件 payload —— main 查
+                #   mw_events 的 task.stuck 即可直接读出阈值/闲置时长/依据,
+                #   无需读 harvest_log 或比对 mtime 推断。
+                "waiting_criteria": {
+                    "threshold_minutes": threshold // 60,
+                    "idle_minutes": mins,
+                    "last_progress_at": last_progress,
+                    "basis": ("ledger.last_progress_at → marker.started_at"
+                              " → harvest_contracts.updated_at"),
+                },
             })
             results.append({"task_id": task_id, "trigger": "stuck_notify",
                            "verdict": "NOTIFIED"})
@@ -1558,6 +1903,21 @@ def _notify_null_slot(ledger, active_run, results, registry=None,
                        "verdict": "ERROR", "error": str(e)[:150]})
 
 
+def _undelivered_knock_max() -> int:
+    """「已收割未送达」兜底敲门的次数上限 (issue #177, 2026-10-31)。
+
+    env MW_REAPER_UNDELIVERED_KNOCK_MAX (默认 3); 非法值/非正数回落 3
+    (容错口径同 _binding_event_dedup_min)。计数面复用 mw_events
+    (team_work.undelivered_knock 事件, run 级), 零 schema 变更。
+    """
+    v = os.environ.get("MW_REAPER_UNDELIVERED_KNOCK_MAX", "")
+    try:
+        n = int(v) if v else 3
+    except (TypeError, ValueError):
+        return 3
+    return n if n > 0 else 3
+
+
 def _notify_undelivered_harvest(ledger, active_run, results, registry=None,
                                 stuck_after_min=30, base="."):
     """F4 补档 (2026-10-25 issue #103): 「已收割未送达 main」空窗敲门。
@@ -1605,6 +1965,50 @@ def _notify_undelivered_harvest(ledger, active_run, results, registry=None,
     idle = now - min(stamps)
     if idle <= threshold:
         return  # 还在 stuck 窗口内, 不敲
+    # issue #177 (2026-10-31): 兜底敲门有界化 —— 计数面复用 mw_events
+    # (run 级 team_work.undelivered_knock 事件, 零 schema 变更), 只统计
+    # 「最新报告之后」的敲门: set_worker_report 内容变化会刷新 updated_at
+    # 并清 confirmed_at ⇒ 新报告 = 新事件 ⇒ 计数自然归零 (重新武装口径)。
+    try:
+        newest_report = max(float(_row_get(r, "updated_at") or 0.0)
+                            for r in undelivered)
+    except Exception:
+        newest_report = 0.0
+    try:
+        cnt = ledger.conn.execute(
+            "SELECT COUNT(*) AS n FROM mw_events "
+            "WHERE task_id=? AND event_type='team_work.undelivered_knock' "
+            "AND created_at > ?", (run_id, newest_report)).fetchone()
+        knock_count = int(cnt["n"]) if cnt else 0
+    except Exception:
+        knock_count = 0  # 查询异常 ⇒ 不拦敲门 (宁可多敲, 不可漏敲)
+    if knock_count >= _undelivered_knock_max():
+        # 达限: 不再敲。仅首次达限时 emit exhausted 事件 (存在性去重与
+        # 计数同口径: 最新报告之后已有 exhausted 事件 ⇒ 不重复)。
+        try:
+            seen = ledger.conn.execute(
+                "SELECT 1 FROM mw_events WHERE task_id=? "
+                "AND event_type='team_work.undelivered_knock_exhausted' "
+                "AND created_at > ? LIMIT 1",
+                (run_id, newest_report)).fetchone()
+            if not seen:
+                ledger.emit_event(
+                    "team_work.undelivered_knock_exhausted", run_id, {
+                        "knocks": knock_count,
+                        "max": _undelivered_knock_max(),
+                        "cards": ", ".join(r["task_id"]
+                                           for r in undelivered[:5]),
+                        "next_action": (
+                            "manual: 兜底敲门已达上限, 平台不再自动重敲; "
+                            "请人工 GET /api/tasks 读报告后补 "
+                            "notify_confirmed_at / resume / re-route"),
+                    })
+        except Exception:
+            pass
+        results.append({"task_id": run_id, "trigger": "undelivered_knock",
+                        "verdict": "SKIP",
+                        "note": f"knock_exhausted({knock_count})"})
+        return
     ids = ", ".join(r["task_id"] for r in undelivered[:5])
     n = len(undelivered)
     # 投递失败留痕信息 (issue #103): 让敲门文案带上失败次数/原因, main

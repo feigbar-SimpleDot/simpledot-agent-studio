@@ -31,7 +31,8 @@
     "toggle_theme_title": "Toggle theme",
     "worker_chat_title": "Worker · {name}",
     "workers_subtitle": "Register routes · generate compose · view runtime metadata",
-    "workflows_subtitle": "Workflow templates · decide how collaborative tasks decompose"
+    "workflows_subtitle": "Workflow templates · decide how collaborative tasks decompose",
+    "subtitle_schedule": "Inbox · task queue, auto-chained"
   },
   "chat": {
     "commands": {
@@ -133,8 +134,8 @@
       "auto_select": "Auto-select (LLM picks)",
       "cancel_btn": "Cancel",
       "inherit_option": "Inherit current session ({name})",
-      "start_btn": "Start",
-      "start_busy_btn": "Starting…",
+      "start_btn": "Confirm & Enable",
+      "start_busy_btn": "Adding…",
       "subtitle": "Multiple workers split the task — each one is delegated one sub-task.",
       "task_placeholder": "e.g. \"Add user login to the backend\".",
       "task_requirement": "Task requirement",
@@ -144,7 +145,8 @@
       "workflows_unreachable": "Workflow list unreachable — only Auto-select is available",
       "workspace_hint": "All workers of this task produce files in this directory. Leave empty to inherit the current session's workspace; create a new one in the top bar Workspace picker.",
       "workspace_label": "Workspace",
-      "workspace_placeholder": "(optional)"
+      "workspace_placeholder": "(optional)",
+      "queued_toast": "Added to the inbox queue"
     },
     "team_work_prompt_label": "【Team Work 多智能体任务】",
     "tool_args_truncated": "… (truncated, {n} chars total)",
@@ -212,7 +214,8 @@
     "settings": "Settings",
     "tasks_board": "Tasks",
     "workers": "Workers",
-    "workflows": "Workflows"
+    "workflows": "Workflows",
+    "schedule": "Inbox"
   },
   "cron": {
     "action": {
@@ -376,6 +379,7 @@
     "current_step_block_label": "Current step",
     "current_step_pending": "Step switching — waiting for scheduler",
     "current_step_unreplyable": "This step cannot be replied to right now",
+    "delivery_failed_badge": "Delivery failed",
     "empty_initial_task": "(no initial request)",
     "empty_subtitle": "Go to Chat and tell the main assistant what you need — tasks appear here automatically.",
     "empty_title": "(Untitled)",
@@ -681,6 +685,16 @@
   "chat.session.readonly_badge": "Read-only",
   "chat.session.load_history_aria": "Loading past messages",
   "chat.errors.upload_failed": "Upload failed HTTP {status}",
+  "chat.errors.image_compress_failed": "Image compression failed: {reason}",
+  "chat.errors.image_too_large": "Image is too large even after compression",
+  "chat.errors.image_unsupported": "Unsupported image format or the file is corrupted",
+  "chat.errors.pillow_unavailable": "Image compression service is temporarily unavailable",
+  "chat.errors.image_missing_data": "Missing image attachment data",
+  "chat.errors.image_bad_base64": "Image attachment data is not valid base64",
+  "chat.errors.image_payload_too_large": "Image attachment request body exceeds the limit",
+  "chat.errors.image_compress_failed_generic": "Image compression failed",
+  "chat.input.image_meta": "[Image attachment: {name} — original format {originalFormat}; {resolution}, {bytes} bytes ({mb} MB); not recompressed (already under 1MB).]",
+  "chat.input.image_meta_compressed": "[Image attachment: {name} — original {originalResolution}, {originalBytes} bytes ({originalMb} MB); compressed to {compressedResolution}, {compressedBytes} bytes ({compressedMb} MB); original format {originalFormat}; compression saved {savedPct}%.]",
   "chat.team_work_dispatch_marker": "【Team Work 多智能体任务】",
   "chat.team_work_dispatch_field_requirement": "Requirement: {task}",
   "chat.team_work_dispatch_field_workflow_explicit": "Reference workflow: {wf}",
@@ -720,6 +734,22 @@
   "chat.files.err_network": "Network error — check your connection and retry",
   "chat.files.err_deleted": "File was moved or deleted",
   "chat.files.retry": "Retry",
+  "chat.files.upload": "Upload",
+  "chat.files.upload_hint": "Upload to {path}",
+  "chat.files.uploading": "Uploading…",
+  "chat.files.upload_ok": "Uploaded {name}",
+  "chat.files.upload_failed": "Upload failed: {reason}",
+  "chat.files.upload_conflict": "A file with that name already exists",
+  "chat.files.upload_too_large": "File exceeds the 20MB limit",
+  "chat.files.delete": "Delete",
+  "chat.files.delete_confirm_title": "Confirm deletion",
+  "chat.files.delete_confirm_body": "This will permanently delete {path} ({size}). This cannot be undone.",
+  "chat.files.delete_cancel": "Cancel",
+  "chat.files.delete_ok": "Deleted {path}",
+  "chat.files.delete_failed": "Delete failed: {reason}",
+  "chat.files.delete_needs_file": "Only files can be deleted, not directories",
+  "chat.files.err_conflict": "Target already exists",
+  "chat.files.err_confirm_required": "Confirmation required",
   "workflows.tmpl_header": "# mw platform workflow definition template (v2, with description/input/output fields)",
   "workflows.tmpl_schema_header": "## JSON Schema (workflow body)",
   "workflows.tmpl_field_semantics_header": "## Field semantics",
@@ -761,5 +791,68 @@
   "workflows.tmpl_example_step_review_name": "Code review",
   "workflows.tmpl_example_step_review_desc": "Review code quality, security, and maintainability",
   "workflows.tmpl_example_step_review_io_in": "Source code changes, docs/design.md",
-  "workflows.tmpl_example_step_review_io_out": "docs/review-notes.md"
+  "workflows.tmpl_example_step_review_io_out": "docs/review-notes.md",
+  "schedule": {
+    "group": {
+      "running": "Running",
+      "pending": "Not started",
+      "done": "Done / Cancelled"
+    },
+    "state": {
+      "pending": "Pending",
+      "paused": "Paused",
+      "running": "Running",
+      "done": "Done",
+      "cancelled": "Cancelled",
+      "unknown": "Unknown"
+    },
+    "prio": {
+      "urgent": "Urgent",
+      "high": "High",
+      "normal": "Normal",
+      "low": "Low"
+    },
+    "btn": {
+      "pause": "Pause",
+      "resume": "Resume",
+      "cancel": "Cancel",
+      "delete": "Delete",
+      "edit": "Edit",
+      "run_now": "Run Now",
+      "view_board": "View Board"
+    },
+    "auto_execute": "Auto-execute",
+    "busy_hint": "A task is running; inbox is queued",
+    "countdown": {
+      "next": "Countdown to next task"
+    },
+    "col_added": "Added",
+    "col_executed": "Executed",
+    "cron_badge": "Cron job",
+    "empty": {
+      "title": "Inbox is empty",
+      "hint": "Click \"Start multi-agent collaboration\" in the top bar to join the inbox queue"
+    },
+    "form": {
+      "edit_title": "Edit Inbox Task",
+      "detail": "Task detail",
+      "detail_placeholder": "e.g. \"Add user login to the backend\".",
+      "detail_required": "Task detail is required",
+      "priority": "Priority"
+    },
+    "confirm": {
+      "title": "Run Now",
+      "body": "Task \"{title}\" will start immediately, skipping the remaining wait. Confirm?"
+    },
+    "toast": {
+      "paused": "Paused",
+      "resumed": "Resumed to pending",
+      "cancelled": "Cancelled",
+      "deleted": "Deleted",
+      "saved_paused": "Saved, still paused",
+      "auto_on": "Auto-execute enabled",
+      "auto_off": "Auto-execute disabled",
+      "run_started": "Execution started"
+    }
+  }
 }

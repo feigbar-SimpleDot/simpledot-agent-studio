@@ -398,7 +398,66 @@ CREATE TABLE task_resume_requests (
     status      TEXT,   -- PENDING/CLAIMED/DONE/FAILED
     created_at  TIMESTAMP
 );
+
+-- Team Work top-level object (one row = one run; run_id is generated at
+-- launch, never derived from the manifest). Only one ACTIVE run at a
+-- time: the partial UNIQUE index below is the DB-level backstop for the
+-- race, and the application-level check must exist alongside it — with
+-- neither one alone, a race lets two through. current_card_id is the
+-- single dispatchable card of the ACTIVE run; it must be NULL before
+-- advance. Orphan PENDING cards (no team_work_run_id) are SKIPped by
+-- the reaper; the operator archives them via the close endpoint.
+CREATE TABLE IF NOT EXISTS team_work_runs (
+    run_id              TEXT PRIMARY KEY,
+    initiator_session   TEXT NOT NULL,
+    initial_task        TEXT NOT NULL,
+    project_workspace   TEXT,
+    current_card_id     TEXT,
+    status              TEXT NOT NULL DEFAULT 'ACTIVE'
+        CHECK(status IN ('ACTIVE','HOLD','CLOSED','ABORTED','ARCHIVED')),
+    card_count          INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    closed_at           REAL,
+    closed_reason       TEXT,
+    -- issue #210 run hold: three audit columns (reason / actor / moment).
+    -- hold semantics = frozen, no longer advancing (the boundary rulings
+    -- below: the worker process is not killed, current_card_id is left
+    -- alone). These three columns only record "who froze it, when, and
+    -- why" — they take part in no scan-surface decision.
+    hold_reason         TEXT,
+    hold_actor          TEXT,
+    hold_at             REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_team_work_one_active
+    ON team_work_runs(status) WHERE status='ACTIVE';
 ```
+
+> On an existing database four operational columns
+> (`last_null_slot_knock_at` / `current_card_cleared_at` /
+> `current_card_handoff_at` / `last_waiting_at`) are added by
+> `ADD COLUMN` migrations, and the issue #210 CHECK migration rebuilds
+> the table to the full 17-column shape — see §4.5 and DEPLOY.md §5.4.
+
+**Run state machine (issue #210 added `HOLD`):**
+
+| From | To | Trigger |
+|---|---|---|
+| `ACTIVE` | `HOLD` | `POST /api/team-work/<run_id>/hold` — freeze the chain (§11.7) |
+| `HOLD` | `ACTIVE` | `POST /api/team-work/<run_id>/hold/resume` — thaw; if another ACTIVE run already exists the UPDATE hits the partial UNIQUE index `idx_team_work_one_active` and the endpoint answers `409` |
+| `HOLD` | `CLOSED` \| `ABORTED` | close is allowed on a HOLD run — a frozen chain can still be terminated (`close_team_work` idempotency gate accepts `ACTIVE` and `HOLD`) |
+| `HOLD` | `ARCHIVED` | archive is allowed on a HOLD run (the terminal UPDATE gate is `IN ('ABORTED','CLOSED','HOLD')`) |
+
+Two hard rulings for `HOLD` (issue #210, PLAN-U §1.3):
+
+- **hold does not kill the worker process and does not clear
+  `current_card_id`** — freezing means "stop advancing": a worker that
+  finishes naturally still settles into the ledger, and the relay
+  delivers after the resume (a HOLD run is not ACTIVE, so the relay
+  holds the report back).
+- **a HOLD run does not count as "the one running task"** in any
+  uniqueness check — the reaper's ACTIVE scan surface, the relay JOIN
+  and the knock gate all skip it with zero code change, and a second
+  ACTIVE run may be launched while one is held.
 
 > 1A subtraction: the old `contract_hash` / `ContractTampered` tamper-
 > proof fields are removed — the worker-prompt hard constraint ("only
@@ -432,9 +491,10 @@ CREATE TABLE IF NOT EXISTS schedule_tasks (
     priority     TEXT NOT NULL DEFAULT 'normal'
                  CHECK(priority IN ('urgent','high','normal','low')),
     status       TEXT NOT NULL DEFAULT 'pending'
-                 CHECK(status IN ('pending','paused','running','done','cancelled')),
+                 CHECK(status IN ('pending','paused','running','done','cancelled','hold')),
     added_at     REAL NOT NULL,
     executed_at  REAL,
+    finished_at  REAL,
     added_by     TEXT NOT NULL DEFAULT '',
     workflow     TEXT NOT NULL DEFAULT 'auto',
     workspace    TEXT NOT NULL DEFAULT '',
@@ -446,7 +506,7 @@ CREATE TABLE IF NOT EXISTS schedule_tasks (
 CREATE INDEX IF NOT EXISTS idx_sched_status_added
     ON schedule_tasks(status, added_at DESC);
 
--- key/value settings (the only key today: auto_execute_enabled)
+-- key/value settings (keys: auto_execute_enabled / schema_version)
 CREATE TABLE IF NOT EXISTS schedule_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -481,11 +541,18 @@ loses the race instead of corrupting the row — the API then answers
 - `paused ->` paused (the update endpoint rewrites the fields and
   **keeps** the row paused)
 - `pending -> running` (the engine takes the head of the queue; the
-  queue order is `added_at DESC`, i.e. the most recently added pending
-  task goes first, and the take is a two-step select + conditional
+  queue order is `added_at ASC`, i.e. the **earliest** added pending
+  task goes first — issue #197 replaced the older `added_at DESC`
+  decision — and the take is a two-step select + conditional
   update, so two engines cannot take the same row)
-- `running -> done` (the run finished)
+- `running -> done` (the run finished; the **completion moment** is
+  written to `finished_at`)
 - `running -> pending` (the trigger failed; `last_error` is recorded)
+- `running -> hold` (a Team Work run was frozen; issue #210 — the inbox
+  task of a held run leaves the "running" set, so the next task starts
+  its countdown normally)
+- `hold -> pending` (the run was resumed; issue #210 — the task returns
+  to the head of the pending queue, `added_at = min(pending.added_at) − 1`)
 
 Editing a task is allowed **only** in the `paused` state; a delete is
 allowed **only** in the `cancelled` state — both rejected with `409`.
@@ -499,8 +566,21 @@ survive (§4.3).
 
 The ticker (a daemon thread, one tick per second) starts the countdown
 only while the trigger condition holds: auto-execute **on** ∧ at least
-one `pending` task ∧ no active Team Work run ∧ the gateway probe reports
-itself free. When the condition stops holding the countdown is
+one `pending` task ∧ no in-progress inbox task (no `running` row in
+`schedule_tasks` — issue #206) ∧ no active Team Work run ∧ the gateway
+probe reports itself free. The inbox-running criterion comes first
+(issue #206): a task delivered to main but not yet expanded into cards
+has no ledger run row, so the ACTIVE-run check alone leaves a blind spot
+through which the next task's countdown would keep ticking; the
+`running` row spans that whole window (set by `take_pending`; cleared when
+the run closes or the fire fails back to `pending`). One case does not
+converge on its own: if the run row never appears (main has not expanded
+the task into cards, or a process restart left the row behind), the row
+stays `running` and keeps the countdown blocked — the engine logs a
+warning once the row has been un-converged for 2x the stream hard cap
+(`_ZOMBIE_RUNNING_WARN_S`, `mw/schedule.py`) but does **not** auto-revert it
+to `pending`; automatic reversion is an open decision.
+When the condition stops holding the countdown is
 cancelled (not paused); when it holds again a **new** countdown starts.
 The length is five minutes (`COUNTDOWN_S = 300`).
 
@@ -512,7 +592,8 @@ stale. The probe reports three distinct busy reasons — `gateway_busy`
 (the gateway is busy **or** reports active agents), `gateway_probe_unavailable`
 (the probe itself failed) and "not busy" — and they never overwrite each
 other (issue #181); the `busy_reason` enumeration is registered in
-§11.7.
+§11.7. The full busy-reason precedence is `inbox_running` (issue #206)
+first, then `active_run`, then the probe reasons.
 
 Turning the auto-execute switch off cancels the countdown; turning it
 back on explicitly zeroes it (`restart_countdown`) so the next tick
@@ -523,6 +604,62 @@ restarts the countdown from the beginning.
 Two trigger sources exist — the countdown expiring and the run-now
 button — and they share one fire lock (`_fire_lock`), so exactly one run
 can be started per countdown even when both fire at the same moment.
+
+### 4.5 Schedule queue order and the countdown holder (issue #197)
+
+Issue #197 changed the queue semantics: a pending task is executed in
+**creation order** (`added_at ASC`), the inbox shows the same order
+(display order = execution order), and the completed group is sorted by
+**completion moment** (`finished_at DESC`), not by creation time.
+
+The completed group needs a dedicated column because `updated_at` is
+refreshed by every conditional update, so any later edit of a finished
+row would silently reorder the group. `schedule_tasks.finished_at` is
+written when a task reaches `done` or `cancelled`. The column is
+migrated automatically: the schema carries a `schema_version` row in
+`schedule_settings`, and the first **write** connection on an older
+database adds the column, backfills the terminal rows with their
+`updated_at` (the closest available approximation) and records the new
+version. Read connections never write, so the migration never runs on
+the read path.
+
+The same auto-migration discipline covers the later versions: the
+`schedule_tasks` v2 → v3 rebuild (the `hold` status, issue #210) and
+the `team_work_runs` status-CHECK rebuild (the `HOLD` status plus the
+three `hold_*` audit columns, issue #210) both run on the first write
+connection as table rebuilds — new table, copy, drop, rename — each
+guarded by a content check on the stored DDL and a row-count
+verification that rolls back on a mismatch (operator's view:
+DEPLOY.md §5.4).
+
+Concretely, a read connection only creates the database when the core
+tables (`schedule_tasks` and `schedule_settings`) do not exist yet (a
+brand new database, or a zero-byte file left by an interrupted first
+build). When those tables exist but the schema version is too old, the
+read path degrades to a read-only view instead of migrating: the sort
+key for the terminal group is chosen from the columns that actually
+exist (`COALESCE(finished_at, updated_at)` when `finished_at` is
+present, `updated_at` otherwise). The migration still runs on the
+first write connection, so an older database converges to the current
+schema as soon as anything writes to it.
+
+The countdown is **bound to a holder** (`ScheduleEngine.countdown_task_id`):
+the task the countdown belongs to, kept in memory next to
+`countdown_ends_at` and cleared together with it. The holder is the
+queue head when the countdown starts. If the holder is paused, cancelled
+or completed, the countdown is withdrawn and the **next** pending task
+starts a **full** new five-minute countdown — the remaining time is never
+inherited. Resuming a paused task does **not** take over a running
+countdown: the resumed task returns to the head of the pending list (by
+creation time), but the countdown keeps pointing at its holder, and when
+it expires it triggers that holder. There is at most one countdown, so a
+resume can never create a second one.
+
+A `hold` row does **not** count as "the one running task": the first
+busy criterion reads `list_by_status('running')`
+(`mw/schedule.py:_busy_reason`), which never returns `hold` rows, so
+the next pending task starts its countdown normally while a task is
+held (issue #210).
 
 ---
 
@@ -843,7 +980,14 @@ questions flow to whoever can answer" — one skill fills that gap.
    native dispatcher and main's LLM fight for driving rights.
 6. **One kanban.db**: `mw`'s `MW_HERMES_HOME` MUST point at main's
    `HERMES_HOME`; otherwise a second `kanban.db` silently forks (dual
-   ledger, tasks disappear from one side).
+   ledger, tasks disappear from one side). The hermes CLI resolves the
+   kanban DB as `HERMES_KANBAN_DB` > `HERMES_KANBAN_HOME` > default
+   hermes root, and the last one falls back to `~/.hermes/kanban.db`
+   when `HERMES_HOME` is unset — a trimmed-env subprocess then writes
+   to that shadow DB with zero errors (issue #191). `deploy/main_entry.sh`
+   therefore also exports `HERMES_HOME` alongside `MW_KANBAN_DB`, and
+   the console's task-404 message carries a shadow-DB troubleshooting
+   hint.
 7. **main's three-process entry**: gateway (foreground) + reaper loop +
    console, each under a watchdog; deploy new code by `pkill`ing the
    child process (watchdog restarts), zero container restart.
@@ -898,9 +1042,13 @@ mechanisms are unchanged in 1A, only "who creates the card" moves from
 
 ## 8. Open issues / next steps
 
-- 7 pre-existing failures in `test_repeat_notify_dedup.py` (backoff /
-  dead-letter assertions don't match current ledger behaviour), unrelated
-  to the 1A refactor, pending alignment.
+- `tests/test_repeat_notify_dedup.py` is a script-style check (a `main()`
+  with `check()` helpers — it carries no pytest cases, so the earlier note
+  here about "7 pre-existing pytest failures" described a set that does not
+  exist in this repo; corrected by the 2026-11-02 document audit). Its
+  backoff / dead-letter assertions have not been re-verified against
+  current ledger behaviour (running it needs the `hermes` CLI); pending
+  alignment.
 - Multi-worker parallel orchestration (currently strictly serial): if
   DAG parallelism is needed in the future, the dispatch concurrency
   guards must be redesigned; not in the current 1A scope.
@@ -1142,8 +1290,14 @@ and the client locale is a user invariant.
   deployments**, because consumers match them literally: dispatch marker
   `【Team Work 多智能体任务】` (`parseDispatchCard`), SOUL-init marker
   `【平台 SOUL 初始化指令】` (console↔worker SOUL §7 handshake), skip
-  fast-path line `- 跳过: 是` (`mw/pipeline.py`). English-language docs
-  and templates quote these literals and label them as protocol tokens.
+  fast-path line `- 跳过: 是` (`mw/pipeline.py`), attachment-list section
+  marker `【附件】` (the Team Work dialog's detail section separator,
+  issue #211 — produced by `buildTeamWorkDetail` in
+  `ui/src/views/ChatView.jsx`, byte-identical to the backend contract
+  constant `ATTACH_DETAIL` in `tests/test_issue211_upload_contract.py`;
+  consumers parse the `- <absolute path>` lines, never the marker's
+  language). English-language docs and templates quote these literals
+  and label them as protocol tokens.
 - Protocol literals inside code blocks (e.g. LLM dispatch prompts)
   retain these shared literals; everything else in the `en` template
   family is English (user-visible copy, field keys, example data).
@@ -1224,10 +1378,33 @@ Main LLM reads the notification and decides:
 > decomposition, the cards and the launch call — only the *timing* of
 > the session creation moved earlier.
 
-Only the shared protocol literals (`- 跳过: 是`, the two `【…】` markers)
-stay Chinese verbatim in every deployment — they are protocol, not copy
-(see §10 hard guarantees). TODO.md field keys follow the deployment
-language and parse bilingually (I18N-R3).
+Only the shared protocol literals (`- 跳过: 是` and the `【…】` markers
+listed in §10) stay Chinese verbatim in every deployment — they are
+protocol, not copy (see §10 hard guarantees). TODO.md field keys follow
+the deployment language and parse bilingually (I18N-R3).
+
+#### Team Work dialog attachments (issue #211)
+
+The Team Work dialog (the queue entry above) has four user-fillable
+fields: requirement (the task text), workflow, workspace, and
+attachments. Attachments reuse the chat-attachment endpoint
+`POST /api/upload` (see §11.7): files upload **on selection** (before
+submit), capped at **5 files / 20 MB each** (types unrestricted), with
+uploading / upload-failed / over-limit feedback in both locales. On
+submit the queued `detail` keeps the raw requirement text and appends
+the attachment section as a protocol block — `<requirement text>` /
+blank line / `【附件】` / one `- <absolute path>` line per file — built
+by `buildTeamWorkDetail` (`ui/src/views/ChatView.jsx`), locked
+byte-identical to the backend contract constant `ATTACH_DETAIL`
+(`tests/test_issue211_upload_contract.py`). The schedule engine
+forwards `detail` verbatim into the first dispatch message, so the
+receiving worker reads the listed paths with `read_file`. Files land
+under `MW_UPLOAD_DIR` (default `/share_workspace/uploads`) on the
+shared volume — a worker container must mount that same volume to read
+them (see DEPLOY.md). Cancelling the dialog does **not** reclaim
+already-uploaded files: orphans stay in the uploads directory (same
+posture as chat attachments — disk usage only grows; cleanup was
+deliberately not invented here).
 
 ### 11.3 `POST /api/team-work/launch` boundary (1A)
 
@@ -1356,6 +1533,8 @@ force-skipped by main as an explicit product decision.
 | `/api/workers/<name>` | GET / DELETE | worker detail (api_key redacted) / delete | frontend |
 | `/api/workers/<name>/avatar` | GET | serve worker avatar bytes (file on disk, routed before the worker-detail fallback; see §11.5) | frontend |
 | `/api/team-work/launch` | POST | register all cards + dispatch the first | LLM |
+| `/api/team-work/<run_id>/hold` | POST | freeze one ACTIVE run: ACTIVE→HOLD, records hold_reason/actor/time; does not kill the worker and does not clear current_card_id; idempotent on an already-HOLD run (200, was_already:true); 404 unknown run / 409 on a non-ACTIVE run; the run's running inbox task is set to `hold` (schedule_linkage reports the outcome) — issue #210 | LLM / operator |
+| `/api/team-work/<run_id>/hold/resume` | POST | thaw one HOLD run: HOLD→ACTIVE; a second ACTIVE run ⇒ 409 (partial UNIQUE index); the run's held inbox tasks return to `pending` at the queue head (added_at = min(pending.added_at) − 1); idempotent on an already-ACTIVE run — issue #210 | LLM / operator |
 | `/api/dispatch` | POST | spawn a worker for one claimed card | LLM |
 | `/api/resume` | POST | relay a clarification answer to the worker's same session | LLM |
 | `/api/relay/confirm` | POST | explicit main-side receipt of a delivered report (`{"task_id": ...}`); idempotent, a dead-lettered card recovers on one receipt (issue #119) | LLM |
@@ -1369,27 +1548,27 @@ force-skipped by main as an explicit product decision.
 | `/api/heartbeat` | GET | reaper liveness heartbeat (`reaper_alive` + `reaper_heartbeat_age_s`); the liveness rule is identical to the one in `/api/workers` | frontend |
 | `/api/settings` | GET / PUT | public settings | frontend |
 | `/api/compose/generate` | POST | generate worker compose | frontend |
-| `/api/upload` | POST | upload files | frontend |
+| `/api/upload` | POST | upload one file to the shared volume (base64 JSON body `{"name", "data"}`, data-URL prefix or bare base64; ≤20 MB per file; the name is sanitised to `[A-Za-z0-9_.-]` and the stored file is `<ts>_<token>_<name>` under `MW_UPLOAD_DIR` (default `/share_workspace/uploads`), so a worker container mounting that same volume can read it by absolute path); answers `{ok, path (absolute), name, bytes}`; over-limit / missing-data / bad-base64 are `422` with a fixed message (no exception echo) — issue #211 (the Team Work dialog attaches files this way and appends the absolute paths to the queued task detail, see §11.2) | frontend (chat attachments; the Team Work dialog) |
 | `/api/attachments/image` | POST | server-side image compression for chat attachments (base64 in, compressed data URL + metadata out; long edge 2048 / JPEG q82 / ≤2 MB target, `413` when still too large — never falls back to the raw image; `503 pillow_unavailable` when Pillow is missing — issue #159) | frontend |
 | `/api/gwconfig` | GET | gateway config | frontend |
 | `/api/lang` | GET | deployment language (see §10) | frontend |
 | `/api/w/<path>` | GET/PUT/POST | passthrough to worker gateway | frontend |
-| `/webui` (+ `/webui/<path>`) | GET/POST/PUT/PATCH/DELETE | same-origin reverse proxy to the container-internal hermes-webui (prefix stripped; 302 never followed; SSE passed through line by line; enabled by the `webui_proxy_enabled` settings key > env `WEBUI_PROXY_ENABLED` > auto-detect of `/webui/start.sh`; answers `404 webui proxy disabled` when off) — issue #131 option B | user's browser |
+| `/webui` (+ `/webui/<path>`) | GET/POST/PUT/PATCH/DELETE | same-origin reverse proxy to the container-internal hermes-webui (prefix stripped; 302 never followed; a `3xx` `Location` whose `next=` is exactly the root (`/` or `%2F`) is rewritten to `next=/webui/` so a login round-trip lands back under the proxy — issue #199; SSE passed through line by line; enabled by the `webui_proxy_enabled` settings key > env `WEBUI_PROXY_ENABLED` > auto-detect of `/webui/start.sh`; answers `404 webui proxy disabled` when off) — issue #131 option B | user's browser |
 | `/api/sessions/<sid>/messages` | GET | proxy to the gateway session transcript; with `want`/`before` the console serves a windowed page itself (tail-anchored, cursor `o:<n>`), without those parameters it stays a plain passthrough (the rollback switch) | frontend |
 | `/api/cron/jobs` | GET | list cron jobs plus ticker liveness; the data plane is a JSON bridge to a venv subprocess (the console interpreter cannot import `cron.*`), and `state` is the derived `effective_job_state` | frontend |
 | `/api/cron/jobs/<id>/runs` | GET | recent executions of one job (`?limit=`, clamped to 1..10, default 3) | frontend |
 | `/api/cron/jobs/<id>/pause` | POST | pause one job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
 | `/api/cron/jobs/<id>/resume` | POST | resume one paused job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
 | `/api/cron/jobs/<id>/trigger` | POST | queue one job for the next scheduler tick (action whitelist; next-tick semantics, not a forced fire; 409 on a terminal job) | frontend |
-| `/api/schedule/tasks` | GET / POST | list the schedule queue (GET), pre-ordered server-side (running first, then not-yet-run `pending`+`paused`, then finished+cancelled), plus `next_task_id` (the head of the queue) — the only schedule read surface that carries the whole list; and queue one schedule task (POST, 201): `detail` is required (400), `priority` must be one of `urgent`/`high`/`normal`/`low` (400), the title is derived from the first non-empty line of `detail`, and the write triggers an immediate re-evaluation of the engine — issue #164 | frontend |
-| `/api/schedule/state` | GET | the schedule engine snapshot: the persisted `auto_execute` switch, the countdown block (`active` / `ends_at` / `remaining_s` / `next_task_id` / `next_task_title`, `null` when no countdown is running), the `busy_reason` (`active_run` / `gateway_busy` / `gateway_probe_unavailable` / `null`) and the `running_task_id` — issue #164; the `gateway_busy` reason covers both a busy gateway and a gateway reporting active agents, and the probe-unavailable case is kept distinct (issue #181) | frontend |
+| `/api/schedule/tasks` | GET / POST | list the schedule queue (GET), pre-ordered server-side in four groups (running first, then `pending`, then `paused`, then finished+cancelled — issue #197 split `paused` into its own group; `hold` shares the `paused` band, issue #210), each group ordered `added_at ASC` with the terminal group ordered by completion moment `finished_at DESC` (§4.5), plus `next_task_id` (the head of the pending queue — **not** the countdown holder, which `/api/schedule/state` exposes as `countdown.next_task_id`; the two differ after a resume, §4.5) — the only schedule read surface that carries the whole list; and queue one schedule task (POST, 201): `detail` is required (400), `priority` must be one of `urgent`/`high`/`normal`/`low` (400), the title is derived from the first non-empty line of `detail`, and the write triggers an immediate re-evaluation of the engine — issue #164 | frontend |
+| `/api/schedule/state` | GET | the schedule engine snapshot: the persisted `auto_execute` switch, the countdown block (`active` / `ends_at` / `remaining_s` / `next_task_id` / `next_task_title`, `null` when no countdown is running; since issue #197 `next_task_id` is the countdown **holder** per §4.5, not necessarily the head of the queue), the `busy_reason` (`inbox_running` / `active_run` / `gateway_busy` / `gateway_probe_unavailable` / `null`; `inbox_running` means an inbox task is in `running` state — issue #206) and the `running_task_id` — issue #164; the `gateway_busy` reason covers both a busy gateway and a gateway reporting active agents, and the probe-unavailable case is kept distinct (issue #181) | frontend |
 | `/api/schedule/settings` | POST | persist the `auto_execute` switch; turning it **off** cancels the running countdown (the ticker drops it within its next tick, because the trigger condition no longer holds); turning it **on** again explicitly zeroes the countdown and starts a **full** five-minute countdown — it does not resume the remaining time of the previous one — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/update` | POST | edit a queued task; only a `paused` task may be edited (409 otherwise) and the row stays `paused` after the edit; `detail` (400 when blank) and `priority` (400 when invalid) are validated — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/pause` | POST | `pending -> paused`; a task that does not exist is a 404, an illegal transition is a 409 — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/resume` | POST | `paused -> pending` and re-arms the countdown; 404 when the task is gone, 409 on a state conflict — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/cancel` | POST | `pending`/`paused -> cancelled`; 404 when the task is gone, 409 on a state conflict — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/delete` | POST | permanently delete a task; **only** a `cancelled` task may be deleted (409 otherwise, 404 when the task is gone) — issue #164 | frontend |
-| `/api/schedule/run-now` | POST | run the head of the queue right now instead of waiting for the countdown; the server re-checks every condition inside the fire lock (auto-execute off / an active Team Work run / a busy gateway / an unreachable gateway / no active countdown / no pending task — each a 409 with its own reason) so the button cannot double-fire against the ticker — issue #164; the no-pending case carries its own message instead of a generic "operation not allowed" one (issue #179) | frontend |
+| `/api/schedule/run-now` | POST | run the countdown holder right now instead of waiting for the countdown (§4.5; issue #197: the holder, not the head of the queue); the server re-checks every condition inside the fire lock (auto-execute off / an in-progress inbox task (issue #206) / an active Team Work run / a busy gateway / an unreachable gateway / no active countdown / no pending task — each a 409 with its own reason) so the button cannot double-fire against the ticker — issue #164; the no-pending case carries its own message instead of a generic "operation not allowed" one (issue #179) | frontend |
 | `/health` | GET | health check | monitoring |
 | `/` | GET | serve React UI | user's browser |
 

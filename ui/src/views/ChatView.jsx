@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
@@ -6,6 +7,7 @@ import { gw, makeGw, gwBootstrap } from '../gateway.js'
 import { api } from '../api.js'
 import { i18next } from '../i18n'
 import { Modal } from '../components/ui.jsx'
+import { Icon, ICONS } from '../components/icons.jsx'
 import { FileDrawer } from '../components/filebrowser/FileDrawer.jsx'
 import { enhanceFileLinks } from '../components/filebrowser/chatLinks.js'
 
@@ -286,11 +288,16 @@ function sealTurnThinking(setMessages, auth) {
 // runStream 与 send 共用同一份事件处理代码: 回合级单卡聚合、reasoning 1.5s
 // 轮询、回合末权威收口全部住在这里, 不再有两套 switch 漏改风险。
 // deps: { setMessages, setRunInfo, setPhase, turnDedupRef, reasoningSeenRef,
-//         reasoningTimerRef, runIdRef, fetchMessages }
+//         reasoningTimerRef, runIdRef, fetchMessages,
+//         setDecodeRate, fetchSessionTokens }   // #212 新增两依赖
 // fetchMessages: async () => raw[]  (GET session messages, reasoning 轮询数据源)
+// fetchSessionTokens: async () => {output_tokens, reasoning_tokens} | null
+//   (#212: GET /api/sessions/{sid} 五桶快照, 失败返回 null, 回合首尾各取一次)
 function buildTurnStreamHandler(deps) {
+  // #212 两依赖为可选 (缺省 no-op): 既有守护测试与任何未接线的调用方零破坏。
   const { setMessages, setRunInfo, setPhase, turnDedupRef,
-          reasoningSeenRef, reasoningTimerRef, runIdRef, fetchMessages } = deps
+          reasoningSeenRef, reasoningTimerRef, runIdRef, fetchMessages,
+          setDecodeRate = () => {}, fetchSessionTokens = async () => null } = deps
   // 原子定位「最后一个 streaming 的 assistant 气泡」(无 index 竞态, 语义不变):
   // React 保证 updater 串行, 快速连续 delta 只作用在同一气泡上, 不碎片化。
   const findStreaming = (m) => {
@@ -340,12 +347,76 @@ function buildTurnStreamHandler(deps) {
       }
     } catch { /* 网络/权限失败静默, 回合末权威收口兜底 */ }
   }
+  // ── #212 decode 速度 (PLAN-U §2.2/§2.3) ──────────────────────────
+  // 实时近似: assistant.delta 到达时滑动窗口 (DECODE_WIN_MS) 统计字符/秒,
+  // 按 ~4 字符≈1 token 粗估 tok/s —— delta 帧大小非恒定, 显示必须标「近似」。
+  // 收口: assistant.completed / run.completed|failed|cancelled 后不再更新。
+  // 权威校准: 回合首尾各取一次 session 五桶快照 (fetchSessionTokens),
+  // Δoutput_tokens ÷ 生成时长 = 精确平均 tok/s; reasoning_tokens 独立分桶
+  // (PLAN-U §2.3, harvest.py 五桶先例), 有值时单独展示不混入 output。
+  // 工厂每回合重建 → 窗口/基线天然回合级隔离 (同 turnLowerBound 口径)。
+  const DECODE_WIN_MS = 3000
+  const CHARS_PER_TOKEN = 4
+  let decodeWin = []          // [{t, c}] 窗口内样本 (t=ms, c=字符数)
+  let decodeSealed = false    // 收口后 trackDelta 变 no-op
+  let firstDeltaAt = null     // 本回合首个 delta 到达时刻 (精确口径分母起点)
+  let turnStartAt = Date.now()
+  let baseTokens = null       // 回合起点 session token 快照 (null=取不到)
+  let lastApproxTps = null    // 收口前的最后近似值, 随校准结果一并落消息
+  const trackDelta = (n) => {
+    if (decodeSealed || !(n > 0)) return
+    const now = Date.now()
+    if (firstDeltaAt == null) firstDeltaAt = now
+    decodeWin.push({ t: now, c: n })
+    const cutoff = now - DECODE_WIN_MS
+    while (decodeWin.length && decodeWin[0].t < cutoff) decodeWin.shift()
+    // 单样本 span=0 → 0.25s 下限防除零/首帧爆表
+    const span = Math.max((now - decodeWin[0].t) / 1000, 0.25)
+    const chars = decodeWin.reduce((s, x) => s + x.c, 0)
+    lastApproxTps = chars / span / CHARS_PER_TOKEN
+    setDecodeRate({ tps: lastApproxTps })
+  }
+  const sealDecode = () => { decodeSealed = true; decodeWin = [] }
+  // 回合收口后异步校准: 任一快照缺失/时长非正/无增量 → 静默跳过 (宁缺勿假)。
+  const calibrateDecode = (evName) => {
+    if (evName !== 'run.completed') return
+    const endAt = Date.now()
+    const genSec = (endAt - (firstDeltaAt || turnStartAt)) / 1000
+    const approx = lastApproxTps
+    ;(async () => {
+      try {
+        const after = await fetchSessionTokens()
+        if (!after || !baseTokens || genSec <= 0) return
+        const dOut = Math.max(0, (after.output_tokens || 0) - (baseTokens.output_tokens || 0))
+        const dRea = Math.max(0, (after.reasoning_tokens || 0) - (baseTokens.reasoning_tokens || 0))
+        if (dOut <= 0 && dRea <= 0) return
+        setMessages((m) => {
+          for (let i = m.length - 1; i >= 0; i--) {
+            if (m[i].role === 'assistant') {
+              const c = [...m]
+              c[i] = { ...c[i], decodeStats: {
+                approxTps: approx,
+                exactTps: dOut > 0 ? dOut / genSec : null,
+                reasoningTps: dRea > 0 ? dRea / genSec : 0,
+              } }
+              return c
+            }
+          }
+          return m
+        })
+      } catch { /* 校准尽力而为, 失败只丢精确值不影响近似显示 */ }
+    })()
+  }
   const handler = (ev, d) => {
     switch (ev) {
       case 'run.started':
         runIdRef.current = d.run_id || null
         setRunInfo({ status: 'running' })
         setPhase('thinking')
+        // #212: 记回合起点时刻 + 抓 session token 基线快照 (失败静默,
+        // 基线缺失时回合末校准整体跳过)
+        turnStartAt = Date.now()
+        Promise.resolve(fetchSessionTokens()).then((b) => { baseTokens = b || null }).catch(() => {})
         // 回合开始: 重建去重指纹集(thinking 此后装已渲染的真 reasoning 片段)
         // + reasoning 消费游标, 并启动 1.5s reasoning 轮询
         turnDedupRef.current = { thinking: new Set(), msgIds: new Set() }
@@ -356,7 +427,11 @@ function buildTurnStreamHandler(deps) {
         reasoningTimerRef.current = setInterval(pollReasoning, 1500)
         break
       case 'assistant.delta':
-        if (d.delta) { appendField('text', d.delta); setPhase('responding') }
+        if (d.delta) {
+          appendField('text', d.delta)
+          trackDelta(d.delta.length)   // #212: 滑动窗口近似 decode 速度
+          setPhase('responding')
+        }
         break
       case 'assistant.commentary':
         // C-1: commentary 与已渲染 reasoning 同文时不二次渲染 (指纹集去重)
@@ -381,6 +456,7 @@ function buildTurnStreamHandler(deps) {
         attachToolResult(setMessages, d, ev === 'tool.failed')
         break
       case 'assistant.completed':
+        sealDecode()   // #212: 正文流收口, 近似速度停止更新
         // C-2: 记录该回合 assistant 消息的 gateway id 进 msgIds ——
         // poll.recovered 重放同 id 消息时整条跳过 (AC1-2 主键去重)。
         if (d.message_id && turnDedupRef.current) {
@@ -405,6 +481,8 @@ function buildTurnStreamHandler(deps) {
         closeTurnToolGroups(setMessages)
         sealTurnThinking(setMessages, authoritativeReasoning(d.messages))
         backfillToolResults(setMessages, d.messages)
+        sealDecode()               // #212: run 结束, 近似速度停止更新
+        calibrateDecode(ev)        // #212: run.completed 异步精确校准 (fail-open)
         break
       case 'poll.broken':
         // SSE 连接异常断, chatStream 已自动切换到 fallback 轮询模式
@@ -639,6 +717,26 @@ function buildSlashCommands(t) {
   ]
 }
 
+// ── issue #211: 弹窗附件 (发起多智能体协作) ──────────────────────────
+// 上限常量与后端对齐: 单文件 20MB = mw/console.py UPLOAD_MAX_BYTES
+// (console.py:149), 5 个/任务 = PLAN-T §1.2 边界定稿。前端选择时预检,
+// 超限/超数不发请求 (服务端 20MB 闸为双保险)。
+const TW_ATTACH_MAX_FILES = 5
+const TW_ATTACH_MAX_BYTES = 20 * 1024 * 1024
+
+// detail 附件清单拼装 (协议级格式, PLAN-T §1.4 / s4 契约
+// tests/test_issue211_upload_contract.py ATTACH_DETAIL 逐字对齐):
+//   <任务原文>\n\n【附件】\n- <绝对路径>\n- <绝对路径>
+// 只收上传成功条目 (有 path、非 uploading、无 error); 无附件 = 原文不变。
+// 纯函数, ui/tests/test_issue211_teamwork_attach.mjs 抽取直测锁格式。
+function buildTeamWorkDetail(task, files) {
+  const paths = (files || [])
+    .filter((f) => f && f.path && !f.uploading && !f.error)
+    .map((f) => `- ${f.path}`)
+  if (!paths.length) return task
+  return `${task}\n\n【附件】\n${paths.join('\n')}`
+}
+
 // [en] ChatView exposes `openTeamWork` via useImperativeHandle so the global
 //      「核心功能」/Core Features button in App.jsx can trigger the modal
 //      from any view (R2.3 — cross-component trigger, ChatView's internal
@@ -673,9 +771,21 @@ const ChatView = React.forwardRef(function ChatView(
   const [runInfo, setRunInfo] = useState(null)  // {status, toolName}
   const [phase, setPhase] = useState(null)      // 'thinking' | 'tool' | 'responding' | 'steering'
   const [elapsed, setElapsed] = useState(0)    // 本轮已处理秒数
+  const [decodeRate, setDecodeRate] = useState(null)  // #212: 实时近似 {tps}, null=无数据
   const elapsedTimerRef = useRef(null)
   const abortRef = useRef(null)
   const runIdRef = useRef(null)   // 当前运行中的 run_id, steer 用
+  // issue #209 (流式中切会话被拦+串台): 视图级摘流两件套。
+  //   viewSidRef   — 当前画面展示的 session sid。切换/新建/ensureSession
+  //                  处**同步**改写 (不等 React 渲染, 摘流零窗口), 传给
+  //                  gateway.chatStream 的 opts.activeSidRef, 流回调层按
+  //                  sessionId 过滤丢弃 —— 与 histPendingSidRef 重试机制
+  //                  (#75-s10) 同层同思路 (过期响应丢弃)。
+  //   streamGenRef — 流世代号。摘流时 +1; 旧流的 catch/finally 比对世代,
+  //                  不一致即整体跳过 —— 视图 state (busy/phase/runInfo/
+  //                  abortRef/timers) 自此归新会话, 旧流收尾不得倒踩。
+  const viewSidRef = useRef(sessionId)
+  const streamGenRef = useRef(0)
   // Issue#8 (2026-10-13): 轮询守门用的 ref —— 即使 React 18 strict mode
   // 把 setSessionId 与 setInterval 排在不同宏任务, 旧 tick 也能在 await
   // 后比对「closure sid vs 当前 React sid」, 不等则丢结果。这个 ref 在
@@ -710,6 +820,11 @@ const ChatView = React.forwardRef(function ChatView(
   const [twLaunching, setTwLaunching] = useState(false) // 提交中
   const [twError, setTwError] = useState('')            // 弹窗内错误
   const [twWorkspace, setTwWorkspace] = useState('')    // 弹窗里选的工作目录(空=继承 session 绑定)
+  // issue #211: 弹窗附件 —— 选择即上传(与聊天附件 :1338 同模式), 提交时
+  // 仍挂在清单上的绝对路径随 detail 入队; 取消弹窗孤儿文件不回收(PLAN §1.2)。
+  const [twFiles, setTwFiles] = useState([])            // [{id,name,path,bytes,uploading,error}]
+  const twFileInputRef = useRef(null)                   // 隐藏 file input
+  const twFileSeqRef = useRef(0)                        // 条目 id 自增
   // issue #164: 弹窗提交改入队后的「已加入收件箱」提示条 (5s 自动消失)
   const [queueToast, setQueueToast] = useState('')
   useEffect(() => {
@@ -1063,6 +1178,9 @@ const ChatView = React.forwardRef(function ChatView(
   const ensureSession = useCallback(async () => {
     if (sessionId) return sessionId
     const sid = await g.createSession()
+    // issue #209: 新 sid 落地同步进摘流 ref —— 必须在 chatStream 起流前指向
+    // 新 sid, 否则摘流过滤会把本流自己的事件当「旧会话残余」丢掉。
+    viewSidRef.current = sid
     setSessionId(sid)
     // 新 session 创建后, 把 draft 期选的 workspace 迁到新 sid 名下
     const draftWs = localStorage.getItem(wsKeyFor(''))
@@ -1074,35 +1192,76 @@ const ChatView = React.forwardRef(function ChatView(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
 
+  // issue #209: 视图级摘流 —— 切会话/新建对话时, 对仍在流式的旧 run 停止向
+  // 当前视图渲染 (run 服务端继续, #63 保活语义: 只 abort 本地 fetch, 不调
+  // g.stop)。三层保障缺一不可:
+  //   1) streamGenRef+1 → 旧流 catch/finally 世代不符整体跳过, 视图 state
+  //      归新会话 (否则旧流收尾的 setBusy(false)/finalizeTurn 会倒踩新会话);
+  //   2) abort 本地 fetch → 事件源真正关闭 (fallback 轮询按 aborted 退出);
+  //   3) 调用方已先把 viewSidRef 指向新 sid → gateway 流回调层丢弃同 tick
+  //      已排队的残余帧 (abort 生效前窗口也不串台)。
+  // 幂等: 无流在跑时调用只是空转 (clearInterval(null)/setBusy(false) 无害)。
+  const detachStream = () => {
+    streamGenRef.current += 1
+    abortRef.current?.abort()
+    abortRef.current = null
+    clearInterval(reasoningTimerRef.current)
+    reasoningTimerRef.current = null
+    clearInterval(elapsedTimerRef.current)
+    elapsedTimerRef.current = null
+    setBusy(false)
+    setPhase(null)
+    setRunInfo(null)
+    setDecodeRate(null)
+    runIdRef.current = null
+  }
+
   // 可复用流式执行: 把 content 发给指定(或当前)session, 流式渲染 assistant 回复。
   // sidOverride 用于 Team Work 刚 createSession 后 React state 尚未更新的场景。
   // 事件处理全部委托 buildTurnStreamHandler 公共工厂 (DESIGN D6), 与 send 共用。
   const runStream = useCallback(async (content, sidOverride) => {
+    const gen = streamGenRef.current   // #209: 世代快照, 摘流后本流收尾整体作废
     setBusy(true)
     setPhase('queued')
     setElapsed(0)
+    setDecodeRate(null)   // #212: 新回合从零开始, 不残留上回合速率
     clearInterval(elapsedTimerRef.current)
     elapsedTimerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000)
     try {
       const sid = sidOverride || await ensureSession()
+      viewSidRef.current = sid   // #209: 起流前把摘流 ref 锚定到本流会话
       const ac = new AbortController()
       abortRef.current = ac
       const handler = buildTurnStreamHandler({
         setMessages, setRunInfo, setPhase, turnDedupRef, reasoningSeenRef,
         reasoningTimerRef, runIdRef,
         fetchMessages: async () => ((await g.getMessages(sid)) || {}).data || [],
+        // #212: 实时近似 setter + session 五桶快照 (同源代理 GET /api/sessions/{sid},
+        // 非 2xx/异常 → null, 校准侧 fail-open)
+        setDecodeRate,
+        fetchSessionTokens: async () => {
+          const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}`)
+          if (!r.ok) return null
+          const s = (await r.json()).session || {}
+          const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+          return { output_tokens: n(s.output_tokens), reasoning_tokens: n(s.reasoning_tokens) }
+        },
       })
-      await g.chatStream(sid, content, handler, ac.signal)
+      await g.chatStream(sid, content, handler, ac.signal, { activeSidRef: viewSidRef })
     } catch (e) {
-      setError(String(e.message || e))
+      // 摘流后的 AbortError 是预期路径 (用户已切走), 世代不符不弹错误
+      if (streamGenRef.current === gen) setError(String(e.message || e))
     } finally {
-      finalizeTurn(setMessages, { reasoning: reasoningTimerRef.current, elapsed: elapsedTimerRef.current })
-      reasoningTimerRef.current = null
-      setBusy(false)
-      setPhase(null)
-      setRunInfo(null)
-      runIdRef.current = null
-      abortRef.current = null
+      // 世代不符 = 已摘流, 视图 state 归新会话, 本流收尾一律跳过
+      if (streamGenRef.current === gen) {
+        finalizeTurn(setMessages, { reasoning: reasoningTimerRef.current, elapsed: elapsedTimerRef.current })
+        reasoningTimerRef.current = null
+        setBusy(false)
+        setPhase(null)
+        setRunInfo(null)
+        runIdRef.current = null
+        abortRef.current = null
+      }
     }
   }, [ensureSession])
 
@@ -1202,14 +1361,17 @@ const ChatView = React.forwardRef(function ChatView(
     }
     setPendingFiles([])
 
+    const gen = streamGenRef.current   // #209: 世代快照, 摘流后本流收尾整体作废
     setBusy(true)
     setPhase('queued')
     setElapsed(0)
+    setDecodeRate(null)   // #212: 新回合从零开始, 不残留上回合速率
     clearInterval(elapsedTimerRef.current)
     elapsedTimerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000)
     setMessages((m) => [...m, { role: 'user', text: fullTextForDisplay(text, files), files, ts: Date.now() / 1000 }])
     try {
       const sid = await ensureSession()
+      viewSidRef.current = sid   // #209: 起流前把摘流 ref 锚定到本流会话
       const ac = new AbortController()
       abortRef.current = ac
       // 事件处理与 runStream 共用公共工厂 (DESIGN D6), 不再维护两套 switch
@@ -1217,18 +1379,32 @@ const ChatView = React.forwardRef(function ChatView(
         setMessages, setRunInfo, setPhase, turnDedupRef, reasoningSeenRef,
         reasoningTimerRef, runIdRef,
         fetchMessages: async () => ((await g.getMessages(sid)) || {}).data || [],
+        // #212: 实时近似 setter + session 五桶快照 (同源代理 GET /api/sessions/{sid},
+        // 非 2xx/异常 → null, 校准侧 fail-open)
+        setDecodeRate,
+        fetchSessionTokens: async () => {
+          const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}`)
+          if (!r.ok) return null
+          const s = (await r.json()).session || {}
+          const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+          return { output_tokens: n(s.output_tokens), reasoning_tokens: n(s.reasoning_tokens) }
+        },
       })
-      await g.chatStream(sid, content, handler, ac.signal)
+      await g.chatStream(sid, content, handler, ac.signal, { activeSidRef: viewSidRef })
     } catch (e) {
-      setError(String(e.message || e))
+      // 摘流后的 AbortError 是预期路径 (用户已切走), 世代不符不弹错误
+      if (streamGenRef.current === gen) setError(String(e.message || e))
     } finally {
-      finalizeTurn(setMessages, { reasoning: reasoningTimerRef.current, elapsed: elapsedTimerRef.current })
-      reasoningTimerRef.current = null
-      setBusy(false)
-      setPhase(null)
-      setRunInfo(null)
-      runIdRef.current = null
-      abortRef.current = null
+      // 世代不符 = 已摘流, 视图 state 归新会话, 本流收尾一律跳过
+      if (streamGenRef.current === gen) {
+        finalizeTurn(setMessages, { reasoning: reasoningTimerRef.current, elapsed: elapsedTimerRef.current })
+        reasoningTimerRef.current = null
+        setBusy(false)
+        setPhase(null)
+        setRunInfo(null)
+        runIdRef.current = null
+        abortRef.current = null
+      }
     }
   }, [input, busy, ensureSession, pendingFiles])
 
@@ -1319,7 +1495,11 @@ const ChatView = React.forwardRef(function ChatView(
   }
 
   const newChat = () => {
-    if (busy) return
+    // issue #209: 新建钮流式可用 —— 不再被 busy 拦。先切 draft 视图 (sid='')
+    // 再摘流: viewSidRef 与旧流 sid 不符 → gateway 回调层丢残余帧;
+    // detachStream abort 本地流, 旧 run 服务端继续。
+    viewSidRef.current = ''
+    detachStream()
     setSessionId('')
     setMessages([])
     setError('')
@@ -1354,6 +1534,7 @@ const ChatView = React.forwardRef(function ChatView(
     setTwTask('')
     setTwWorkflow('auto')
     setTwWorkspace(workspace || '')  // 默认继承当前 session 的工作目录
+    setTwFiles([])                   // issue #211: 每次打开弹窗附件清单归零
     setTwOpen(true)
     // 拉 workflow 列表(后端未就绪时 fallback 到 auto-only)
     try {
@@ -1368,7 +1549,68 @@ const ChatView = React.forwardRef(function ChatView(
     if (twLaunching) return
     setTwOpen(false)
     setTwError('')
+    setTwFiles([])                   // issue #211: 关闭/取消一并清附件清单
   }
+
+  // ── issue #211: 弹窗附件上传 (选择即上传, 复用聊天附件 /api/upload 模式) ──
+  // 单文件上传: FileReader → dataURL → POST /api/upload → 绝对路径回填条目。
+  // 服务端 20MB 闸文案(「附件超过 20MB 上限」)映射本地化 attach_too_large,
+  // 其余失败统一 attach_upload_failed (条目红字 + 可移除后重选重试)。
+  const uploadTwFile = async (entryId, file) => {
+    try {
+      const dataUrl = await new Promise((resolve, reject) => {
+        const r = new FileReader()
+        r.onload = () => resolve(r.result)
+        r.onerror = () => reject(new Error(t('chat.errors.file_read_failed')))
+        r.readAsDataURL(file)
+      })
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: file.name, data: dataUrl }),
+      })
+      const d = await res.json().catch(() => ({}))
+      if (!res.ok || !d.ok || !d.path) {
+        const err = new Error(String(d.error || '').includes('20MB') ? 'too_large' : 'upload_failed')
+        throw err
+      }
+      setTwFiles((p) => p.map((f) => (f.id === entryId
+        ? { ...f, path: d.path, bytes: (typeof d.bytes === 'number' ? d.bytes : file.size), uploading: false, error: '' }
+        : f)))
+    } catch (e) {
+      setTwFiles((p) => p.map((f) => (f.id === entryId
+        ? { ...f, uploading: false, error: (String(e && e.message) === 'too_large') ? 'too_large' : 'upload_failed' }
+        : f)))
+    }
+  }
+  // 选择文件: 超数/超大前端预检(不发请求), 通过者先挂 uploading 条目再异步上传。
+  const onTwFilesPicked = (e) => {
+    const picked = Array.from(e.target.files || [])
+    e.target.value = ''  // 允许重选同名文件
+    if (!picked.length) return
+    const slots = TW_ATTACH_MAX_FILES - twFiles.length
+    if (slots <= 0) { setTwError(t('chat.team_work_modal.attach_too_many')); return }
+    const accepted = picked.slice(0, slots)
+    if (picked.length > slots) setTwError(t('chat.team_work_modal.attach_too_many'))
+    const entries = accepted.map((f) => {
+      const entry = {
+        id: ++twFileSeqRef.current, name: f.name, bytes: f.size,
+        uploading: false, error: '', path: '',
+      }
+      if (f.size > TW_ATTACH_MAX_BYTES) {
+        entry.error = 'too_large'    // 预检超限: 不发请求, 条目直接标红
+      } else {
+        entry.uploading = true
+      }
+      return entry
+    })
+    setTwFiles((p) => [...p, ...entries])
+    entries.forEach((entry, i) => {
+      if (entry.uploading) void uploadTwFile(entry.id, accepted[i])
+    })
+  }
+  const removeTwFile = (id) => setTwFiles((p) => p.filter((f) => f.id !== id))
+
   // 把 openTeamWork 暴露给父组件(App.jsx 的全局「核心功能」按钮使用)。
   // R2.6: 全局按钮恒可点击 —— 这里不感知/不调用 busy,流式回复中点击
   //       弹窗仍会打开,真正的旧流清理交给 submitTeamWork 内部的 (a) 步
@@ -1380,6 +1622,9 @@ const ChatView = React.forwardRef(function ChatView(
   const submitTeamWork = async () => {
     const task = twTask.trim()
     if (!task) { setTwError(t('chat.errors.teamwork_task_required')); return }
+    // issue #211: 有附件仍在上传 ⇒ 拒绝提交 (按钮 disabled 之外的兜底守卫),
+    // 避免 detail 少拼路径。上传失败/超限条目不入 detail, 用户可移除后重试。
+    if (twFiles.some((f) => f.uploading)) { setTwError(t('chat.team_work_modal.attach_uploading')); return }
     setTwLaunching(true)
     setTwError('')
     // issue #164 (F7/AC-7.x) + 追加裁决 (ENTRY-164B): 「确定并启用」不再直接
@@ -1391,7 +1636,8 @@ const ChatView = React.forwardRef(function ChatView(
     // 不动; 失败仍走 setTwError。
     try {
       await api.scheduleCreate({
-        detail: task,
+        // issue #211: 附件绝对路径清单按协议格式追加进 detail (buildTeamWorkDetail)
+        detail: buildTeamWorkDetail(task, twFiles),
         workflow: twWorkflow || 'auto',
         workspace: twWorkspace || '',
       })
@@ -1407,8 +1653,15 @@ const ChatView = React.forwardRef(function ChatView(
   }
 
   const switchSession = async (sid) => {
-    if (busy || sid === sessionId) { setListOpen(false); return }
+    // issue #209: 去掉 busy 短路 (issue 口径: 浏览器已与 console-hermes 脱钩,
+    // 不需严格限制切换) —— 流式中照样可切。只保留同会话短路。切换前先做
+    // 视图级摘流: viewSidRef 同步指向目标 sid (不等 React 渲染), 旧流残余
+    // token 在 gateway 回调层按 sessionId 过滤丢弃; detachStream abort 本地
+    // 流并复位视图 state, 旧 run 服务端继续 (#63 保活)。
+    if (sid === sessionId) { setListOpen(false); return }
     setListOpen(false)
+    viewSidRef.current = sid
+    detachStream()
     setLoadingHist(true)
     setError('')
     // issue #75 s10 C-1: 切换失败也要能重试 —— 失败时记下目标 sid 到
@@ -1432,6 +1685,9 @@ const ChatView = React.forwardRef(function ChatView(
       setHistErr('')
       histPendingSidRef.current = ''
     } catch (e) {
+      // #209: 切换失败 = 画面仍是旧会话, viewSidRef 回指旧 sid,
+      // 否则旧会话后续发送会被摘流过滤误丢自己的事件。
+      viewSidRef.current = sessionId
       seenIdsRef.current = seenSnapshot   // 还原去重集 (旧会话消息仍在画面上)
       histPendingSidRef.current = sid     // 记下待重试的目标会话
       setHistLoadFailed(true)
@@ -1445,11 +1701,13 @@ const ChatView = React.forwardRef(function ChatView(
     <div className="chat-touch flex flex-col h-full -m-3 md:-m-6">
       {/* 工具条 (CONSOLE2 §4.3: flex-wrap 双行, 375px 不溢出; 裸 session_id 收进 title) */}
       <div className="shrink-0 flex flex-wrap items-center gap-2 px-3 md:px-6 py-2 border-b border-line bg-panel/40 relative">
-        <button onClick={openList} disabled={busy || loadingHist}
+        {/* issue #209: 摘掉 busy 闸 —— 流式中可开会话列表切换 (loadingHist
+            闸保留: 历史在飞时再切会并发两个 loadHistoryWindow, 与 #75 竞态纪律冲突) */}
+        <button onClick={openList} disabled={loadingHist}
           className="btn-ghost btn-sm flex items-center gap-1.5 max-w-[320px] flex-1 md:flex-none"
           title={sessionId || t('chat.session.new_session_title')}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-               strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 shrink-0">
+               strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4 shrink-0" aria-hidden="true">
             <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />
           </svg>
           <span className="truncate">
@@ -1458,18 +1716,19 @@ const ChatView = React.forwardRef(function ChatView(
               : t('chat.session.new_btn')}
           </span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-               strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0">
+               strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0" aria-hidden="true">
             <path d="M6 9l6 6 6-6" />
           </svg>
         </button>
         {/* 工作目录选择器: 当前对话的 workspace, 透传给所有 worker */}
         <div className="relative">
+          {/* issue #209: 摘掉 busy 闸 —— 流式中也可换 workspace 绑定
+              (per-session 持久化, 只影响下一条消息, 不碰在跑的 run) */}
           <button onClick={() => { if (!wsOpen) loadWorkspaces(); setWsOpen(!wsOpen) }}
-                  disabled={busy}
                   className="btn-ghost btn-sm flex items-center gap-1.5 max-w-[200px]"
                   title={t('chat.input.workspace_label', { path: workspace || '' })}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-                 strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0">
+                 strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0" aria-hidden="true">
               <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
             </svg>
             <span className="truncate font-mono text-[11px]" title={workspace || ''}>
@@ -1489,7 +1748,9 @@ const ChatView = React.forwardRef(function ChatView(
                                   flex items-center gap-2 ${workspace === w.path ? 'bg-accent/10 text-accent' : ''}`}>
                   <span className="font-mono truncate">{w.name}</span>
                   {!w.writable && <span className="text-[10px] text-bad shrink-0">{t('chat.session.readonly_badge')}</span>}
-                  {workspace === w.path && <span className="ml-auto shrink-0">✓</span>}
+                  {workspace === w.path && (
+                    <span className="ml-auto shrink-0"><Icon d={ICONS.check} className="w-3.5 h-3.5" /></span>
+                  )}
                 </button>
               ))}
               {workspaces.length === 0 && (
@@ -1521,7 +1782,7 @@ const ChatView = React.forwardRef(function ChatView(
                 title={workspace ? t('chat.files.btn_label') : t('chat.files.no_workspace_hint')}
                 aria-label={t('chat.files.btn_label')}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-               strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0">
+               strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0" aria-hidden="true">
             <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
           </svg>
           <span className="hidden sm:inline">{t('chat.files.btn_label')}</span>
@@ -1530,7 +1791,8 @@ const ChatView = React.forwardRef(function ChatView(
           {/* 2026-10-15 改版:多智能体协作入口已迁至全局 header「核心功能」按钮
               (App.jsx 全局动作组 + 移动顶栏),本对话页右上角不再重复出现。
               空态引导保留(ChatView 内的「发起多智能体协作」按钮,R2.5)。*/}
-          <button onClick={newChat} className="btn-ghost btn-sm" disabled={busy}>{t('chat.session.new_btn')}</button>
+          {/* issue #209: 新建钮流式可用 —— newChat 内部先摘流再切 draft */}
+          <button onClick={newChat} className="btn-ghost btn-sm">{t('chat.session.new_btn')}</button>
           {onClose && (
             <button onClick={onClose} className="btn-ghost btn-sm !text-bad"
                     title={t('app.close_chat')}>
@@ -1572,13 +1834,16 @@ const ChatView = React.forwardRef(function ChatView(
 
       {/* 消息流 */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 md:px-6 py-4 space-y-3">
-        {/* issue #164: 入队成功反馈条 (聊天区顶部, 5s 自动消失, AC-7.4) */}
-        {queueToast && (
-          <div className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-ok/10 border border-ok/30 text-[12.5px] text-ok"
-               role="status">
+        {/* issue #164: 入队成功反馈条 (5s 自动消失, AC-7.4)。
+            issue #202 R2: 弹框改全局 overlay 后, 提交可能发生在任意视图 ——
+            反馈条同步 createPortal 到 body 顶部居中, 保证「停留原视图可见」
+            (AC-R2-4); 文案/5s 自动消失逻辑 (queueToast effect) 不变。 */}
+        {queueToast && createPortal(
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[60] flex items-center gap-2 max-w-[90vw]
+                         px-4 py-2.5 rounded-xl bg-ok/10 border border-ok/30 text-[12.5px] text-ok shadow-2xl"
+               role="status" aria-live="polite">
             <span className="min-w-0 break-words">{queueToast}</span>
-          </div>
-        )}
+          </div>, document.body)}
         {/* issue #75 B3 §5.3: 「更多历史对话」前插入口 (has_more=true 才显示;
             加载态 disabled+.spin; 错误态内联 .field-err, 按钮恢复可重试) */}
         {histMore && (
@@ -1626,7 +1891,7 @@ const ChatView = React.forwardRef(function ChatView(
             (issue #75 s10 C-1: 失败态优先, 不与错误条同时出现) */}
         {histLoaded && messages.length === 0 && !histLoadFailed && (
           <div className="h-full flex flex-col items-center justify-center text-dim gap-2">
-            <div className="text-[32px]" aria-hidden="true">💬</div>
+            <Icon d={ICONS.chat} className="w-8 h-8 text-dim" />
             {base ? (
               <>
                 <div className="text-[15px] font-semibold text-ink">{t('chat.session.chat_with', { name: targetLabel })}</div>
@@ -1677,7 +1942,7 @@ const ChatView = React.forwardRef(function ChatView(
                   {m.text}
                 </div>
                 {mTs && (
-                  <div className="text-[10.5px] text-dim/70 text-right pr-1 select-none"
+                  <div className="text-[10.5px] text-dim text-right pr-1 select-none"
                        title={m.ts ? new Date(m.ts * 1000).toLocaleString() : ''}>
                     {mTs}
                   </div>
@@ -1704,7 +1969,7 @@ const ChatView = React.forwardRef(function ChatView(
                         running ? 'bg-warn animate-pulse'
                         : hasErr ? 'bg-bad' : 'bg-ok/70'}`} />
                       <span className="font-medium text-ink/80">{t('chat.tool_call.calls_count', { n: items.length })}</span>
-                      <span className="text-dim/60 truncate min-w-0 font-mono" title={summary}>· {summary}</span>
+                      <span className="text-dim truncate min-w-0 font-mono" title={summary}>· {summary}</span>
                     </summary>
                     {/* 展开后逐条目渲染, 复用单卡内部结构, 状态随 items 实时更新 */}
                     <div className="mt-1.5 space-y-1.5">
@@ -1715,21 +1980,21 @@ const ChatView = React.forwardRef(function ChatView(
                               it.status === 'running' ? 'bg-warn animate-pulse'
                               : it.status === 'error' ? 'bg-bad' : 'bg-ok/70'}`} />
                             <span className="font-mono font-medium text-ink/80">{it.name}</span>
-                            <span className="text-dim/60 shrink-0" title={it.status}>
+                            <span className="text-dim shrink-0" title={it.status}>
                               {it.status === 'running' ? t('chat.tool_call.running_busy')
                               : it.status === 'error' ? t('chat.tool_call.failed') : t('chat.tool_call.done')}</span>
-                            {it.args && <span className="text-dim/50 truncate min-w-0">· {it.args.split('\n')[0].slice(0, 60)}</span>}
+                            {it.args && <span className="text-dim truncate min-w-0">· {it.args.split('\n')[0].slice(0, 60)}</span>}
                           </div>
                           {it.args && (
                             <div className="mt-1">
-                              <div className="text-[10.5px] text-dim/70 mb-0.5">{t('chat.tool_call.args')}</div>
+                              <div className="text-[10.5px] text-dim mb-0.5">{t('chat.tool_call.args')}</div>
                               <pre className="text-[11px] text-dim leading-snug whitespace-pre-wrap break-all
                                              bg-canvas/60 border border-line/50 rounded-lg p-2 max-h-[200px] overflow-y-auto font-mono">{it.args}</pre>
                             </div>
                           )}
                           {it.result != null && (
                             <div className="mt-1">
-                              <div className="text-[10.5px] text-dim/70 mb-0.5">{t('chat.tool_call.result')}</div>
+                              <div className="text-[10.5px] text-dim mb-0.5">{t('chat.tool_call.result')}</div>
                               <pre className={`text-[11px] leading-snug whitespace-pre-wrap break-all
                                              border rounded-lg p-2 max-h-[240px] overflow-y-auto font-mono ${
                                 it.status === 'error' ? 'text-bad bg-bad/5 border-bad/30'
@@ -1751,7 +2016,7 @@ const ChatView = React.forwardRef(function ChatView(
                                      flex items-center gap-1.5 hover:text-ink transition-colors">
                     <span className={`w-1.5 h-1.5 rounded-full ${m.streaming ? 'bg-warn animate-pulse' : 'bg-dim/60'}`} />
                     <span className="font-medium">{m.streaming ? t('chat.tool_call.thinking_busy') : t('chat.tool_call.thinking')}</span>
-                    <span className="text-dim/60">({(m.text || '').length} {t('chat.tool_call.chars_suffix')})</span>
+                    <span className="text-dim">({(m.text || '').length} {t('chat.tool_call.chars_suffix')})</span>
                   </summary>
                   <div className="mt-2 text-[11.5px] text-dim leading-relaxed whitespace-pre-wrap
                                  border-l-2 border-warn/40 pl-2.5 max-h-[240px] overflow-y-auto">
@@ -1778,9 +2043,24 @@ const ChatView = React.forwardRef(function ChatView(
                 )}
                 {/* assistant 回合时间标签: 与 user 一样只在 ts 存在时显示 */}
                 {mTs && !m.streaming && (
-                  <div className="text-[10.5px] text-dim/70 pl-1 select-none"
+                  <div className="text-[10.5px] text-dim pl-1 select-none"
                        title={m.ts ? new Date(m.ts * 1000).toLocaleString() : ''}>
                     {mTs}
+                  </div>
+                )}
+                {/* #212: 回合 decode 速度收口行 — 近似(收口前最后窗口值) +
+                    精确(session output_tokens Δ ÷ 生成时长); reasoning 独立分桶
+                    (PLAN-U §2.3), 有值才显示; 校准缺失时整行不渲染 (宁缺勿假) */}
+                {m.decodeStats && (
+                  <div className="text-[10.5px] text-dim pl-1 select-none"
+                       title={t('chat.decode_speed.tooltip')}>
+                    {t('chat.decode_speed.label')}
+                    {m.decodeStats.approxTps != null && m.decodeStats.approxTps > 0 &&
+                      `: ${t('chat.decode_speed.approx', { n: Math.round(m.decodeStats.approxTps) })}`}
+                    {m.decodeStats.exactTps != null &&
+                      `${m.decodeStats.approxTps != null && m.decodeStats.approxTps > 0 ? ' · ' : ': '}${t('chat.decode_speed.exact', { n: m.decodeStats.exactTps.toFixed(1) })}`}
+                    {m.decodeStats.reasoningTps > 0 &&
+                      ` ${t('chat.decode_speed.reasoning_suffix', { n: m.decodeStats.reasoningTps.toFixed(1) })}`}
                   </div>
                 )}
               </div>
@@ -1811,6 +2091,12 @@ const ChatView = React.forwardRef(function ChatView(
             )}
             {phase === 'responding' && (<>{t('chat.tool_call.replying')}</>)}
             {phase === 'steering' && (<>{t('chat.input.steer_hint')}</>)}
+            {/* #212: decode 速度实时近似 (滑动窗口 chars/s ÷4 粗估 tok/s, 标「近似」) */}
+            {decodeRate && phase === 'responding' && decodeRate.tps > 0 && (
+              <span className="decode-rate text-dim" title={t('chat.decode_speed.tooltip')}>
+                {t('chat.decode_speed.approx', { n: Math.round(decodeRate.tps) })}
+              </span>
+            )}
             <span className="elapsed">{elapsed}s</span>
           </div>
         )}
@@ -1840,7 +2126,7 @@ const ChatView = React.forwardRef(function ChatView(
                   <span className="text-[11.5px] text-dim">{c.desc}</span>
                 </button>
               ))}
-              <div className="px-4 pt-1.5 text-[10.5px] text-dim/60 border-t border-line/50">
+              <div className="px-4 pt-1.5 text-[10.5px] text-dim border-t border-line/50">
                 {t('chat.input.completion_hint')}
               </div>
             </div>
@@ -1854,7 +2140,10 @@ const ChatView = React.forwardRef(function ChatView(
                 <span className="text-ink truncate max-w-[200px]">{f.name}</span>
                 <span className="text-dim">{(f.bytes / 1024).toFixed(1)} KB</span>
                 <button onClick={() => setPendingFiles((p) => p.filter((_, j) => j !== i))}
-                        className="text-dim hover:text-bad">✕</button>
+                        className="text-dim hover:text-bad"
+                        aria-label={t('common.close')}>
+                  <Icon d={ICONS.close} className="w-3.5 h-3.5" />
+                </button>
               </div>
             ))}
           </div>
@@ -1866,7 +2155,7 @@ const ChatView = React.forwardRef(function ChatView(
                   className="btn-ghost btn-sm shrink-0 self-stretch flex items-center"
                   title={t('chat.input.attach')}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-                 strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
+                 strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4" aria-hidden="true">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
             </svg>
           </button>
@@ -1899,7 +2188,7 @@ const ChatView = React.forwardRef(function ChatView(
             placeholder={t('chat.input.placeholder')}
             rows={2}
             className="flex-1 resize-none rounded-xl bg-panel2 border border-line px-3.5 py-2.5
-                       text-[13.5px] text-ink placeholder:text-dim/60 outline-none
+                       text-[13.5px] text-ink placeholder:text-dim outline-none
                        focus:ring-1 focus:ring-accent/50"
           />
           {busy && (
@@ -1914,13 +2203,18 @@ const ChatView = React.forwardRef(function ChatView(
       </div>
 
       {/* ── 多智能体协作启动弹窗 (CONSOLE2 §4.4: 迁移 ui.jsx Modal,
-           获得 Escape/遮罩关闭/弹入动画; 提交中防误关走 closeTeamWork 既有守卫) ── */}
+           获得 Escape/遮罩关闭/弹入动画; 提交中防误关走 closeTeamWork 既有守卫)
+           issue #202 R2 (硬约束 2): createPortal 挂 document.body —— 弹框不再
+           受视图容器 display:none 影响, 任意视图原地以覆盖层打开, 不切 view /
+           不切 chat tab (openCoreFeatures 已去掉 setView/setActiveChat)。 ── */}
+      {createPortal(
       <Modal open={twOpen} onClose={closeTeamWork} title={t('chat.team_work_modal.title')} width="max-w-[560px]"
         footer={
           <>
             <button onClick={closeTeamWork} disabled={twLaunching}
                     className="btn-ghost btn-sm">{t('common.cancel')}</button>
-            <button onClick={submitTeamWork} disabled={twLaunching || !twTask.trim()}
+            <button onClick={submitTeamWork}
+                    disabled={twLaunching || !twTask.trim() || twFiles.some((f) => f.uploading)}
                     className="btn-primary btn-sm">
               {twLaunching ? (<><span className="spin" />{t('chat.team_work_modal.start_busy_btn')}</>) : t('chat.team_work_modal.start_btn')}
             </button>
@@ -1941,7 +2235,7 @@ const ChatView = React.forwardRef(function ChatView(
                 autoFocus
                 placeholder={t('chat.team_work_modal.task_placeholder')}
                 className="w-full resize-none rounded-lg bg-canvas border border-line px-3 py-2.5
-                           text-[13px] text-ink placeholder:text-dim/60 outline-none
+                           text-[13px] text-ink placeholder:text-dim outline-none
                            focus:border-accent focus:ring-2 focus:ring-accent/25"
               />
               <div className="hint">{t('chat.team_work_modal.task_requirement_hint')}</div>
@@ -1986,6 +2280,45 @@ const ChatView = React.forwardRef(function ChatView(
               </div>
             </div>
 
+            {/* issue #211: 附件字段 —— 选择即上传, 清单逐行(名称+大小+移除),
+                上传中/失败/超限三态均有 t() 文案; 提交时成功条目路径进 detail。 */}
+            <div>
+              <label className="label">{t('chat.team_work_modal.attach_label')}</label>
+              <input type="file" multiple ref={twFileInputRef} className="hidden"
+                     onChange={onTwFilesPicked} disabled={twLaunching} />
+              <button type="button" className="btn-ghost btn-sm"
+                      onClick={() => twFileInputRef.current && twFileInputRef.current.click()}
+                      disabled={twLaunching || twFiles.length >= TW_ATTACH_MAX_FILES}>
+                {t('chat.team_work_modal.attach_btn')}
+              </button>
+              <div className="hint">{t('chat.team_work_modal.attach_hint')}</div>
+              {twFiles.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {twFiles.map((f) => (
+                    <div key={f.id}
+                         className="flex items-center gap-2 rounded-lg bg-canvas border border-line px-2.5 py-1.5 text-[12px]">
+                      <span className="truncate text-ink" title={f.path || f.name}>{f.name}</span>
+                      <span className="shrink-0 text-dim">{(f.bytes / 1024).toFixed(1)} KB</span>
+                      {f.uploading && (
+                        <span className="shrink-0 text-dim"><span className="spin" />{t('chat.team_work_modal.attach_uploading')}</span>
+                      )}
+                      {!f.uploading && f.error === 'too_large' && (
+                        <span className="shrink-0 text-bad">{t('chat.team_work_modal.attach_too_large')}</span>
+                      )}
+                      {!f.uploading && f.error === 'upload_failed' && (
+                        <span className="shrink-0 text-bad">{t('chat.team_work_modal.attach_upload_failed')}</span>
+                      )}
+                      <button type="button" className="btn-ghost btn-sm ml-auto shrink-0"
+                              onClick={() => removeTwFile(f.id)} disabled={twLaunching}
+                              title={t('chat.team_work_modal.attach_remove')}>
+                        {t('chat.team_work_modal.attach_remove')}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {twError && (
               <div className="px-3 py-2 rounded-lg bg-bad/10 border border-bad/30 text-[12.5px] text-bad" title={twError}>
                 {twError}
@@ -1994,6 +2327,7 @@ const ChatView = React.forwardRef(function ChatView(
           </div>
         )}
       </Modal>
+      , document.body)}
       {/* Issue #46 (s4-impl): 文件浏览器抽屉。key={workspace} 整体重挂载,
           切工作目录/切会话时树与预览天然重置(AC-A5 / R4.5)。
           project 必须只传项目名(basename), 绝对路径会被后端正则拒绝 (R-2 / ARCH §4.1)。 */}

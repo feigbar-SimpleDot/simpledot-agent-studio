@@ -19,6 +19,8 @@
       (设置页保存会钉死 False 压掉自动探测); api_settings_save 拒收该键
   W8  compose 守护: 8787 宿主端口映射已删; HERMES_WEBUI_HOST=127.0.0.1
   W9  verify.sh 守护: webui 探活走 docker exec 容器内探测 (宿主 curl 已删)
+  W12 issue #199: 302 Location 里 next=/ (或 %2F) 定点改写为 next=/webui/;
+      非精确根值 (next=/x 等) 与非 3xx 响应原样透传
 
 跑法: 仓库根 .venv 下 `pytest tests/test_issue131_webui_proxy.py -v`
 """
@@ -313,15 +315,19 @@ def test_w6a_forwards_host_cookie_csrf_origin():
 
 
 def test_w6b_redirect_not_followed():
-    """302 原样透传 (相对 Location 由浏览器按 /webui/ 前缀解析)。"""
-    resp = FakeResp(302, {"Location": "login?next=/",
+    """302 不跟随、Location 原样透传 (相对 Location 由浏览器按 /webui/ 前缀解析)。
+
+    issue #199 后 next=/ 会被定点改写 (见 W12), 本用例改用**非根** next 值
+    保持「原样透传」语义纯净 —— 不跟随重定向的结构性守护仍在此处。
+    """
+    resp = FakeResp(302, {"Location": "login?next=/x",
                           "Content-Type": "text/html"}, b"")
     op = FakeOpener(resp)
     h = make_handler(path="/webui/")
     with mock.patch.object(wp, "_opener", op):
         wp.proxy_http(h, "/")
     assert ("status", 302) in h.headers_sent
-    assert ("Location", "login?next=/") in h.headers_sent
+    assert ("Location", "login?next=/x") in h.headers_sent
     # 结构性守护: 模块 opener 的 redirect handler 永不跟随
     rh = [x for x in wp._opener.handlers
           if isinstance(x, urllib.request.HTTPRedirectHandler)]
@@ -470,8 +476,9 @@ def test_w10c_slash_and_post_not_redirected():
         wp.proxy_http(h1, "/")
         wp.proxy_http(h2, "")
     assert len(op.requests) == 2      # 两者都走了上游
-    assert not any(s == 302 for k, s in h1.headers_sent if k == "status")
-    assert not any(s == 302 for k, s in h2.headers_sent if k == "status")
+    # issue #198: 正向成员断言, 与 W10a/b 的 ("status", code) in headers_sent 风格对称
+    assert ("status", 302) not in h1.headers_sent
+    assert ("status", 302) not in h2.headers_sent
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -499,3 +506,60 @@ def test_w11b_webui_status_key_not_in_defaults():
     """端点只读探测, 其依赖键 webui_proxy_enabled 刻意不进 SETTINGS_DEFAULTS
     (与 W7 同法守护: 进键集会被设置页保存钉死, 压掉自动探测)。"""
     assert "webui_proxy_enabled" not in console.SETTINGS_DEFAULTS
+
+
+# ──────────────────────────────────────────────────────────────────
+# W12: issue #199 未登录闭环 next=/ 改写为 next=/webui/ (proxy_http 直测)
+# ──────────────────────────────────────────────────────────────────
+
+def _proxy_location(status, location):
+    """上游 status+Location 经 proxy_http 透传后, 代理回传的 Location。"""
+    resp = FakeResp(status, {"Location": location,
+                             "Content-Type": "text/html"}, b"")
+    op = FakeOpener(resp)
+    h = make_handler(path="/webui/")
+    with mock.patch.object(wp, "_opener", op):
+        wp.proxy_http(h, "/")
+    locs = [v for k, v in h.headers_sent if k == "Location"]
+    assert len(locs) == 1
+    return locs[0]
+
+
+def test_w12a_next_root_rewritten():
+    """302 login?next=/ ⇒ 改写为 login?next=/webui/ (未登录闭环落 /webui/)。"""
+    assert _proxy_location(302, "login?next=/") == "login?next=/webui/"
+
+
+def test_w12b_next_root_percent_encoded_rewritten():
+    """%2F 编码形态同改 (webui 上游两种形态都可能出现)。"""
+    assert _proxy_location(302, "login?next=%2F") == "login?next=/webui/"
+
+
+def test_w12c_next_root_mid_query_rewritten():
+    """next 不在末尾 (& 边界) 同样改写, 前后参数不受影响。"""
+    assert _proxy_location(
+        302, "login?a=1&next=/&b=2") == "login?a=1&next=/webui/&b=2"
+
+
+def test_w12d_non_root_next_untouched():
+    """M11 变异反证锚: next=/x、next=/webui/ 等非精确根值必须原样。"""
+    assert _proxy_location(302, "login?next=/x") == "login?next=/x"
+    assert _proxy_location(302, "login?next=/webui/") == "login?next=/webui/"
+    assert _proxy_location(302, "login?next=/webui/api/x") == "login?next=/webui/api/x"
+    # next= 空值与无 next 同样不动
+    assert _proxy_location(302, "login?next=") == "login?next="
+    assert _proxy_location(302, "/webui/login") == "/webui/login"
+
+
+def test_w12e_non_redirect_status_untouched():
+    """非 3xx 响应即便带 Location 头也不改写 (改写只属重定向语义)。"""
+    assert _proxy_location(200, "login?next=/") == "login?next=/"
+
+
+def test_w12f_rewrite_unit():
+    """_rewrite_login_next 纯函数口径: 只匹配 (?=&|$) 整值边界。"""
+    assert wp._rewrite_login_next("login?next=/") == "login?next=/webui/"
+    assert wp._rewrite_login_next("login?next=%2F") == "login?next=/webui/"
+    assert wp._rewrite_login_next("login?next=/x") == "login?next=/x"
+    assert wp._rewrite_login_next("login?next=//") == "login?next=//"
+    assert wp._rewrite_login_next("no-query") == "no-query"

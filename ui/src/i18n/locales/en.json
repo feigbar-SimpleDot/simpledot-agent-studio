@@ -131,6 +131,14 @@
       "start_teamwork_btn": "Start multi-agent collaboration"
     },
     "team_work_modal": {
+      "attach_label": "Attachments",
+      "attach_btn": "Add attachments",
+      "attach_hint": "optional, up to 5 files, ≤20MB each; workers can read them by path",
+      "attach_uploading": "Uploading…",
+      "attach_upload_failed": "Attachment upload failed — retry",
+      "attach_too_large": "Attachment exceeds the 20MB limit",
+      "attach_too_many": "At most 5 attachments",
+      "attach_remove": "Remove",
       "auto_select": "Auto-select (LLM picks)",
       "cancel_btn": "Cancel",
       "inherit_option": "Inherit current session ({name})",
@@ -147,6 +155,13 @@
       "workspace_label": "Workspace",
       "workspace_placeholder": "(optional)",
       "queued_toast": "Added to the inbox queue"
+    },
+    "decode_speed": {
+      "approx": "≈{n} tok/s (approx)",
+      "exact": "{n} tok/s (exact)",
+      "label": "decode",
+      "reasoning_suffix": "+{n} tok/s reasoning",
+      "tooltip": "Live estimate from delta arrival intervals; calibrated with session output_tokens after the turn ends"
     },
     "team_work_prompt_label": "【Team Work 多智能体任务】",
     "tool_args_truncated": "… (truncated, {n} chars total)",
@@ -338,7 +353,7 @@
       "docker_compose_dir_hint": "Suggested host directory to save the generated worker docker-compose.yaml (advisory only).",
       "docker_compose_dir_label": "Worker compose output directory [host]",
       "hermes_webui_url_hint": "Link to the fuller WebUI (Agent management). Leave empty: when the webui is deployed (same-origin /webui proxy enabled) the header shows a \"hermes-webui\" entry pointing at /webui/ automatically, no config needed. Set an absolute URL (http(s)://...) to override the entry with that external address. With neither, the entry is hidden.",
-      "hermes_webui_url_label": "hermes-webui link",
+      "hermes_webui_url_label": "hermes-webui URL (optional)",
       "pixel_office_enabled_hint": "When enabled, the sidebar shows a \"Pixel Office\" tab that renders worker live status as pixel-character animation (embedded via same-origin console proxy; pixel-agents exposes no external port). Requires the compiled pixel-agents package mounted and sidecar running at deploy time. Enabling without that setup just shows \"sidecar not running\".",
       "pixel_office_enabled_label": "Pixel Office (pixel-agents)",
       "reaper_interval_seconds_hint": "Max delay for settling async tasks; independent of API read frequency (read count = settlement count).",
@@ -796,6 +811,7 @@
     "group": {
       "running": "Running",
       "pending": "Not started",
+      "paused": "Paused",
       "done": "Done / Cancelled"
     },
     "state": {
@@ -829,6 +845,9 @@
     "col_added": "Added",
     "col_executed": "Executed",
     "cron_badge": "Cron job",
+    "meta_workspace": "Workspace",
+    "meta_workspace_default": "default",
+    "meta_workflow": "Workflow",
     "empty": {
       "title": "Inbox is empty",
       "hint": "Click \"Start multi-agent collaboration\" in the top bar to join the inbox queue"

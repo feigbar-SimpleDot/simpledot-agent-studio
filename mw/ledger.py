@@ -124,11 +124,17 @@ CREATE TABLE IF NOT EXISTS team_work_runs (
     project_workspace   TEXT,
     current_card_id     TEXT,
     status              TEXT NOT NULL DEFAULT 'ACTIVE'
-        CHECK(status IN ('ACTIVE','CLOSED','ABORTED','ARCHIVED')),
+        CHECK(status IN ('ACTIVE','HOLD','CLOSED','ABORTED','ARCHIVED')),
     card_count          INTEGER NOT NULL DEFAULT 0,
     created_at          REAL NOT NULL,
     closed_at           REAL,
-    closed_reason       TEXT
+    closed_reason       TEXT,
+    -- 2026-11-04 issue #210 run hold: hold 留痕三列 (原因/操作者/时刻)。
+    -- hold 语义 = 冻结不再推进 (§1.3: 不杀 worker, current_card 不动),
+    -- 这三列只记录「谁在何时因何冻结」, 不参与任何扫描面判定。
+    hold_reason         TEXT,
+    hold_actor          TEXT,
+    hold_at             REAL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_team_work_one_active
     ON team_work_runs(status) WHERE status='ACTIVE';
@@ -286,6 +292,20 @@ class Ledger:
                 self.conn.execute(
                     "ALTER TABLE team_work_runs "
                     "ADD COLUMN last_waiting_at REAL")
+            # issue#210 (2026-11-04): run hold 留痕三列 —— hold_team_work
+            # 记录「谁在何时因何冻结」。纯加列, 迁移幂等: PRAGMA 检查后 ADD。
+            if "hold_reason" not in tw_cols:
+                self.conn.execute(
+                    "ALTER TABLE team_work_runs "
+                    "ADD COLUMN hold_reason TEXT")
+            if "hold_actor" not in tw_cols:
+                self.conn.execute(
+                    "ALTER TABLE team_work_runs "
+                    "ADD COLUMN hold_actor TEXT")
+            if "hold_at" not in tw_cols:
+                self.conn.execute(
+                    "ALTER TABLE team_work_runs "
+                    "ADD COLUMN hold_at REAL")
             # issue#13 (2026-10-15): waiting_sub 数据戳列 —— worker
             # 在 TODO.md 写 waiting_sub 后, reaper 在本卡首遇此状态时
             # 盖戳 (COALESCE 不覆盖); 仅作 derive_worker_state 派生
@@ -337,6 +357,96 @@ class Ledger:
                 self.conn.execute(
                     "ALTER TABLE harvest_contracts "
                     "ADD COLUMN plan_seq REAL")
+            # 2026-11-04 issue #210 run hold: team_work_runs.status CHECK
+            # 增 'HOLD'。SQLite 的 ALTER TABLE 不能改 CHECK ⇒ 表重建迁移
+            # (照下方 ARCHIVED 迁移先例: 事务内 新表→拷数→drop→rename)。
+            # 门控用内容判据 (建表 SQL 是否已含 'HOLD') 而非 user_version —
+            # 下方 ARCHIVED 块在部分库上静默失败不回写版本号, 版本号门控会
+            # 漏; 内容门控天然幂等, 重跑无害。迁移前强制备份 ledger.db +
+            # 行数校验 (PLAN-U §1.2/§1.5 硬口径)。
+            # 必须排在 ARCHIVED 块之前: ARCHIVED 块失败会 raise 短路本块。
+            tw_ddl = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='team_work_runs'").fetchone()
+            if tw_ddl and tw_ddl[0] and "'HOLD'" not in tw_ddl[0]:
+                # ⚠ 备份前必须 commit: 上方 seq 回填等 UPDATE 会开隐式事务,
+                # conn.backup() 在源连接持未提交事务时会死锁 (实测 b5 旧库
+                # 卡死; 提交本身无害 —— 这些迁移写最终也要 commit)。
+                self.conn.commit()
+                # 备份: 在线备份 API, 不中断其他连接; 只读库失败不阻断
+                # (行数校验 + 事务回滚仍兜底, 备份是尽力而为的额外保险)
+                try:
+                    _bak = sqlite3.connect(self.path + ".pre-hold-migration")
+                    try:
+                        self.conn.backup(_bak)
+                    finally:
+                        _bak.close()
+                except sqlite3.Error:
+                    pass
+                self.conn.execute("PRAGMA foreign_keys=OFF")
+                self.conn.execute("BEGIN")
+                try:
+                    n_before = self.conn.execute(
+                        "SELECT COUNT(*) FROM team_work_runs").fetchone()[0]
+                    old_cols = [r["name"] for r in self.conn.execute(
+                        "PRAGMA table_info(team_work_runs)").fetchall()]
+                    self.conn.execute(
+                        "ALTER TABLE team_work_runs "
+                        "RENAME TO team_work_runs__old")
+                    self.conn.execute(
+                        "CREATE TABLE team_work_runs ("
+                        "    run_id              TEXT PRIMARY KEY,"
+                        "    initiator_session   TEXT NOT NULL,"
+                        "    initial_task        TEXT NOT NULL,"
+                        "    project_workspace   TEXT,"
+                        "    current_card_id     TEXT,"
+                        "    status              TEXT NOT NULL DEFAULT 'ACTIVE'"
+                        "        CHECK(status IN ('ACTIVE','HOLD','CLOSED',"
+                        "                          'ABORTED','ARCHIVED')),"
+                        "    card_count          INTEGER NOT NULL DEFAULT 0,"
+                        "    created_at          REAL NOT NULL,"
+                        "    closed_at           REAL,"
+                        "    closed_reason       TEXT,"
+                        "    last_null_slot_knock_at REAL,"
+                        "    current_card_cleared_at REAL,"
+                        "    current_card_handoff_at REAL,"
+                        "    last_waiting_at     REAL,"
+                        "    hold_reason         TEXT,"
+                        "    hold_actor          TEXT,"
+                        "    hold_at             REAL"
+                        ")")
+                    # 显式列交集拷贝 (不用 INSERT SELECT * —— 新旧列集
+                    # 可能不同, 显式列免疫列数不匹配, ARCHIVED 块的教训)
+                    new_cols = [r["name"] for r in self.conn.execute(
+                        "PRAGMA table_info(team_work_runs)").fetchall()]
+                    copy_cols = [c for c in new_cols if c in old_cols]
+                    col_sql = ", ".join(copy_cols)
+                    self.conn.execute(
+                        f"INSERT INTO team_work_runs ({col_sql}) "
+                        f"SELECT {col_sql} FROM team_work_runs__old")
+                    n_after = self.conn.execute(
+                        "SELECT COUNT(*) FROM team_work_runs").fetchone()[0]
+                    if n_after != n_before:
+                        raise RuntimeError(
+                            f"#210 迁移行数校验失败: 迁移前 {n_before} 行, "
+                            f"迁移后 {n_after} 行 — 回滚, 拒绝半迁移")
+                    self.conn.execute("DROP TABLE team_work_runs__old")
+                    self.conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "idx_team_work_one_active "
+                        "ON team_work_runs(status) WHERE status='ACTIVE'")
+                    self.conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_team_work_status "
+                        "ON team_work_runs(status, created_at DESC)")
+                    self.conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_team_work_initiator "
+                        "ON team_work_runs(initiator_session)")
+                    self.conn.execute("COMMIT")
+                except Exception:
+                    self.conn.execute("ROLLBACK")
+                    raise
+                finally:
+                    self.conn.execute("PRAGMA foreign_keys=ON")
             # 2026-10-06 Team Work 归档 (run 列表收缩):CHECK constraint
             # 加 ARCHIVED 值。SQLite 的 ALTER TABLE 不能改 CHECK,只能
             # rebuild 表:drop → 重建(保留所有数据)。降级路径:db_version
@@ -2016,13 +2126,15 @@ class Ledger:
         closed_reason 由 caller 拼接后传入, 常见格式:
             'complete_all' / 'user_close by <operator>' / 'first_dispatch_failed'
         """
-        # 幂等保护: 非 ACTIVE 的 run 不动也不写, 返回 None。
+        # 幂等保护: 非 ACTIVE/HOLD 的 run 不动也不写, 返回 None。
         # (先于判定查询 —— 对已终态 run 跑判定 SELECT 无副作用, 但把
         #  守卫放最前面让意图与 A-5 用例语义一一对应)
+        # issue#210 §1.3: HOLD run 允许 close (冻结的链也可以终结),
+        # 条件 UPDATE 的 status 门同步放宽到 IN ('ACTIVE','HOLD')。
         run_row = self.conn.execute(
             "SELECT status FROM team_work_runs WHERE run_id=?", (run_id,)
         ).fetchone()
-        if not run_row or run_row["status"] != "ACTIVE":
+        if not run_row or run_row["status"] not in ("ACTIVE", "HOLD"):
             return None
         if final_status is not None and final_status not in ("CLOSED", "ABORTED"):
             raise ValueError(
@@ -2033,7 +2145,7 @@ class Ledger:
             cur = self.conn.execute(
                 "UPDATE team_work_runs SET status=?, closed_at=?, "
                 "closed_reason=?, current_card_id=NULL "
-                "WHERE run_id=? AND status='ACTIVE'",
+                "WHERE run_id=? AND status IN ('ACTIVE','HOLD')",
                 (final_status, now, reason, run_id))
         else:
             # 自动判定 (#7-3): 判定并入 UPDATE 的 CASE —— 遗留数与
@@ -2049,7 +2161,7 @@ class Ledger:
             cur = self.conn.execute(
                 f"UPDATE team_work_runs SET status={final_status}, "
                 "closed_at=?, closed_reason=?, current_card_id=NULL "
-                "WHERE run_id=? AND status='ACTIVE'",
+                "WHERE run_id=? AND status IN ('ACTIVE','HOLD')",
                 (run_id, run_id, now, reason, run_id))
         self.conn.commit()
         # rowcount 裁决: 0 行 = 并发下已被他人关闭 (非 ACTIVE), 未变更。
@@ -2062,6 +2174,53 @@ class Ledger:
         return self.conn.execute(
             "SELECT status FROM team_work_runs WHERE run_id=?",
             (run_id,)).fetchone()["status"]
+
+    # ---- issue #210: run hold / resume (PLAN-U §1.2) ----
+    def hold_team_work(self, run_id, *, reason: str,
+                       actor: str) -> Optional[str]:
+        """ACTIVE→HOLD: 冻结一条 run, 不再推进。
+
+        hold 语义 (§1.3 边界裁决):
+          - **不杀 worker 进程、不清 current_card_id** —— 冻结 = 不再推进;
+            worker 若自然跑完, harvest 结算照常落库, 但 relay 不投
+            (run 非 ACTIVE), resume 后补投。
+          - reaper 联动零代码: HOLD ∉ ACTIVE ⇒ 扫描/投递/敲门自然全停
+            (reap_once 取 get_active_team_work、relay JOIN 认 ACTIVE、
+            敲门以 ACTIVE 为门)。
+        条件 UPDATE `WHERE status='ACTIVE'` 下沉幂等到语句级 (与
+        close_team_work 同构): 已 HOLD / 已终态 / 并发下他人先动 ⇒
+        0 行 ⇒ 返回 None, 由端点层区分「幂等」与「409」。
+        hold_reason/hold_actor/hold_at 三列留痕「谁在何时因何冻结」。
+        成功返回 'HOLD'。
+        """
+        now = time.time()
+        cur = self.conn.execute(
+            "UPDATE team_work_runs SET status='HOLD', hold_reason=?, "
+            "hold_actor=?, hold_at=? WHERE run_id=? AND status='ACTIVE'",
+            (reason, actor, now, run_id))
+        self.conn.commit()
+        return "HOLD" if cur.rowcount else None
+
+    def resume_team_work(self, run_id, *, actor: str) -> Optional[str]:
+        """HOLD→ACTIVE: 恢复一条冻结的 run。
+
+        条件 UPDATE `WHERE status='HOLD'` (非 HOLD ⇒ 0 行返回 None,
+        端点层区分幂等/409)。并发护栏: partial UNIQUE INDEX
+        `idx_team_work_one_active` 保证全库至多一行 ACTIVE —— 若期间
+        已存在别的 ACTIVE run, UPDATE 直接撞索引抛
+        sqlite3.IntegrityError (端点捕获转 409「已有执行中的 run」)。
+        hold_* 留痕列不清空 (审计: 上次冻结的原因/人/时刻仍可读)。
+        成功返回 'ACTIVE'。
+        """
+        try:
+            cur = self.conn.execute(
+                "UPDATE team_work_runs SET status='ACTIVE' "
+                "WHERE run_id=? AND status='HOLD'", (run_id,))
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+            raise
+        return "ACTIVE" if cur.rowcount else None
 
     def archive_team_work_cards(self, run_id) -> list:
         """close 时调用:把 run 名下所有未结算卡标成 ARCHIVED,返回 task_id 列表。
@@ -2158,7 +2317,7 @@ class Ledger:
         self.conn.execute(
             "UPDATE team_work_runs SET status='ARCHIVED', "
             "closed_reason=COALESCE(closed_reason, 'archived') "
-            "WHERE run_id=? AND status IN ('ABORTED','CLOSED')",
+            "WHERE run_id=? AND status IN ('ABORTED','CLOSED','HOLD')",
             (run_id,))
         self.conn.commit()
         return {"ok": True, "run_id": run_id,

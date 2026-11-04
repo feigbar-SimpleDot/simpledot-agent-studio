@@ -110,7 +110,9 @@ side console locale and the deployed SOUL/SKILL template pair match.
 
 Shared protocol literals are **identical in both deployments** (matched
 verbatim by the code): dispatch marker `【Team Work 多智能体任务】`,
-SOUL-init marker `【平台 SOUL 初始化指令】`, skip line `- 跳过: 是`.
+SOUL-init marker `【平台 SOUL 初始化指令】`, skip line `- 跳过: 是`,
+attachment-list section marker `【附件】` (issue #211, the queued
+task-detail attachment block — see design.md §10 / §11.2).
 Status values (`working` / `进行中` / `in-progress`) are never translated.
 
 Things that **do not** change with `LANG`:
@@ -319,10 +321,6 @@ precise the better.
 **Deploying registry.json** (hot-reloaded on every API call; restarting
 `mw.console` also clears process-level caches):
 
-> Note: the tracked `mw/registry.json` ships with placeholder `api_key` values
-> (`CHANGE_ME_WORKER_API_KEY_…`). Replace them with each worker's real
-> `API_SERVER_KEY` after deploy; the file is never committed with real secrets.
-
 ```bash
 # edit mw/registry.json in the repo, then deploy to the main container
 scp mw/registry.json <host>:/tmp/registry.json
@@ -527,6 +525,8 @@ an upgrade).
 | `verify.sh` shows a red item | the corresponding service didn't start | follow the prompt and check `docker logs`, fix and re-run `verify.sh` |
 | Console reports `gateway unreachable` on macOS/colima | a socket inode on the virtiofs-shared data dir became unreachable in the guest (`Errno 95`); image `>= 0.22.x` (measured: v0.22.4) turns it into a startup abort | see §4.5 — the deploy path now keeps `/opt/data` on a named volume; for an old topology, clear the stale socket on the host and re-run `./deploy/install.sh` |
 | Most workers show as *offline* in the console but their containers are up | the registered `api_url` points at a published host port, so calls go through `docker-proxy` inside the VM, which drops them under load; also check the VM memory (§4.7) | see §4.6 — register `http://hermes_<name>:8642` (container-internal address) |
+| The hold endpoint returns 409 "state changed concurrently" or never takes effect | the issue #210 CHECK migration did not run — a sqlite-level error inside the store init path is swallowed (`except sqlite3.Error: pass`), so the console starts normally but the old schema (no `HOLD` / `hold`) stays in place | check the live DDL: `sqlite3 /mw_data/ledger.db "SELECT sql FROM sqlite_master WHERE name='team_work_runs'"` — it must contain `'HOLD'`; if it does not, restore the pre-migration backup `ledger.db.pre-hold-migration` (see §5.4) and restart |
+| `${MW_HOME}` gained a `ledger.db.pre-hold-migration` file after an upgrade | automatic pre-migration backup taken before the issue #210 `team_work_runs` table rebuild (§5.4) | it is a pre-migration snapshot; once the new database is confirmed healthy it may be deleted |
 
 ## 4.5 macOS/colima: the control socket on a virtiofs-shared data dir (issue #82)
 
@@ -925,6 +925,34 @@ bidirectional sync is mandatory:
 Temporary workflows created with PUT during debugging (e.g.
 `hotfix-cycle`, etc.) must be DELETEd when done, otherwise they pollute
 the Workflow management page list.
+
+## 5.4 Database migration on upgrade (issue #210)
+
+The first **write** connection to an existing `ledger.db` /
+`schedule.db` runs a CHECK-constraint migration automatically — no
+deployment step is required:
+
+- `team_work_runs.status` gains `HOLD` plus three audit columns
+  (`hold_reason` / `hold_actor` / `hold_at`);
+- `schedule_tasks.status` gains `hold` (schema v2 → v3).
+
+SQLite cannot `ALTER` a CHECK constraint, so each migration is a
+**table rebuild** (create the new table → copy the rows → drop the old
+table → rename), wrapped in an explicit transaction with a row-count
+check: a mismatch raises and rolls back — a half-migrated database is
+refused. Before the `team_work_runs` rebuild the ledger is backed up
+online to `${MW_HOME}/ledger.db.pre-hold-migration` — a pre-migration
+snapshot you may keep as a rollback basis and delete once the new
+database is confirmed healthy (the file grows with the ledger). The
+`schedule_tasks` rebuild follows the same discipline without a backup
+step.
+
+Failure posture: the migration block sits inside the store init path,
+where a sqlite-level error is swallowed (`except sqlite3.Error: pass`)
+— a failed migration does **not** stop the console; it leaves the old
+schema in place and the hold feature silently inert. If hold/resume
+ever answers 409 or does nothing after an upgrade, check the live DDL
+per the §4 troubleshooting rows.
 
 ---
 

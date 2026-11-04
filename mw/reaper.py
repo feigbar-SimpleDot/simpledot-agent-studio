@@ -66,6 +66,22 @@ from .todo import (
     STATUS_WORKING, STATUS_WAITING_SUB,
 )
 
+# issue #210 R4 守护 (U批 2026-11-04 s4f): relay 扫描与迟到补结算扫描共用的
+# team_work_runs ACTIVE 门, 从两处内联 SQL 提取为模块常量 —— **纯提取,
+# 零行为变更**。tests/test_issue210_reaper_hold.py::test_r4 直接执行
+# RELAY_SCAN_SQL 引用生产 SQL; 若有人放宽 JOIN (如 ACTIVE →
+# IN ('ACTIVE','HOLD')), 守护必红 (变异 M-210-D)。
+TW_RUN_ACTIVE_GATE = "AND (hc.team_work_run_id IS NULL OR twr.status = 'ACTIVE')"
+
+RELAY_SCAN_SQL = (
+    "SELECT hc.task_id, hc.harvest_status, hc.worker_report "
+    "FROM harvest_contracts hc "
+    "LEFT JOIN team_work_runs twr ON hc.team_work_run_id = twr.run_id "
+    "WHERE hc.harvest_status IN ('HARVESTED','NEED_CLARIFICATION','BLOCKED') "
+    "AND hc.worker_report IS NOT NULL AND hc.notify_confirmed_at IS NULL "
+    + TW_RUN_ACTIVE_GATE
+)
+
 
 def marker_path(base: str, task_id: str) -> Path:
     return Path(base) / "spawn" / f"{task_id}.json"
@@ -626,8 +642,8 @@ def _reap_late_completions(ledger, hermes_home, base, registry, results,
         "LEFT JOIN team_work_runs twr ON hc.team_work_run_id = twr.run_id "
         "WHERE ((hc.harvest_status = 'BLOCKED' "
         "AND hc.harvest_log LIKE 'timeout:%') "
-        "OR hc.harvest_status = 'WAITING') "  # issue #65 C-3: WAITING 兜底面
-        "AND (hc.team_work_run_id IS NULL OR twr.status = 'ACTIVE')"
+        "OR hc.harvest_status = 'WAITING') " +  # issue #65 C-3: WAITING 兜底面
+        TW_RUN_ACTIVE_GATE
     ).fetchall()
     for row in rows:
         task_id = row["task_id"]
@@ -1172,12 +1188,7 @@ def _notify_main_of_reports(ledger, results, registry: dict | None = None):
     # 孤儿卡(team_work_run_id IS NULL)=非 Team Work 启动的卡,这里不挡
     # (主流程不依赖 Team Work 的卡仍走原路径),语义 = 仅挡「run 已关」的卡。
     rows = ledger.conn.execute(
-        "SELECT hc.task_id, hc.harvest_status, hc.worker_report "
-        "FROM harvest_contracts hc "
-        "LEFT JOIN team_work_runs twr ON hc.team_work_run_id = twr.run_id "
-        "WHERE hc.harvest_status IN ('HARVESTED','NEED_CLARIFICATION','BLOCKED') "
-        "AND hc.worker_report IS NOT NULL AND hc.notify_confirmed_at IS NULL "
-        "AND (hc.team_work_run_id IS NULL OR twr.status = 'ACTIVE')"
+        RELAY_SCAN_SQL
     ).fetchall()
     for row in rows:
         tid = row["task_id"]

@@ -7,7 +7,8 @@ import { Toast, Modal, Confirm } from '../components/ui.jsx'
 // ScheduleView — 收件箱 TAB (原任务排期) 视图 (issue #164, ARCH-164 §3.2)
 //
 // 结构: 顶栏自动执行开关 + busy 提示 / 倒计时条(进度条 + 立即执行) /
-//       修改弹窗(仅 paused) / 三分组列表 (执行中 / 未执行+定时预览 / 已完成取消)。
+//       修改弹窗(仅 paused) / 四分组列表 (执行中 / 未执行+定时预览 /
+//       已暂停 / 已完成取消)。
 //
 // issue #164 追加 (ENTRY-164B): 排期页不再有「新建任务」入口 —— 排期是任务
 // 唯一入口, 新建统一走「发起多智能体协作」弹窗入队 (ChatView.submitTeamWork);
@@ -75,13 +76,17 @@ export function fmtCountdown(sec) {
   return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`
 }
 
-// 三分组切分 (纯函数, 供单测): 组0 running / 组1 pending+paused /
-// 组2 done+cancelled。服务端已按 (组序, added_at DESC) 预排, 这里只切。
+// 四分组切分 (纯函数, 供单测): 组0 running / 组1 pending / 组2 paused /
+// 组3 done+cancelled。服务端已按 (组序, 组内序) 预排, 这里只切不重排。
+//
+// issue #197: paused 从「未执行」组独立出来 (OQ-1 裁决) —— 暂停任务必须
+// 排除出待执行列表 (AC-Q197-6), 但要保留可见入口以便恢复。
 export function schedGroups(tasks) {
-  const g = { running: [], pending: [], done: [] }
+  const g = { running: [], pending: [], paused: [], done: [] }
   for (const t of (Array.isArray(tasks) ? tasks : [])) {
     if (t.status === 'running') g.running.push(t)
-    else if (t.status === 'pending' || t.status === 'paused') g.pending.push(t)
+    else if (t.status === 'pending') g.pending.push(t)
+    else if (t.status === 'paused') g.paused.push(t)
     else g.done.push(t)
   }
   g.done = g.done.slice(0, 50)   // R-5: 底部仅渲染最近 50 条
@@ -90,6 +95,9 @@ export function schedGroups(tasks) {
 
 // cron 预览条目混入未执行组 (A13): 按 next_run_at 与任务 added_at 同轴排序。
 // cron.next_run_at 是 RFC3339 字符串, added_at 是 epoch 秒 → 统一成 ms 比较。
+//
+// issue #197: 排序方向改为**升序** (时间早的在上) —— 取代 A8 裁决的
+// 「倒序 = 新在前」, 与「显示序 = 执行序 = 创建时间升序」同向。
 export function mergePendingWithCron(pendingTasks, cronJobs) {
   const items = pendingTasks.map((t) => ({ kind: 'task', at: t.added_at * 1000, task: t }))
   for (const job of (Array.isArray(cronJobs) ? cronJobs : [])) {
@@ -98,8 +106,8 @@ export function mergePendingWithCron(pendingTasks, cronJobs) {
     if (Number.isNaN(at)) continue
     items.push({ kind: 'cron', at, job })
   }
-  items.sort((a, b) => a.at - b.at)   // 时间倒序 = 新在前 (显示序=执行序 A8)
-  return items.reverse()
+  items.sort((a, b) => a.at - b.at)   // 升序 = 时间早的在上 (#197 取代 A8)
+  return items
 }
 
 const COUNTDOWN_TOTAL = 300   // 5 分钟 (与后端 COUNTDOWN_S 同值)
@@ -225,6 +233,11 @@ export default function ScheduleView({ onNavigate }) {
           <div className="mt-1 text-[11.5px] text-dim">
             {t('schedule.col_added')}: {formatSchedTime(task.added_at) || '—'}
             {' · '}{t('schedule.col_executed')}: {task.executed_at ? formatSchedTime(task.executed_at) : '—'}
+            {/* issue #208: workspace/workflow 轻量标识 —— 与时间同 11.5px text-dim
+                同级小字, 不与 prio/state badge 抢视觉层级; workspace 空显示
+                「默认」占位, workflow=auto 弱化(opacity)显示。 */}
+            {' · '}{t('schedule.meta_workspace')}: {task.workspace || t('schedule.meta_workspace_default')}
+            {' · '}<span className={task.workflow && task.workflow !== 'auto' ? undefined : 'opacity-60'}>{t('schedule.meta_workflow')}: {task.workflow || 'auto'}</span>
             {task.last_error ? <span className="text-bad"> · {task.last_error}</span> : null}
           </div>
         </div>
@@ -275,12 +288,13 @@ export default function ScheduleView({ onNavigate }) {
   )
 
   const sectionTitle = (key, n) => (
-    <div className="text-xs font-semibold text-dim uppercase tracking-wide mt-4 mb-2">
+    <div className="text-xs font-semibold text-dim mt-4 mb-2">
       {t(key)}{n > 0 ? ` (${n})` : ''}
     </div>
   )
 
-  const empty = groups.running.length === 0 && merged.length === 0 && groups.done.length === 0
+  const empty = groups.running.length === 0 && merged.length === 0 &&
+    groups.paused.length === 0 && groups.done.length === 0
 
   return (
     <div className="max-w-4xl mx-auto space-y-3">
@@ -336,7 +350,7 @@ export default function ScheduleView({ onNavigate }) {
         <div className="space-y-2">{groups.running.map(renderTaskRow)}</div>
       </>}
 
-      {/* 分组2 未执行 (pending+paused 混排 + cron 预览按时间参与排序) */}
+      {/* 分组2 未执行 (pending + cron 预览按时间同轴混排, 升序 = 早的在上) */}
       {merged.length > 0 && <>
         {sectionTitle('schedule.group.pending', groups.pending.length)}
         <div className="space-y-2">
@@ -346,7 +360,14 @@ export default function ScheduleView({ onNavigate }) {
         </div>
       </>}
 
-      {/* 分组3 已完成/取消 (底部, 前端截 50) */}
+      {/* 分组3 已暂停 (issue #197 / OQ-1: 暂停任务排除出待执行列表, 但保留
+          可见入口以便恢复; 操作集复用 schedActions('paused')) */}
+      {groups.paused.length > 0 && <>
+        {sectionTitle('schedule.group.paused', groups.paused.length)}
+        <div className="space-y-2 opacity-90">{groups.paused.map(renderTaskRow)}</div>
+      </>}
+
+      {/* 分组4 已完成/取消 (底部, 前端截 50) */}
       {groups.done.length > 0 && <>
         {sectionTitle('schedule.group.done', groups.done.length)}
         <div className="space-y-2 opacity-80">{groups.done.map(renderTaskRow)}</div>
@@ -379,7 +400,7 @@ export default function ScheduleView({ onNavigate }) {
                 else setFormErr('')
               }}
               placeholder={t('schedule.form.detail_placeholder')}
-              className="w-full resize-none rounded-xl bg-panel2 border border-line px-3.5 py-2.5 text-[13.5px] text-ink placeholder:text-dim/60 outline-none focus:ring-1 focus:ring-accent/50" />
+              className="w-full resize-none rounded-xl bg-panel2 border border-line px-3.5 py-2.5 text-[13.5px] text-ink placeholder:text-dim outline-none focus:ring-1 focus:ring-accent/50" />
           </div>
           <div>
             <label className="label">{t('schedule.form.priority')}</label>

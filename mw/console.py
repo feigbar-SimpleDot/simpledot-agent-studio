@@ -1496,7 +1496,9 @@ def api_team_work_close(run_id: str, payload: dict) -> dict:
         if not run:
             return {"error": f"team work {run_id} 不存在",
                     "code": 404, "ok": False}
-        if run["status"] != "ACTIVE":
+        if run["status"] not in ("ACTIVE", "HOLD"):
+            # issue#210 §1.3: HOLD run 允许 close (冻结的链也可终结);
+            # 其余非 ACTIVE 状态维持原 409 护栏。
             return {"error": f"team work {run_id} 已是 {run['status']}, 无需再关",
                     "code": 409, "ok": False,
                     "current_status": run["status"]}
@@ -1578,6 +1580,146 @@ def api_team_work_archive(run_id: str, payload: dict) -> dict:
         return res
     finally:
         led.close()
+
+
+def api_team_work_hold(run_id: str, payload: dict) -> dict:
+    """issue #210: 把一条 ACTIVE run 置 HOLD (冻结, 不再推进)。
+
+    语义 (PLAN-U §1.2/§1.3, 唯一技术依据):
+      - 条件 UPDATE ACTIVE→HOLD (0 行 ⇒ 并发下他人先动 ⇒ 409);
+      - **不杀 worker 进程、不动 current_card_id** —— 冻结 = 不再推进;
+        worker 自然跑完时 harvest 结算照常落库, relay 因 run 非 ACTIVE
+        不投 (§1.3), resume 后补投;
+      - reaper 联动零代码: HOLD ∉ ACTIVE ⇒ 扫描/投递/敲门自然全停;
+      - schedule 联动: 该 run 名下 running 的 inbox 任务置 'hold'
+        (hold ∉ 执行中 ⇒ 下一任务按常规流程起倒计时);
+      - 重复 hold 已 HOLD 的 run ⇒ 幂等成功 (§1.3, 不报错);
+      - 非 ACTIVE (CLOSED/ABORTED/ARCHIVED) ⇒ 409。
+    hold_reason/actor 落 ledger 留痕三列; emit 'team_work.held' 事件。
+
+    payload: {"reason": str (default 'user_hold'), "actor"/"operator": str}
+    """
+    reason = (payload.get("reason") or "user_hold").strip()
+    actor = (payload.get("actor") or payload.get("operator")
+             or "console").strip()
+    led = Ledger(LEDGER_DB)
+    try:
+        run = led.get_team_work(run_id)
+        if not run:
+            return {"error": f"team work {run_id} 不存在",
+                    "code": 404, "ok": False}
+        if run["status"] == "HOLD":
+            return {"ok": True, "run_id": run_id, "status": "HOLD",
+                    "was_already": True, "reason": reason, "actor": actor,
+                    "note": f"team work {run_id} 已是 HOLD (幂等)"}
+        if run["status"] != "ACTIVE":
+            return {"error": f"team work {run_id} 状态 {run['status']}, "
+                             "只有 ACTIVE run 可以置 hold",
+                    "code": 409, "ok": False,
+                    "current_status": run["status"]}
+        if not led.hold_team_work(run_id, reason=reason, actor=actor):
+            return {"error": f"team work {run_id} 状态已并发变更, hold 未生效",
+                    "code": 409, "ok": False}
+    finally:
+        led.close()
+
+    # schedule 联动 (§1.2.4): run 名下 running 的 inbox 任务置 hold。
+    # 失败不回滚 run HOLD (run 冻结是本端点的主语义; 排期侧异常在响应
+    # 里如实申报, 操作员可人工处置, 不让半失败伪装成全成功)。
+    held_tasks: list[str] = []
+    linkage = "ok"
+    try:
+        held_tasks = _schedule.hold_running_tasks_for_run(run_id)
+    except Exception as e:
+        linkage = f"failed: {str(e)[:120]}"
+
+    try:
+        led_emit = Ledger(LEDGER_DB)
+        led_emit.emit_event("team_work.held", "", {
+            "run_id": run_id, "reason": reason, "actor": actor,
+            "held_tasks": held_tasks, "schedule_linkage": linkage,
+        })
+        led_emit.close()
+    except Exception:
+        pass  # 事件失败不阻断响应 (与 close 端点同纪律)
+
+    return {
+        "ok": True, "run_id": run_id, "status": "HOLD",
+        "reason": reason, "actor": actor,
+        "held_tasks": held_tasks, "schedule_linkage": linkage,
+        "note": (f"team work {run_id} 已置 HOLD (冻结不再推进; "
+                 f"worker 进程未杀, resume 后继续)"),
+    }
+
+
+def api_team_work_hold_resume(run_id: str, payload: dict) -> dict:
+    """issue #210: 恢复一条 HOLD run (HOLD→ACTIVE)。
+
+    语义 (PLAN-U §1.2/§1.3):
+      - 条件 UPDATE HOLD→ACTIVE; 期间已存在别的 ACTIVE run ⇒ 撞 partial
+        UNIQUE INDEX idx_team_work_one_active ⇒ 409「已有执行中的 run,
+        请等待或先处理」(DB 层天然兜底, 无 TOCTOU);
+      - 已 ACTIVE ⇒ 幂等成功; 终态 (CLOSED/ABORTED/ARCHIVED) ⇒ 409;
+      - schedule 联动: 名下 hold 的 inbox 任务回 pending 且 added_at 置
+        min(当前 pending)-1 ⇒ 回到待执行队列顶部按顺序执行;
+      - 用户经 run 的 main 对话框要求恢复 = main 调本端点 (§1.2.2)。
+    emit 'team_work.resumed' 事件。
+
+    payload: {"actor"/"operator": str}
+    """
+    actor = (payload.get("actor") or payload.get("operator")
+             or "console").strip()
+    led = Ledger(LEDGER_DB)
+    try:
+        run = led.get_team_work(run_id)
+        if not run:
+            return {"error": f"team work {run_id} 不存在",
+                    "code": 404, "ok": False}
+        if run["status"] == "ACTIVE":
+            return {"ok": True, "run_id": run_id, "status": "ACTIVE",
+                    "was_already": True, "actor": actor,
+                    "note": f"team work {run_id} 已是 ACTIVE (幂等)"}
+        if run["status"] != "HOLD":
+            return {"error": f"team work {run_id} 状态 {run['status']}, "
+                             "只有 HOLD run 可以 resume",
+                    "code": 409, "ok": False,
+                    "current_status": run["status"]}
+        try:
+            wrote = led.resume_team_work(run_id, actor=actor)
+        except sqlite3.IntegrityError:
+            # partial UNIQUE INDEX 兜底: hold 期间已有新 ACTIVE run
+            return {"error": "已有执行中的 run, 请等待或先处理",
+                    "code": 409, "ok": False}
+        if not wrote:
+            return {"error": f"team work {run_id} 状态已并发变更, resume 未生效",
+                    "code": 409, "ok": False}
+    finally:
+        led.close()
+
+    resumed_tasks: list[str] = []
+    linkage = "ok"
+    try:
+        resumed_tasks = _schedule.resume_held_tasks_for_run(run_id)
+    except Exception as e:
+        linkage = f"failed: {str(e)[:120]}"
+
+    try:
+        led_emit = Ledger(LEDGER_DB)
+        led_emit.emit_event("team_work.resumed", "", {
+            "run_id": run_id, "actor": actor,
+            "resumed_tasks": resumed_tasks, "schedule_linkage": linkage,
+        })
+        led_emit.close()
+    except Exception:
+        pass
+
+    return {
+        "ok": True, "run_id": run_id, "status": "ACTIVE", "actor": actor,
+        "resumed_tasks": resumed_tasks, "schedule_linkage": linkage,
+        "note": (f"team work {run_id} 已恢复 ACTIVE"
+                 + (f", {len(resumed_tasks)} 个排期任务回到待执行队列顶部"
+                    if resumed_tasks else "")),
+    }
 
 
 def _parse_wr(blob) -> dict | None:
@@ -2491,7 +2633,11 @@ def api_task_detail(task_id: str) -> dict:
                      "created_at,started_at,completed_at "
                      "FROM tasks WHERE id=?", (task_id,))
     if not rows:
-        return {"error": f"task '{task_id}' 不存在", "code": 404}
+        # issue #191: 裁剪 env 的 subprocess 建卡会静默回落影子库
+        # (~/.hermes/kanban.db) —— 404 文案追加影子库排查提示。
+        return {"error": f"task '{task_id}' 不存在（若卡经 subprocess 创建, "
+                         "检查 subprocess env 是否含 HERMES_HOME"
+                         "(影子库 ~/.hermes/kanban.db)）", "code": 404}
     t = rows[0]
     h = {}
     for r in _ro_query(LEDGER_DB,
@@ -4515,7 +4661,11 @@ def api_cron_jobs() -> tuple[int, dict]:
     try:
         _cron_assert_home(data)
     except ValueError as e:
-        return 500, {"error": str(e)}
+        # issue #193 (照抄 #176 先例): home 不一致文案含内部路径, 不回显;
+        # 全量异常留服务端日志。
+        logging.getLogger("mw.console").exception(
+            "api_cron_jobs failed: %s", e)
+        return 500, {"error": "internal_error"}
     jobs = data.get("jobs")
     if not isinstance(jobs, list):
         # 桥坏形状 → 500(不是 200 + 空体), 前端落错误态。
@@ -4545,7 +4695,11 @@ def api_cron_runs(job_id: str, limit) -> tuple[int, dict]:
     try:
         _cron_assert_home(data)
     except ValueError as e:
-        return 500, {"error": str(e)}
+        # issue #193 (照抄 #176 先例): home 不一致文案含内部路径, 不回显;
+        # 全量异常留服务端日志。
+        logging.getLogger("mw.console").exception(
+            "api_cron_runs failed: %s", e)
+        return 500, {"error": "internal_error"}
     runs = data.get("runs")
     if not isinstance(runs, list):
         return 500, {"error": "cron 数据源返回了非法形状"}
@@ -4570,7 +4724,11 @@ def api_cron_action(job_id: str, action: str) -> tuple[int, dict]:
     try:
         _cron_assert_home(data)
     except ValueError as e:
-        return 500, {"error": str(e)}
+        # issue #193 (照抄 #176 先例): home 不一致文案含内部路径, 不回显;
+        # 全量异常留服务端日志。
+        logging.getLogger("mw.console").exception(
+            "api_cron_action failed: %s", e)
+        return 500, {"error": "internal_error"}
     job = data.get("job")
     if not isinstance(job, dict):
         return 500, {"error": "cron 数据源返回了非法形状"}
@@ -5176,7 +5334,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, api_team_work_state(m.group(1)))
             return self._send(404, {"error": "not found"})
         except Exception as e:
-            return self._send(500, {"error": str(e)})
+            # issue #193 (照抄 #176 do_POST 先例): 外层兜底不再回显 str(e) ——
+            # 异常原文可能含绝对路径/栈信息, 回显即泄漏面。客户端只拿固定
+            # 文案, 全量异常 (含栈) 留服务端日志 (mw.console logger)。
+            logging.getLogger("mw.console").exception(
+                "do_GET %s failed: %s", p, e)
+            return self._send(500, {"error": "internal_error"})
 
     def do_POST(self):
         p = self.path.split("?")[0]
@@ -5284,6 +5447,19 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 return self._send(200, api_team_work_archive(
                     m.group(1), payload))
+            # 2026-11-04 issue #210: run hold / hold-resume (冻结/恢复)。
+            # /hold/resume 必须先于 /hold 匹配 ($ 锚点已互斥, 顺序仅可读性);
+            # 错误码经 payload 的 code 字段透传 (404/409), 与 launch 同形态。
+            m = re.match(r"^/api/team-work/([A-Za-z0-9_-]+)/hold/resume$", p)
+            if m:
+                _res = api_team_work_hold_resume(m.group(1), payload)
+                _code = _res.pop("code", 200)
+                return self._send(_code, _res)
+            m = re.match(r"^/api/team-work/([A-Za-z0-9_-]+)/hold$", p)
+            if m:
+                _res = api_team_work_hold(m.group(1), payload)
+                _code = _res.pop("code", 200)
+                return self._send(_code, _res)
             # 2026-10-04 补根: run 中途追加卡 (回流场景: 审查打回建修复卡)。
             # 只登记不派发, 派活仍走 /advance。
             m = re.match(r"^/api/team-work/([A-Za-z0-9_-]+)/cards$", p)
@@ -5367,6 +5543,13 @@ class Handler(BaseHTTPRequestHandler):
                 return webui_proxy.proxy_http(
                     self, self.path[len("/webui"):])
             n = int(self.headers.get("Content-Length", 0))
+            # issue #193 (L-O1-1): do_PUT 预读复用 POST_BODY_MAX_BYTES 闸
+            # (与 do_POST #166 闸同款), 超限 413, 超大 body 不进内存。
+            if n > POST_BODY_MAX_BYTES:
+                logging.getLogger("mw.console").warning(
+                    "issue #193: do_PUT %s body 超限 n=%d > %d ⇒ 413",
+                    p, n, POST_BODY_MAX_BYTES)
+                return self._send(413, {"error": "payload_too_large"})
             payload = json.loads(self.rfile.read(n) or b"{}")
             if p == "/api/workers":
                 return self._send(200, api_registry_save(payload))
@@ -5382,12 +5565,25 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._send(422, {"error": str(e)})
         except Exception as e:
-            return self._send(500, {"error": str(e)})
+            # issue #193 (照抄 #176 do_POST 先例): 外层兜底不再回显 str(e),
+            # 固定文案 + 全量异常留服务端日志。
+            logging.getLogger("mw.console").exception(
+                "do_PUT %s failed: %s", p, e)
+            return self._send(500, {"error": "internal_error"})
 
     def do_PATCH(self):
         # issue #131 方案B: webui 前端 (kanban 面) 有 PATCH 调用; 控制台自身
         # 无 PATCH 端点, 故本方法只服务 /webui 代理, 其余路径保持默认 501。
         p = self.path.split("?")[0]
+        # issue #193 (L-O1-1): PATCH 无 JSON 预读, 但 /webui 代理的
+        # proxy_http 会把整个 body 读进内存 —— 同型 DoS 面, 闸落方法入口
+        # (与 do_POST #166 闸同款, 超限 413)。
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        if n > POST_BODY_MAX_BYTES:
+            logging.getLogger("mw.console").warning(
+                "issue #193: do_PATCH %s body 超限 n=%d > %d ⇒ 413",
+                p, n, POST_BODY_MAX_BYTES)
+            return self._send(413, {"error": "payload_too_large"})
         if p == "/webui" or p.startswith("/webui/"):
             try:
                 if not webui_proxy.webui_proxy_enabled():
@@ -5425,7 +5621,11 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._send(422, {"error": str(e)})
         except Exception as e:
-            return self._send(500, {"error": str(e)})
+            # issue #193 (照抄 #176 do_POST 先例): 外层兜底不再回显 str(e),
+            # 固定文案 + 全量异常留服务端日志。
+            logging.getLogger("mw.console").exception(
+                "do_DELETE %s failed: %s", p, e)
+            return self._send(500, {"error": "internal_error"})
 
     def _stream_events(self, since_id: int):
         """问题7D: SSE 长连接。

@@ -10,6 +10,7 @@ import CronView from './views/CronView.jsx'
 import PixelOfficeView from './views/PixelOfficeView.jsx'
 import SettingsView from './views/SettingsView.jsx'
 import LogoMark from './components/LogoMark.jsx'
+import { Icon } from './components/icons.jsx'
 import { BRAND_EN, BRAND_ZH } from './brand.js'
 
 // [en] NAV icons + ids are protocol-shaped; the human-readable label is
@@ -54,15 +55,6 @@ const NAV_LABEL_KEYS = {
   'settings':    'nav.settings',
 }
 
-function Icon({ d, className = 'w-5 h-5' }) {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-         strokeLinecap="round" strokeLinejoin="round" className={className}>
-      <path d={d} />
-    </svg>
-  )
-}
-
 // 手机屏检测: <768px 视为移动端, 布局切换为上下排版
 function useIsMobile() {
   const [isMobile, setIsMobile] = useState(
@@ -76,14 +68,46 @@ function useIsMobile() {
   return isMobile
 }
 
+// issue #207: WebuiBtn / CoreFeaturesBtn 原定义在 App 函数体内 ⇒ 每次 App
+// 重渲染(5s 心跳 setReaper)组件函数身份变化 ⇒ React 卸载/重挂整棵子树 ⇒
+// 键盘焦点节点被替换掉 body。提升到模块级后组件身份稳定, 依赖全部 props 化:
+// WebuiBtn 收 webuiTarget/onClick; CoreFeaturesBtn 收 onClick(=openCoreFeatures),
+// 文案自行 useTranslation。渲染语义零变化。
+// [en] Hoisted to module level so the 5s heartbeat re-render no longer
+//      remounts (and steals focus from) these header buttons.
+function WebuiBtn({ compact = false, webuiTarget, onClick }) {
+  return webuiTarget ? (
+    <button onClick={onClick} className="btn-ghost btn-sm shrink-0" title={webuiTarget}>
+      <Icon d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6m4-3v6m-1 9l5-5m0 0l-5-5m5 5H10" className="w-4 h-4" />
+      {!compact && 'hermes-webui'}
+    </button>
+  ) : null
+}
+// 2026-10-15 R2.1/R2.2: 全局「核心功能」按钮 —— 桌面主 header 动作组最左
+// btn-primary 高亮,移动端顶栏紧凑态(图标-only),文案走 t(),tooltip 复用
+// chat.session.start_teamwork_btn 保证点击预期可发现。
+function CoreFeaturesBtn({ compact = false, onClick }) {
+  const { t } = useTranslation()
+  return (
+    <button onClick={onClick}
+      className={compact ? 'btn-primary btn-sm shrink-0 !px-2' : 'btn-primary btn-sm shrink-0'}
+      title={t('chat.session.start_teamwork_btn')}>
+      <Icon d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zm14 10v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"
+            className="w-3.5 h-3.5" />
+      {!compact && t('chat.session.start_teamwork_btn')}
+    </button>
+  )
+}
+
 export default function App() {
   // R1.2: 取 i18n 对象以便用 .language.startsWith('zh') 判定是否渲染中文副标题。
   // 语言运行时切换(zh↔en)走 i18next.changeLanguage → React 组件重渲,无需额外 effect。
   const { t, i18n } = useTranslation()
   const isZh = (i18n.language || '').startsWith('zh')
-  // 2026-10-15 R3.4: 首屏落地改为 tasks-board(多智能体协作成果主视图);协作发起
-  // 由全局「核心功能」按钮在任意视图 1 击可达,不再依赖 chat 作首页兜底。
-  const [view, setView] = useState('tasks-board')
+  // issue #202 R1 (硬约束 1, OQ-A 裁决=固定 inbox): 首屏落地 = 收件箱
+  // (schedule, NAV 首位)。不引入视图记忆 —— 刷新/新加载恒回收件箱;
+  // 会话内手动切 tab 行为不变 (AC-R1-1~3)。
+  const [view, setView] = useState('schedule')
   const [collapsed, setCollapsed] = useState(false)
   const [reaper, setReaper] = useState(null)
   const [counts, setCounts] = useState({ attention: 0, running: 0, finished: 0, total: 0 })
@@ -106,11 +130,21 @@ export default function App() {
   })
   const [activeChat, setActiveChat] = useState('main')
 
-  // 2026-10-15 R2.3a: 全局「核心功能」按钮需要触发 main ChatView 的 openTeamWork。
+  // 2026-10-15 R2.3a: 全局「核心功能」按钮触发 main ChatView 的 openTeamWork。
   // chatTabs 任意一项都 mount 一个 ChatView 实例;只有 tab='main' 的实例负责
   // 弹窗(useImperativeHandle 在 ChatView 内部已暴露)。维护 chatTabs.length
   // 大小的 ref 数组,位置与 chatTabs 一一对应。
   const chatViewRefs = useRef([])
+  // issue #202 R2 (硬约束 2, OQ-B 裁决): 不再 setActiveChat('main') / setView('chat')
+  // —— 弹框本体已经由 ChatView createPortal 挂到 document.body, 不随视图
+  // display:none 隐藏, 任意视图原地以覆盖层打开, 当前 view 与 chat tab 选中态
+  // 均不改变 (AC-R2-1~3)。main ChatView 实例恒 mount (chatTabs[0]='main' 契约),
+  // ref 直接可用, 旧 setTimeout 等 commit 的补丁不再需要。
+  // R2.6: 全局按钮恒可点击,不感知 busy。
+  const openCoreFeatures = () => {
+    const mainRef = chatViewRefs.current[0]
+    if (mainRef && typeof mainRef.openTeamWork === 'function') mainRef.openTeamWork()
+  }
 
   // hermes-webui 外部覆盖地址(设置页配置); 留空且代理启用时入口回退同源 /webui/ (#196)
   // issue #75 B2: 依赖 [view] → [] — 这两个是会话级静态配置, 每次切视图
@@ -141,45 +175,6 @@ export default function App() {
   // 地址经 window.open 按当前源解析, 天然适配任意 host/端口/上层反代)。
   const webuiTarget = webuiUrl || (webuiProxy ? '/webui/' : '')
   const openWebui = () => webuiTarget && window.open(webuiTarget, '_blank', 'noopener')
-  // 2026-10-15 R2.3a: 全局「核心功能」按钮点击 = (1) 切回 main 对话 +
-  // (2) 触发 main ChatView 的 openTeamWork() 打开协作启动弹窗。
-  // R2.6: 全局按钮恒可点击,不感知 busy。
-  const openCoreFeatures = () => {
-    setActiveChat('main')
-    setView('chat')
-    // chatTabs 第一项必为 'main'(持久化/初始化的契约)。当前 view 已是
-    // chat 时可直接触发;从其它视图切回时, 因非激活 tab 祖先 div 处于
-    // `hidden` (display:none), 挂在它上面的 fixed Modal 也跟着不可见,
-    // 必须先等 React 完成 commit、切到 chat 并激活 main tab 之后, 再
-    // 调用 openTeamWork —— setTimeout(0) 把回调推到下一个宏任务,
-    // 此时 commit 后的 DOM 已生效, Modal 能正确锚到可见容器里。
-    const mainRef = chatViewRefs.current[0]
-    if (!mainRef || typeof mainRef.openTeamWork !== 'function') return
-    if (view === 'chat' && activeChat === 'main') {
-      mainRef.openTeamWork()
-    } else {
-      // 切视图 + 激活 main tab 之后再调用, 避免 Modal 锚到 hidden tab。
-      setTimeout(() => mainRef.openTeamWork(), 0)
-    }
-  }
-  const WebuiBtn = ({ compact = false }) => webuiTarget ? (
-    <button onClick={openWebui} className="btn-ghost btn-sm shrink-0" title={webuiTarget}>
-      <Icon d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6m4-3v6m-1 9l5-5m0 0l-5-5m5 5H10" className="w-4 h-4" />
-      {!compact && 'hermes-webui'}
-    </button>
-  ) : null
-  // 2026-10-15 R2.1/R2.2: 全局「核心功能」按钮 —— 桌面主 header 动作组最左
-  // btn-primary 高亮,移动端顶栏紧凑态(图标-only),文案走 t(),tooltip 复用
-  // chat.session.start_teamwork_btn 保证点击预期可发现。
-  const CoreFeaturesBtn = ({ compact = false }) => (
-    <button onClick={openCoreFeatures}
-      className={compact ? 'btn-primary btn-sm shrink-0 !px-2' : 'btn-primary btn-sm shrink-0'}
-      title={t('chat.session.start_teamwork_btn')}>
-      <Icon d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2M9 11a4 4 0 100-8 4 4 0 000 8zm14 10v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"
-            className="w-3.5 h-3.5" />
-      {!compact && t('chat.session.start_teamwork_btn')}
-    </button>
-  )
 
   useEffect(() => {
     document.documentElement.className = theme
@@ -257,8 +252,8 @@ export default function App() {
           <span className={`ml-auto shrink-0 ${aliveDot}`}
                 title={alive === undefined ? t('app.reaper_unknown') : alive ? t('app.reaper_online') : t('app.reaper_offline')} />
           {/* R2.2: 移动端顶栏同步新增紧凑态「核心功能」按钮(图标-only) */}
-          <CoreFeaturesBtn compact />
-          <WebuiBtn compact />
+          <CoreFeaturesBtn compact onClick={openCoreFeatures} />
+          <WebuiBtn compact webuiTarget={webuiTarget} onClick={openWebui} />
           <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
             className="btn-ghost btn-sm shrink-0 !px-2" title={t('app.theme_toggle')}>
             <Icon d={theme === 'dark'
@@ -357,8 +352,10 @@ export default function App() {
   return (
     <div className="flex h-screen overflow-hidden bg-canvas text-ink font-sans">
       {/* ── 侧边栏 (LangUI sidebar: slate-900 底, 细右边框) ── */}
+      {/* issue #202 R3-6/15 (走查 P1-6/15): 折叠不再动画 width (布局属性动画
+          触发整页 reflow) —— 直接切换宽度, 无 transition。 */}
       <aside className={`${collapsed ? 'w-[68px]' : 'w-60'} shrink-0 flex flex-col border-r border-line
-                       bg-panel transition-all duration-200`}>
+                       bg-panel`}>
         <div className="flex items-center gap-2.5 px-4 h-16 border-b border-line">
           {/* 品牌位: 动态 LOGO 直接绘制于透明容器 (去渐变底, 贴合品牌负空间) */}
           <LogoMark size={32} />
@@ -384,7 +381,7 @@ export default function App() {
               <button key={n.id}
                 onClick={() => { setView(n.id); if (n.id === 'chat') setActiveChat('main') }}
                 className={`w-full flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium
-                           transition-all duration-150 group relative
+                           transition-colors duration-150 group relative
                            ${active
                              ? 'bg-accent/15 text-accent ring-1 ring-inset ring-accent/30'
                              : 'text-dim hover:bg-panel2 hover:text-ink'}`}>
@@ -406,13 +403,14 @@ export default function App() {
               <button key={name}
                 onClick={() => { setActiveChat(name); setView('chat') }}
                 className={`w-full flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium
-                           transition-all duration-150 group relative
+                           transition-colors duration-150 group relative
                            ${active
                              ? 'bg-accent/15 text-accent ring-1 ring-inset ring-accent/30'
                              : 'text-dim hover:bg-panel2 hover:text-ink'}`}>
                 <Icon d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z"
                       className="w-[18px] h-[18px] shrink-0" />
-                {!collapsed && <span className="truncate" title={name}>💬 {name}</span>}
+                {/* issue #202 R4: 去掉 chat emoji 前缀 —— 左侧已有 chat SVG 图标, 文字即标签 */}
+                {!collapsed && <span className="truncate" title={name}>{name}</span>}
                 {/* 关闭按钮统一由 ChatView 内部 onClose 触发("✕ 关闭" 按钮), 侧边栏不重复 */}
               </button>
             )
@@ -433,7 +431,7 @@ export default function App() {
             )}
           </div>
           {!collapsed && (
-            <div className="mt-2 flex items-center justify-between text-[10.5px] text-dim/70">
+            <div className="mt-2 flex items-center justify-between text-[10.5px] text-dim">
               <span className="truncate" title={t('app.sidebar_footer_tagline')}>{t('app.sidebar_footer_tagline')}</span>
             </div>
           )}
@@ -478,8 +476,8 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2">
             {/* R2.1: 桌面主 header 动作组最左新增「核心功能」按钮(btn-primary 高亮) */}
-            <CoreFeaturesBtn />
-            <WebuiBtn />
+            <CoreFeaturesBtn onClick={openCoreFeatures} />
+            <WebuiBtn webuiTarget={webuiTarget} onClick={openWebui} />
             <button onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
               className="btn-ghost btn-sm" title={t('app.theme_toggle')}>
               <Icon d={theme === 'dark'

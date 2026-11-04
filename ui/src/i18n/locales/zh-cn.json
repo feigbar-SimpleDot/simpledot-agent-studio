@@ -131,6 +131,14 @@
       "start_teamwork_btn": "发起多智能体协作"
     },
     "team_work_modal": {
+      "attach_label": "附件",
+      "attach_btn": "添加附件",
+      "attach_hint": "可选, 最多 5 个, 单个 ≤20MB; worker 可按路径直接读取",
+      "attach_uploading": "上传中…",
+      "attach_upload_failed": "附件上传失败, 请重试",
+      "attach_too_large": "附件超过 20MB 上限",
+      "attach_too_many": "最多 5 个附件",
+      "attach_remove": "移除",
       "auto_select": "Auto-select (LLM 自动选)",
       "cancel_btn": "取消",
       "inherit_option": "继承当前对话({name})",
@@ -147,6 +155,13 @@
       "workspace_label": "工作目录",
       "workspace_placeholder": "(可选)",
       "queued_toast": "已加入收件箱队列"
+    },
+    "decode_speed": {
+      "approx": "≈{n} tok/s（近似）",
+      "exact": "{n} tok/s（精确）",
+      "label": "解码",
+      "reasoning_suffix": "+{n} tok/s 推理",
+      "tooltip": "按 delta 到达间隔实时估算；回合结束后以会话 output_tokens 精确校准"
     },
     "team_work_prompt_label": "【Team Work 多智能体任务】",
     "tool_args_truncated": "… (截断, 共 {n} 字符)",
@@ -338,7 +353,7 @@
       "docker_compose_dir_hint": "控制台生成的 worker docker-compose.yaml 建议保存到你机器的哪个目录（仅提示用）",
       "docker_compose_dir_label": "Worker compose 存放目录 [宿主机]",
       "hermes_webui_url_hint": "功能更完善的 WebUI（Agent 管理）跳转地址。留空 = webui 已部署（同源 /webui 代理启用）时顶栏自动出现「hermes-webui」入口并指向 /webui/，无需配置；填写绝对地址（http(s)://…）则以该外部地址覆盖入口。两者都没有时不显示入口",
-      "hermes_webui_url_label": "hermes-webui 跳转地址",
+      "hermes_webui_url_label": "hermes-webui 地址(可选)",
       "pixel_office_enabled_hint": "开启后侧栏出现「像素办公室」标签页，把 worker 实时状态渲染成像素角色动画（经控制台同源代理内嵌，pixel-agents 不对外暴露端口）。需部署时已挂载已编译的 pixel-agents 包并启动 sidecar；未部署时开启也只会提示 sidecar 未运行",
       "pixel_office_enabled_label": "像素办公室（pixel-agents）",
       "reaper_interval_seconds_hint": "异步任务结算的最大延迟；与 API 读取频率无关（读取次数 = 结算次数）",
@@ -796,6 +811,7 @@
     "group": {
       "running": "执行中",
       "pending": "未执行",
+      "paused": "已暂停",
       "done": "已完成 / 取消"
     },
     "state": {
@@ -829,6 +845,9 @@
     "col_added": "添加时间",
     "col_executed": "执行时间",
     "cron_badge": "定时任务",
+    "meta_workspace": "工作区",
+    "meta_workspace_default": "默认",
+    "meta_workflow": "流程",
     "empty": {
       "title": "收件箱还是空的",
       "hint": "点击顶栏「发起多智能体协作」, 任务会加入收件箱队列"

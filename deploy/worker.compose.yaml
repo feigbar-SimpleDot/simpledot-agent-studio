@@ -9,7 +9,7 @@
 # issue #109 (2026-10-26): 不再发布宿主端口 (原 WORKER_PORT:8642 已删)。
 # main<->worker 全部走容器内网别名 http://hermes_<name>:8642 (simple-dot 网络)。
 # See install.sh: it seeds one docker-compose.yaml + .env per worker under
-# <worker-deploy-dir>/<name>/, this template is the source.
+# /home/jayzhou/hermes_agents/<name>/, this template is the source.
 
 services:
   # issue #109: 本模版接入 simple-dot 后, service 名必须 == container_name
@@ -29,11 +29,11 @@ services:
       # otherwise launch writing TODO.md under data/share_workspace/projects/<proj>/ is invisible
       # to worker. Likewise worker writes to deliverables / .clarify.json at wrong location,
       # main never receives them.
-      # Earlier worker.compose.yaml wrote a machine-specific absolute share_workspace path,
+      # Earlier worker.compose.yaml wrote /home/jayzhou/hermes_agents/share_workspace,
       # inconsistent with main's ./data/share_workspace, breaking entire Team Work cross-scene;
       # SE card reported deliverables dir missing, worker reports cannot find TODO.md.
       # Fix: use the same absolute path data/share_workspace as main.
-      - ./data/share_workspace:/share_workspace
+      - /home/jayzhou/hermes_agents/data/share_workspace:/share_workspace
     environment:
       - API_SERVER_ENABLED=true
       - API_SERVER_HOST=0.0.0.0

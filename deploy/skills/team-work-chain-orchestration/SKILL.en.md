@@ -221,6 +221,49 @@ the sole basis; coder only applies the plan + commits) → tester
 re-tests the fix points only → doc_audit / delivery. main never
 hands an unlocalized issue straight to coder.
 
+### main's own root-cause analysis in the issue body is only a hypothesis — a worker may overturn it (measured 2026-10-21)
+
+When main writes a "root-cause analysis" into the tracker issue body
+to save effort and then builds the chain on top of it, that analysis
+is **main's hypothesis**, not established fact — the system-engineer on
+the chain may overturn it with measured evidence. When that happens:
+
+1. **Independently re-check the worker's counter-evidence first**;
+   never just relay and adopt it. Counter-evidence usually names a
+   source location (e.g. "the image redirects the bare `gateway run`
+   to `s6-svc -u` + `execvp sleep infinity`, so no second process ever
+   starts") — main must read that source itself and only then
+   adjudicate. Reading only the worker's report without checking the
+   source just swaps which authority you trust on faith.
+2. **Pick a side in the adjudication and state the reason**, laying the
+   options out for the user/issue: adopt the worker's conclusion vs
+   keep the original hypothesis. When keeping the hypothesis you must
+   also accept the downstream risk the worker pointed out (e.g. "this
+   change breaks a fresh deployment") — never take only the favourable
+   half.
+3. **Post a correction comment to the tracker** (POST comment); never
+   just edit the repo and leave the issue untouched — a reader who only
+   sees the overturned old root cause will go fix production with that
+   wrong root cause. The comment must state: which old conclusion
+   fails + evidence (file:line / measured commands and output) + the
+   new conclusion + **whether the real cause is still unlocalized**.
+4. **While the real cause is unlocalized the issue stays open**; don't
+   close just because "the chain finished". Chain done ≠ problem
+   solved: the chain's output may be exactly "the hypothesis was
+   refuted, here is the next evidence-gathering direction". The closing
+   action is then to update the issue title/body to reflect the real
+   current state (e.g. "root cause pending") + leave a directly
+   executable evidence-gathering command list (read-only probes: which
+   ports, which in-container commands, how to tell "unreachable inside
+   the container" from "unreachable on the host") for the user to run
+   on their own machine.
+5. **Downstream cards' criteria get rewritten per the adjudication**:
+   the re-test card must state "do not reproduce X from the issue body
+   — not reproducing on the baseline is expected; record 'not
+   reproduced', and never conclude fixed / fix-invalid from it", so the
+   tester doesn't grab the wrong ruler and misreport "the defect isn't
+   in this environment" as a failed fix.
+
 Companion rules:
 - Build cards' required_files list only IMPL-NOTES/commit; never
   mix TEST-* files into build cards.

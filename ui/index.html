@@ -25,6 +25,12 @@
         --c-ok: 34 197 94;      /* green-500 */
         --c-warn: 234 179 8;    /* yellow-500 */
         --c-bad: 239 68 68;    /* red-500 */
+        /* issue #202 R3-10: 真紫 token (badge-purple 交接中态, 与 warn 琥珀
+           可分辨); R3-10 另补 scrim 对 (遮罩底/遮罩上白字), 供 index.css
+           wcard-avatar 块引用, 免裸 hex。 */
+        --c-violet: 167 139 250; /* violet-400 (dark 底上亮紫) */
+        --c-scrim: 2 6 23;
+        --c-scrim-ink: 255 255 255;
         /* 品牌色 token (仅 LOGO/favicon/品牌强调位, 不参与交互控件) */
         --brand-ring-dark: #8A93A0;
         --brand-dot-dark: #4DABF7;
@@ -40,6 +46,10 @@
         --c-ok: 22 163 74;
         --c-warn: 202 138 4;
         --c-bad: 220 38 38;
+        /* issue #202 R3-10: 真紫 token (light 底上深紫) + scrim 对 (值恒等原裸 hex) */
+        --c-violet: 124 58 237;  /* violet-600 */
+        --c-scrim: 2 6 23;
+        --c-scrim-ink: 255 255 255;
         /* 品牌色 token (亮色主题) */
         --brand-ring: #343A40;
         --brand-dot: #1878D8;

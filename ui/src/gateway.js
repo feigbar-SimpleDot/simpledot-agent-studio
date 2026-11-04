@@ -105,6 +105,12 @@ export function makeGw(base) {
   // SSE 流式对话。content: 纯文本 string 或 OpenAI 多模态 parts 数组
   // (Hermes 原生: _normalize_multimodal_content 支持 text + image_url/data:image)。
   // onEvent(name, payload) 逐事件回调。
+  // opts (issue #209, 可空): { activeSidRef } —— 视图级摘流。activeSidRef 是
+  // ChatView 同步维护的「当前画面展示的 session sid」ref; 流所属 sessionId 与
+  // 其不等 (= 用户已切走/新建会话) 时, 本流所有事件(含 poll.broken /
+  // poll.recovered fallback 路径)一律丢弃, 旧 run 残余 token 不得落进新会话
+  // 画面。run 本身在服务端继续 (#63 保活语义), 摘流只断渲染。不传 opts =
+  // 旧行为全量透传 (向后兼容既有调用与测试)。
   // 事件序列: run.queued → run.started → message.started
   //   → assistant.delta(多次) / assistant.commentary / tool.* → assistant.completed
   //   → run.completed|failed|cancelled
@@ -122,7 +128,15 @@ export function makeGw(base) {
   //      抓取 chatStream 中断期间 main agent 已经落地但前端没收到的消息
   //   3) 轮询期间检测 run 是否重新变为 idle, 恢复时也用 onEvent 通知前端
   //      (用 'poll.resumed' 事件标记恢复边界, 避免 ChatView 重复渲染)
-  async chatStream(sessionId, content, onEvent, signal) {
+  async chatStream(sessionId, content, onEvent, signal, opts = null) {
+    // issue #209 视图级摘流: 事件出口唯一收口 emit()。流所属 sessionId 与
+    // 当前画面 session (activeSidRef) 不一致 → 全部丢弃 (含 fallback 轮询
+    // 路径)。ref 由 ChatView 在切换瞬间同步改写, 不等 React 渲染, 摘流零窗口。
+    const activeSidRef = opts && opts.activeSidRef
+    const emit = (ev, data) => {
+      if (activeSidRef && activeSidRef.current !== sessionId) return
+      onEvent(ev, data)
+    }
     // 包装一层: 内部 fetch 抛错不算 done, 触发 fallback 恢复
     let transportBroken = false
     let streamDone = false
@@ -155,7 +169,7 @@ export function makeGw(base) {
             try { data = JSON.parse(payload) } catch { /* ignore */ }
           }
         }
-        if (data !== null) onEvent(ev, data)
+        if (data !== null) emit(ev, data)
       }
       const flushPending = () => {
         let idx
@@ -187,7 +201,7 @@ export function makeGw(base) {
       if (err?.name === 'AbortError') throw err
       // 其他网络/解析错误: 标记 broken, 进入 fallback 恢复
       transportBroken = true
-      onEvent('poll.broken', { error: String(err?.message || err), session_id: sessionId })
+      emit('poll.broken', { error: String(err?.message || err), session_id: sessionId })
     }
     // ★ Fallback 恢复: SSE 异常断连时, 启动快速轮询抓取落地消息
     // 触发条件: transportBroken && !signal?.aborted
@@ -209,7 +223,7 @@ export function makeGw(base) {
             if (count > lastCount) {
               const newRaw = raw.slice(lastCount)
               for (const m of newRaw) {
-                onEvent('poll.recovered', { raw: m })
+                emit('poll.recovered', { raw: m })
               }
             }
             done = true
@@ -224,7 +238,7 @@ export function makeGw(base) {
           if (count > lastCount) {
             const newRaw = raw.slice(lastCount)
             for (const m of newRaw) {
-              onEvent('poll.recovered', { raw: m })
+              emit('poll.recovered', { raw: m })
             }
             lastCount = count
           }

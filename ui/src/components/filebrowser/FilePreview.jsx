@@ -1,6 +1,7 @@
 // FilePreview.jsx — 类型分档预览 + 状态机 (issue #46, s3-arch §4.2)
 // 设计依据: docs/UX-FILEBROWSER.md §4 + docs/ARCH-FILEBROWSER.md §4.2
 import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { Icon, ICONS } from '../icons.jsx'
 import { useTranslation } from 'react-i18next'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
@@ -24,7 +25,7 @@ function ErrorCard({ kind, onRetry }) {
   }[kind] || t('chat.files.err_server')
   return (
     <div className="card-pad flex flex-col items-center gap-2 text-center">
-      <div className="text-bad text-[24px]" aria-hidden="true">⚠</div>
+      <Icon d={ICONS.warn} className="w-6 h-6 text-bad" />
       <div className="text-[13px] text-ink">{msg}</div>
       {kind !== 403 && onRetry && (
         <button onClick={onRetry} className="btn-ghost btn-sm">
@@ -41,7 +42,7 @@ function FallbackCard({ selection }) {
   const size = formatSize(selection.size)
   return (
     <div className="card-pad flex flex-col items-center gap-1.5 text-center">
-      <div className="text-dim text-[28px]" aria-hidden="true">📄</div>
+      <Icon d={ICONS.file} className="w-7 h-7 text-dim" />
       <div className="text-[13px] font-medium text-ink">{selection.name}</div>
       <div className="text-[11px] text-dim font-mono">{size}</div>
     </div>

@@ -98,7 +98,7 @@ classify 端点判定 + worker 注册表 scope.tags 语义选定 (SE / PM / 必�
 
 ## Team Work 协议(用户的入口)
 
-- 用户通过「开启 Team Work 任务」创建一个 Team Work session, 该 session 就是你的工作场所。
+- 用户通过「发起多智能体协作」创建一个 Team Work session, 该 session 就是你的工作场所。
 - 用户给你 initial_task + 可选的 workflow_id, 你必须先 **读 GET /api/workflows** 决定拆解粒度。
 - 你必须在 session 内完成所有拆解、澄清、调度工作。
 
@@ -202,6 +202,10 @@ classify 端点判定 + worker 注册表 scope.tags 语义选定 (SE / PM / 必�
 > 最后一张卡结算后 mw 只发 `team_work.run_idle` 事件; 你读完交付总结后
 > 主动调 `POST /api/team-work/<run_id>/close` 收尾。关闭权在你(和操作员),
 > 中间件永不越权关 run。
+
+> **你可以按需冻结 / 恢复整条链** (issue #210): `POST /api/team-work/<run_id>/hold`
+> 冻结一条 ACTIVE run (worker 进程不被杀, 链停止推进, 下一个 inbox 任务可照常起倒计时);
+> 用户要求恢复这个 run 时 `POST /api/team-work/<run_id>/hold/resume` 解冻。
 
 <!-- REQUIRED: do not remove -->
 

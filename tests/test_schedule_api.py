@@ -217,3 +217,57 @@ def test_dispatch_message_equivalence(monkeypatch):
     assert "参考 workflow: wf" in msg2
     assert "工作目录: /ws" in msg2
     assert 'project_workspace' in msg2
+
+
+# ── #197: 收件箱排序 + 暂停出列 + 倒计时持有者 (API 层) ──────────────
+def test_tasks_list_order_is_creation_ascending():
+    """AC-Q197-1: 待执行列表自上而下 = 创建时间升序 (最早创建在最上)。
+
+    MV-197-10: 把 list_all 的组内序改回 DESC ⇒ 本用例红。
+    """
+    t1 = _create("T1")
+    import time
+    time.sleep(0.02)
+    t2 = _create("T2")
+    time.sleep(0.02)
+    t3 = _create("T3")
+    code, body = S.api_schedule_tasks()
+    assert code == 200
+    assert [x["id"] for x in body["tasks"]] == [t1["id"], t2["id"], t3["id"]]
+    # next_task_id = 队首 = 最早创建者
+    assert body["next_task_id"] == t1["id"]
+
+
+def test_paused_task_leaves_pending_group():
+    """AC-Q197-6: 暂停任务不再出现在待执行列表 (前端分组亦独立成组)。"""
+    t1 = _create("T1")
+    import time
+    time.sleep(0.02)
+    t2 = _create("T2")
+    code, _ = S.api_schedule_action(t1["id"], "pause")
+    assert code == 200
+    code, body = S.api_schedule_tasks()
+    assert code == 200
+    rows = {x["id"]: x["status"] for x in body["tasks"]}
+    assert rows[t1["id"]] == "paused"
+    assert rows[t2["id"]] == "pending"
+    # 队首顺位进入待执行
+    assert body["next_task_id"] == t2["id"]
+
+
+def test_state_countdown_next_is_holder():
+    """AC-Q197-10③ 的可见面: 倒计时条显示的 next_task 是**持有者**。"""
+    eng = S.get_engine()
+    t1 = _create("T1")
+    import time
+    time.sleep(0.02)
+    t2 = _create("T2")
+    eng._tick()
+    assert eng.countdown_task_id == t1["id"]
+    S.api_schedule_action(t1["id"], "pause")
+    eng._tick()
+    assert eng.countdown_task_id == t2["id"]
+    code, body = S.api_schedule_state()
+    assert code == 200
+    assert body["countdown"]["next_task_id"] == t2["id"]
+    assert body["countdown"]["next_task_title"] == "T2"

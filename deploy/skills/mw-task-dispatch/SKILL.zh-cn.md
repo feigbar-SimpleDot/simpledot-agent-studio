@@ -70,7 +70,7 @@ launch 响应：
 填**你自己的 Hermes session_id**（reaper 靠它把 worker 报告送回你，
 `POST /api/sessions/<sid>/chat`）。
 
-- 从控制台「开启 Team Work 任务」按钮进来的：请求文本里已注入
+- 从控制台「发起多智能体协作」按钮进来的：请求文本里已注入
   `session_id: "<sid>"`，**直接用那个值**。
 - 不确定自己的 session_id：读你系统提示里的 session id（形如
   `api_<时间戳>_<8hex>`），或从控制台会话列表复制。
@@ -112,6 +112,14 @@ curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/cards \
   错落到 task 目录。
 - 幂等：重复登记同一张卡不重复计数；一张卡不能挂两个 run。
 - 返回 `{registered, already_registered, skipped, card_count}`，逐项核对。
+
+### 冻结 / 恢复整条链（hold / resume，issue #210）
+
+当某张卡无法继续、需要让位给下一个 inbox 任务时，可
+`POST /api/team-work/<run_id>/hold` 冻结本链（worker 进程不被杀，
+`current_card_id` 不动；本链的 inbox 任务同步置 `hold`，下一个 inbox
+任务照常起倒计时）。用户要求恢复时
+`POST /api/team-work/<run_id>/hold/resume` 解冻（已有另一条 ACTIVE run ⇒ 409）。
 
 ### 字段规则（违反会被 400/422 拒收）
 

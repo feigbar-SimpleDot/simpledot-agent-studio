@@ -1,6 +1,7 @@
 // FileDrawer.jsx — 文件浏览器抽屉容器 (issue #46, s3-arch §4.1)
 // 设计依据: docs/UX-FILEBROWSER.md §1 + docs/ARCH-FILEBROWSER.md §4.1
 import React, { useState, useEffect, useCallback, useRef } from 'react'
+import { Icon, ICONS } from '../icons.jsx'
 import { useTranslation } from 'react-i18next'
 import { FileTree } from './FileTree.jsx'
 import { FilePreview } from './FilePreview.jsx'
@@ -20,7 +21,7 @@ function Crumbs({ path, onCrumbsClick }) {
       </button>
       {parts.map((p, i) => (
         <React.Fragment key={i}>
-          <span className="text-dim/50">/</span>
+          <span className="text-dim">/</span>
           <button onClick={() => onCrumbsClick(parts.slice(0, i + 1).join('/'))}
                   className={`hover:text-accent truncate ${i === parts.length - 1
                               ? 'text-ink font-medium' : ''}`}>
@@ -88,7 +89,7 @@ function ActionBar({ project, selection, cwd, uploading, onPickFiles,
       {/* issue #158: 上传入口 (隐藏 input, 选中即逐个 POST /api/fs/upload) */}
       <label className="btn-ghost btn-sm flex items-center gap-1 cursor-pointer"
              title={t('chat.files.upload_hint', { path: targetDir || '.' })}>
-        <span aria-hidden="true">⬆</span>
+        <Icon d={ICONS.upload} className="w-3.5 h-3.5" />
         {uploading ? t('chat.files.uploading') : t('chat.files.upload')}
         <input type="file" multiple className="hidden" disabled={uploading}
                onChange={(e) => {
@@ -101,17 +102,17 @@ function ActionBar({ project, selection, cwd, uploading, onPickFiles,
         <button type="button"
                 className="btn-ghost btn-sm flex items-center gap-1 !text-bad"
                 onClick={onRequestDelete}>
-          <span aria-hidden="true">✕</span> {t('chat.files.delete')}
+          <Icon d={ICONS.close} className="w-3.5 h-3.5" /> {t('chat.files.delete')}
         </button>
       )}
       {selection && (<>
       <a href={api.fsFileUrl(project, selection.path, 'download')} download
          className="btn-ghost btn-sm flex items-center gap-1">
-        <span aria-hidden="true">⬇</span> {t('chat.files.download')}
+        <Icon d={ICONS.download} className="w-3.5 h-3.5" /> {t('chat.files.download')}
       </a>
       <a href={api.fsFileUrl(project, selection.path, 'open')} target="_blank" rel="noreferrer noopener"
          className="btn-ghost btn-sm flex items-center gap-1">
-        <span aria-hidden="true">↗</span> {t('chat.files.open_in_browser')}
+        <Icon d={ICONS.external} className="w-3.5 h-3.5" /> {t('chat.files.open_in_browser')}
       </a>
       </>)}
       <span className="ml-auto text-[10.5px] text-dim truncate font-mono"
@@ -250,13 +251,13 @@ export function FileDrawer({ open, project, onClose, revealTarget, refreshKey })
                   className="btn-quiet btn-sm !px-2"
                   title={t('chat.files.refresh')}
                   aria-label={t('chat.files.refresh')}>
-            ⟳
+            <Icon d={ICONS.refresh} className="w-3.5 h-3.5" />
           </button>
           <button onClick={onClose}
                   className="btn-quiet btn-sm !px-2"
                   title={t('chat.files.close')}
                   aria-label={t('chat.files.close')}>
-            ✕
+            <Icon d={ICONS.close} className="w-3.5 h-3.5" />
           </button>
         </div>
         {selection && <Crumbs path={selection.path}

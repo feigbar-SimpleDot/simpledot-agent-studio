@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -90,6 +91,19 @@ def webui_proxy_enabled() -> bool:
         return env == "1"
     # 自动探测: 与 main_entry.sh 的 webui 启动条件同源 ([ -f /webui/start.sh ])
     return os.path.isfile("/webui/start.sh")
+
+
+# issue #199: 未登录闭环 next=/ 落控制台根 —— webui 登录页对 next 为裸 "/"
+# 的 302 会让浏览器登录后落 / (控制台首页) 而非 /webui/。代理层定点改写:
+# 仅当查询参数 next 的值恰为 "/" 或 "%2F" (精确根路径) 时改写为 /webui/;
+# 其余值 (next=/x、next=/webui/ 等) 原样返回。(?=&|$) 保证只匹配整值,
+# 不误伤 next=/x 这类前缀形态 (PLAN-Q §2.3 裁决; M11 变异反证口径)。
+_LOGIN_NEXT_ROOT = re.compile(r"([?&]next=)(?:/|%2F)(?=&|$)")
+
+
+def _rewrite_login_next(loc: str) -> str:
+    """302 Location 里 next=/ (或 %2F) 改写为 next=/webui/, 其余原样。"""
+    return _LOGIN_NEXT_ROOT.sub(r"\1/webui/", loc)
 
 
 def proxy_http(handler, upstream_path: str):
@@ -156,6 +170,10 @@ def proxy_http(handler, upstream_path: str):
         for k, v in resp.headers.items():
             if k.lower() in _HOP_BY_HOP:
                 continue
+            # issue #199: 3xx 的 Location 里 next=/ 定点改写为 next=/webui/
+            # (未登录闭环落控制台根的根因修在代理可见面; 非 3xx 与其余头原样)。
+            if k.lower() == "location" and 300 <= resp.status < 400:
+                v = _rewrite_login_next(v)
             handler.send_header(k, v)
         handler.send_header("Content-Length", str(len(data)))
         handler.end_headers()

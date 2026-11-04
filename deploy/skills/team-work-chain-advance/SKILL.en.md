@@ -142,7 +142,7 @@ the user's own choice (the user can specify it via their own soul/skill/prompt).
 Three common false positives:
 
 - **Wrong owner/repo path in notes**: the worker writes "pushed to sds/studio" but actually pushed
-  to <owner>/<repo> (or the reverse). The worker's local `git remote -v` is the only
+  to jayzhou/hermes_agents_chain (or the reverse). The worker's local `git remote -v` is the only
   trustworthy source; the URL in `PROJECT-MEMORY.md` lines 3-4 is the authoritative reference.
   Never copy the owner/repo path text from the worker's note — independently
   `curl .../repos/<owner>/<repo>/branches/main` to verify.

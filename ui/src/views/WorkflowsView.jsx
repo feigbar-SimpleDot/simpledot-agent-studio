@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
+import { Icon, ICONS } from '../components/icons.jsx'
 import { useTranslation } from 'react-i18next'
 import { i18next } from '../i18n'   // 全局 i18next 实例 (buildLLMTemplate 在组件外调用, 需要直接读 language)
 import * as yaml from 'js-yaml'
@@ -807,7 +808,7 @@ export default function WorkflowsView({ onChanged }) {
                     <div className="group/ins -my-1 py-0.5 text-center opacity-0 hover:opacity-100 transition-opacity wf-insert">
                       <button className="btn-ghost btn-sm !py-0.5 text-[10px]"
                         title={t('workflows.insert_here_btn')}
-                        onClick={() => insertStepAt(i)}>＋ {t('workflows.insert_here_btn')}</button>
+                        onClick={() => insertStepAt(i)}><Icon d={ICONS.plus} className="w-3 h-3 inline-block -mt-0.5" /> {t('workflows.insert_here_btn')}</button>
                     </div>
                     {/* 步骤块: 头部(序号+实时步骤名) + 双列字段网格, <768px 单列 (§3.2) */}
                     <div className="rounded-lg border border-line bg-panel2/40 p-2.5 space-y-2">
@@ -824,7 +825,7 @@ export default function WorkflowsView({ onChanged }) {
                           onClick={() => moveStep(i, 1)}>▼</button>
                         <button className="btn-ghost btn-sm !px-2 !py-0.5 leading-none text-[11px] text-bad"
                           onClick={() => delStep(i)}
-                          disabled={dlg.f.steps.length <= 1} title={t('workflows.delete_step_btn')}>✕</button>
+                          disabled={dlg.f.steps.length <= 1} title={t('workflows.delete_step_btn')}><Icon d={ICONS.close} className="w-3 h-3 inline-block" /></button>
                       </div>
                     </div>
                     {/* 紧凑 label: 原始 key 进 title 悬浮, placeholder 只留示例值 (§3.2 映射表) */}

@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react'
+import { Icon, ICONS } from '../components/icons.jsx'
 import { useTranslation } from 'react-i18next'
 import { api, fmtApiError } from '../api.js'
 import { Modal, Toast, Confirm } from '../components/ui.jsx'
@@ -371,39 +372,57 @@ function classify(card, t) {
   const sv = card && card.state
   if (sv) {
     if (sv === 'HARVESTED' || sv === 'ARCHIVED')
-      return { group: 'finished', badge: 'badge-green', sem: t('tboard.state_finished'), icon: '✓', dataState: sv }
+      return { group: 'finished', badge: 'badge-green', sem: t('tboard.state_finished'), icon: 'check', dataState: sv }
     if (sv === 'NEED_CLARIFICATION')
-      return { group: 'attention', badge: 'badge-yellow', sem: t('tboard.state_attention'), icon: '!', dataState: sv }
+      return { group: 'attention', badge: 'badge-yellow', sem: t('tboard.state_attention'), icon: 'alert', dataState: sv }
     if (sv === 'BLOCKED' || sv === 'ERROR')
-      return { group: 'blocked', badge: 'badge-red', sem: t('tboard.state_blocked'), icon: '!', dataState: sv }
+      return { group: 'blocked', badge: 'badge-red', sem: t('tboard.state_blocked'), icon: 'alert', dataState: sv }
     if (sv === 'WORKING')
-      return { group: 'running', badge: 'badge-blue', sem: t('tboard.state_running'), icon: '●', dataState: sv }
+      return { group: 'running', badge: 'badge-blue', sem: t('tboard.state_running'), icon: 'dot', dataState: sv }
     if (sv === 'HANDOFF')
-      return { group: 'handoff', badge: 'badge-purple', sem: t('tboard.state_handoff'), icon: '↻', dataState: sv }
+      return { group: 'handoff', badge: 'badge-purple', sem: t('tboard.state_handoff'), icon: 'refresh', dataState: sv }
     if (sv === 'WAITING')
-      return { group: 'waiting', badge: 'badge-amber', sem: t('tboard.state_waiting'), icon: '⌛', dataState: sv }
+      return { group: 'waiting', badge: 'badge-amber', sem: t('tboard.state_waiting'), icon: 'clock', dataState: sv }
     // issue #132: waiting_sub 派生态不再被压平成「等介入」—— worker 在等自己
     // 的子任务, 球在 worker 不在 main, 归忙碌族 (蓝) 与琥珀色 waiting 区分。
     // 分支顺序在 WAITING 之后: 与 ledger 派生优先级一致 (AC-A7 单一派生态真理源)。
     if (sv === 'WAITING_SUB')
-      return { group: 'running', badge: 'badge-blue', sem: t('tboard.state_waiting_sub'), icon: '⋯', dataState: sv }
+      return { group: 'running', badge: 'badge-blue', sem: t('tboard.state_waiting_sub'), icon: 'ellipsis', dataState: sv }
     if (sv === 'PENDING')
-      return { group: 'pending', badge: 'badge-slate', sem: t('tboard.state_pending'), icon: '○', dataState: sv }
+      return { group: 'pending', badge: 'badge-slate', sem: t('tboard.state_pending'), icon: 'circle', dataState: sv }
     if (sv === 'CANCELLED')
-      return { group: 'finished', badge: 'badge-slate', sem: t('tboard.state_cancelled'), icon: '✕', dataState: sv }
+      return { group: 'finished', badge: 'badge-slate', sem: t('tboard.state_cancelled'), icon: 'close', dataState: sv }
   }
   // Fallback: 旧版派生 (保持向后兼容 — 老 server / 直接 consumer
   // kanban 数据时仍可工作)
   if (card.status === 'done' || card.status === 'archived')
-    return { group: 'finished', badge: 'badge-green', sem: t('tboard.state_finished'), icon: '✓' }
+    return { group: 'finished', badge: 'badge-green', sem: t('tboard.state_finished'), icon: 'check' }
   if (card.harvest_status === 'NEED_CLARIFICATION' ||
       (card.status === 'blocked' && card.block_kind === 'needs_input'))
-    return { group: 'attention', badge: 'badge-yellow', sem: t('tboard.state_attention'), icon: '!' }
+    return { group: 'attention', badge: 'badge-yellow', sem: t('tboard.state_attention'), icon: 'alert' }
   if (card.status === 'blocked')
-    return { group: 'blocked', badge: 'badge-red', sem: t('tboard.state_blocked'), icon: '!' }
+    return { group: 'blocked', badge: 'badge-red', sem: t('tboard.state_blocked'), icon: 'alert' }
   if (card.status === 'running')
-    return { group: 'running', badge: 'badge-blue', sem: t('tboard.state_running'), icon: '●' }
-  return { group: 'pending', badge: 'badge-slate', sem: t('tboard.state_pending'), icon: '○' }
+    return { group: 'running', badge: 'badge-blue', sem: t('tboard.state_running'), icon: 'dot' }
+  return { group: 'pending', badge: 'badge-slate', sem: t('tboard.state_pending'), icon: 'circle' }
+}
+
+// issue #202 R4: classify() 的 icon 键 -> SVG 渲染 (统一 1.8w 描边体系,
+// dot/ellipsis 用粗圆头描边成点)。装饰性: 状态文字在同行徽章/文案里,
+// Icon 组件本身 aria-hidden。
+const STATE_GLYPH = {
+  check:   { d: ICONS.check,   sw: 2 },
+  alert:   { d: ICONS.alert,   sw: 2 },
+  dot:     { d: ICONS.dot,     sw: 6 },
+  refresh: { d: ICONS.refresh, sw: 2.2 },
+  clock:   { d: ICONS.clock,   sw: 2 },
+  ellipsis: { d: ICONS.ellipsis, sw: 3 },
+  circle:  { d: ICONS.circle,  sw: 2 },
+  close:   { d: ICONS.close,   sw: 2 },
+}
+function StateGlyph({ icon }) {
+  const g = STATE_GLYPH[icon] || STATE_GLYPH.circle
+  return <Icon d={g.d} className="w-3 h-3" strokeWidth={g.sw} />
 }
 
 // 统一状态徽章 (pulse=进行中呼吸圆点; 定宽居中, 对齐规范 §3.3)
@@ -443,7 +462,7 @@ function AssigneeBadge({ name, t }) {
 function Chevron({ open }) {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
          className={`w-4 h-4 text-dim transition-transform shrink-0 ${open ? 'rotate-90' : ''}`}>
       <path d="M9 6l6 6-6 6" />
     </svg>
@@ -479,15 +498,22 @@ function StepTimeline({ detail, currentId, busy, onReply, onCancel, onArchive, t
                data-state={c.dataState || c.group}>
             {/* 时间线轴: 节点圆 20px + 连接线 */}
             <div className="w-[20px] flex flex-col items-center shrink-0 pt-3">
-              <span className={`w-5 h-5 rounded-full border-[1.5px] flex items-center justify-center
+              {/* issue #202 R3-8/R4: 节点图标换 SVG 体系; animate-pulse 从
+                  整圈(边框+字符)收敛为角上 6px 状态点脉冲 (AC-R3-8)。 */}
+              <span className={`relative w-5 h-5 rounded-full border-[1.5px] flex items-center justify-center
                 text-[11px] font-bold shrink-0
                 ${c.group === 'finished' ? 'border-ok text-ok'
-                  : c.group === 'attention' ? 'border-warn text-warn animate-pulse'
+                  : c.group === 'attention' ? 'border-warn text-warn'
                   : c.group === 'blocked' ? 'border-bad text-bad'
-                  : c.group === 'running' ? 'border-accent text-accent animate-pulse'
+                  : c.group === 'running' ? 'border-accent text-accent'
                   : c.group === 'handoff' ? 'border-warn text-warn animate-spin'
                   : c.group === 'waiting' ? 'border-warn text-warn'
-                  : 'border-line text-dim'}`}>{c.icon}</span>
+                  : 'border-line text-dim'}`}>
+                <StateGlyph icon={c.icon} />
+                {(c.group === 'attention' || c.group === 'running') && (
+                  <span className="absolute -top-1 -right-1 w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+                )}
+              </span>
               {i < cards.length - 1 && <span className="w-[1.5px] flex-1 bg-line min-h-[20px]" />}
             </div>
             {/* 步骤内容: 固定列网格 (对齐规范 §3.1); 当前步高亮底, 等你回复整行黄底
@@ -720,8 +746,8 @@ function CurrentTaskCard({ active, detail, detailErr, closing,
           <div className="mt-3 flex flex-col sm:flex-row sm:items-center gap-2">
             <div className="flex-1 min-w-0 h-1.5 rounded-full bg-panel2 overflow-hidden">
               {detail
-                ? <div className="h-full rounded-full bg-accent transition-all duration-300"
-                       style={{ width: `${pct}%` }} />
+                ? <div className="h-full w-full rounded-full bg-accent origin-left transition-transform duration-300"
+                       style={{ transform: `scaleX(${pct / 100})` }} />
                 : <div className="h-full w-full skeleton !rounded-full" />}
             </div>
             <span className="text-[11.5px] text-dim tabular-nums shrink-0 sm:text-right">
@@ -897,7 +923,7 @@ function FieldRow({ label, children, mono = false, accent = false }) {
   return (
     <div className={`grid grid-cols-[64px_minmax(0,1fr)] gap-x-3 items-start py-1.5
                     border-b border-line/40 last:border-b-0`}>
-      <div className="text-[11px] text-dim uppercase tracking-wide pt-0.5">{label}</div>
+      <div className="text-[11px] text-dim pt-0.5">{label}</div>
       <div className={`min-w-0 ${mono ? 'font-mono' : ''}
                       ${accent ? 'text-accent font-medium' : 'text-ink'} text-[12.5px]
                       break-words`}>{children}</div>
@@ -1197,7 +1223,9 @@ function HistoryList({ items, kind, t }) {
                           ${isDropped
                             ? 'border-bad/30 bg-bad/5 opacity-75 line-through'
                             : 'border-line bg-panel2/40'}`}>
-            {/* 序号位换 ✓ 徽章 (dropped 用 ✕ 红底) 保持视觉对齐 PendingList */}
+            {/* 序号位换徽章 (dropped 红底) 保持视觉对齐 PendingList。
+                issue #202 R4: ✓/✕ 文字符号 -> SVG (语义映射不变: 完成=check,
+                放弃=close, AC-R4-5)。 */}
             <span className={`shrink-0 w-6 h-6 rounded-full border flex items-center justify-center
                               text-[11px] font-bold
                               ${isDropped
@@ -1205,7 +1233,9 @@ function HistoryList({ items, kind, t }) {
                                 : hasStructured
                                   ? 'border-ok text-ok'
                                   : 'border-line text-dim'}`}>
-              {isDropped ? '✕' : hasStructured ? '✓' : '·'}
+              {isDropped ? <StateGlyph icon="close" />
+               : hasStructured ? <StateGlyph icon="check" />
+               : '·'}
             </span>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 flex-wrap">
@@ -1742,7 +1772,7 @@ export default function TasksBoardView({ onChanged }) {
                 <div className="flex flex-wrap gap-2">
                   {dlg.task.options.map((o, i) => (
                     <button key={i}
-                      className={`rounded-lg border px-3 py-1.5 text-[12.5px] transition-all
+                      className={`rounded-lg border px-3 py-1.5 text-[12.5px] transition-colors
                         ${dlg.picked === i
                           ? 'border-ok bg-ok/15 text-ok font-semibold'
                           : 'border-line bg-panel2 text-ink hover:border-accent hover:text-accent'}`}

@@ -137,8 +137,8 @@ one that knows where it is still fuzzy.
 
 ## Team Work Protocol (user-facing entry)
 
-- The user starts a Team Work session via "Start a Team Work task";
-  that session is your workspace.
+- The user starts a Team Work session via "Start multi-agent
+  collaboration"; that session is your workspace.
 - The user gives you `initial_task` and an optional `workflow_id`;
   you **must first call `GET /api/workflows`** to decide the split
   granularity.
@@ -301,6 +301,12 @@ signal (`cmd_spawn_bg`'s `exit_code` is the return value of
 > `POST /api/team-work/<run_id>/close` to wrap up. The closing
 > decision is yours (and the operator's); the middleware never
 > oversteps to close a run.
+
+> **You can freeze and thaw a chain on demand (issue #210)**:
+> `POST /api/team-work/<run_id>/hold` freezes an ACTIVE run (the worker
+> is not killed, the chain stops advancing and the next inbox task may
+> start); when the user asks to resume this run,
+> `POST /api/team-work/<run_id>/hold/resume` thaws it.
 
 <!-- REQUIRED: do not remove -->
 

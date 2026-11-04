@@ -37,6 +37,12 @@ PENDING
 FAILED
 harvest_status
 PHYSICAL_ERROR
+# busy_reason 协议码 (issue #206, 机器面, 与 STATUS_* 同类登记)
+inbox_running
+# 附件清单段标记 (issue #211, 协议字面量, 机器面: schedule detail 的段分隔,
+# 消费方按 `- <绝对路径>` 行 read_file, 不按语言解析; 生产侧 buildTeamWorkDetail
+# 与契约 ATTACH_DETAIL 逐字锁定。登记先例: inbox_running 于 R 批 4996f2b)
+【附件】
 
 # —— logging 调用站点的字符串(架构 §5.3 OUT 项:logging 不入表) ——
 logging.
@@ -92,9 +98,9 @@ task.stuck
 # —— 预登记未接线词条 (卡 fix-console-ui-i18n, B2/G13 裁决留档) ——————
 # console.workflow.* / console.upload.* / console.workers.* /
 # console.settings.* / console.team_work.* / console.soul.read_failed:
-#   值逐字=console.py 校验消息原文 (44 键, 脚本核对全部在码)。按架构
+#   值逐字=console.py 校验消息原文 (42 键, 脚本核对全部在码)。按架构
 #   §5.2 这些是 API error message 域词条; 前端卡 t_2899c2a3 已完成
-#   ui/** i18next 词条表(539 keys)覆盖前端展示, 后端 error 值写时 t()
+#   ui/** i18next 词条表(778 keys, 随 ui/src/i18n/locales/*.json 增删同步)覆盖前端展示, 后端 error 值写时 t()
 #   接线属 §5.3 登记遗留, 由 final-submit/code-review 裁决统一接线,
 #   本卡不越界重排 console.py 校验函数 (零逻辑红线最小 diff)。
 # console.lang.*: GET /api/lang 与前端语言面板词条, 值预抄自架构文档;

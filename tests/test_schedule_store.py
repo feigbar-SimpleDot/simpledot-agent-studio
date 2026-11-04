@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 import sys
@@ -126,17 +127,41 @@ def test_title_generation(store):
 
 # ── SM5: 队首取序 ────────────────────────────────────────────────────
 def test_head_pending_order(store):
+    """队首 = 创建最早者 (added_at ASC) —— issue #197 取代 A8 的 DESC 裁决。
+
+    MV-197-1: 把 head_pending/take_head_pending 的 ASC 改回 DESC ⇒ 本用例红。
+    """
     a = _mk(store, "A")
     time.sleep(0.01)
     b = _mk(store, "B")
     time.sleep(0.01)
     c = _mk(store, "C")
-    assert store.head_pending()["id"] == c["id"]       # added_at DESC
-    store.pause(c["id"])                               # 暂停天然不在 pending 集
+    assert store.head_pending()["id"] == a["id"]       # added_at ASC
+    store.pause(a["id"])                               # 暂停天然不在 pending 集
     assert store.head_pending()["id"] == b["id"]
     assert store.take_head_pending()["id"] == b["id"]
-    assert store.take_head_pending()["id"] == a["id"]
+    assert store.take_head_pending()["id"] == c["id"]
     assert store.take_head_pending() is None
+
+
+# ── SM5b: take_pending 精确取 (倒计时持有者) ────────────────────────
+def test_take_pending_targets_exact_task(store):
+    """take_pending(task_id) 按 id 精确取, 不按队首取 (AC-Q197-10③)。
+
+    MV-197-2: 把 take_pending 换回 take_head_pending ⇒ 本用例红。
+    """
+    a = _mk(store, "A")
+    time.sleep(0.01)
+    b = _mk(store, "B")
+    # 指定取 b (非队首 a) ⇒ b 变 running, a 仍 pending
+    got = store.take_pending(b["id"])
+    assert got is not None and got["id"] == b["id"]
+    assert got["status"] == "running" and got["executed_at"] is not None
+    assert store.get(a["id"])["status"] == "pending"
+    # 非 pending (已 running) ⇒ 0 行 ⇒ 弃轮返回 None (双保险)
+    assert store.take_pending(b["id"]) is None
+    # 不存在的 id ⇒ None
+    assert store.take_pending("nope") is None
 
 
 # ── SM6: 开关持久化 ──────────────────────────────────────────────────
@@ -153,18 +178,168 @@ def test_auto_execute_persist(tmp_path):
 
 # ── SM7: 列表分组预排 ────────────────────────────────────────────────
 def test_list_grouping(store):
+    """四分组 + 组内序 (issue #197)。
+
+    组序: running / pending / paused / done+cancelled (paused 独立成组,
+    OQ-1 裁决)。组内: 组0-2 按 added_at ASC, 组3 按完成时刻 DESC。
+
+    MV-197-3: 把 paused 并回 pending 组 / 组内序改回 DESC ⇒ 本用例红。
+    """
     a = _mk(store, "A")
     b = _mk(store, "B")
     c = _mk(store, "C")
     d = _mk(store, "D")
-    store.take_head_pending()          # 队首 (d) → running
-    store.mark_done(d["id"])           # d → done
-    store.cancel(c["id"])              # c → cancelled
+    store.take_head_pending()          # 队首 (a, #197 升序) → running
+    time.sleep(0.01)
+    assert store.take_pending(d["id"]) is not None   # d → running
+    time.sleep(0.01)
+    assert store.mark_done(d["id"]) is True           # d → done (写 finished_at)
+    time.sleep(0.01)
+    assert store.cancel(c["id"]) is True              # c → cancelled (写 finished_at)
     store.pause(b["id"])               # b → paused
     order = [t["id"] for t in store.list_all()]
-    # 组0 running(无) / 组1 pending+paused 组内 added_at DESC: b(新),a /
-    # 组2 done+cancelled 组内 added_at DESC: d(最新,done),c(cancelled)
-    assert order == [b["id"], a["id"], d["id"], c["id"]]
+    # 组0 running: a / 组1 pending: 无 / 组2 paused: b /
+    # 组3 done+cancelled: 按完成时刻 DESC ⇒ c(后取消) 先, d(先完成) 后
+    assert order == [a["id"], b["id"], c["id"], d["id"]]
+
+
+def test_list_grouping_paused_is_separate_group(store):
+    """AC-Q197-6: 暂停任务不出现在待执行分组, 而在独立「已暂停」组。"""
+    a = _mk(store, "A")
+    b = _mk(store, "B")
+    store.pause(a["id"])
+    rows = store.list_all()
+    statuses = [(r["id"], r["status"]) for r in rows]
+    assert statuses == [(b["id"], "pending"), (a["id"], "paused")]
+
+
+# ── SM7b: 完成时刻 (finished_at) 排序 (AC-Q197-3/4) ──────────────────
+def test_finished_at_written_on_done_and_cancel(store):
+    """AC-Q197-4: done/cancelled 行必须写完成时刻 (非创建/开始执行时刻)。
+
+    MV-197-4: 把 mark_done/cancel 的 finished_at 写入去掉 ⇒ 本用例红。
+    """
+    t = _mk(store, "A")
+    assert store.get(t["id"])["finished_at"] is None
+    store.take_head_pending()
+    time.sleep(0.01)
+    assert store.mark_done(t["id"]) is True
+    done_row = store.get(t["id"])
+    assert done_row["finished_at"] is not None
+    assert done_row["finished_at"] >= done_row["added_at"]
+    # 取消同样写 finished_at
+    c = _mk(store, "C")
+    time.sleep(0.01)
+    assert store.cancel(c["id"]) is True
+    assert store.get(c["id"])["finished_at"] is not None
+
+
+def test_done_group_sorted_by_finished_at_desc(store):
+    """AC-Q197-3: 已完成组按**完成时刻**降序 (最近完成的在最上)。
+
+    后创建的任务先完成 ⇒ 必须排在更早创建但更晚完成的任务之前 ——
+    这正是「按创建时刻排」会错的场景 (变异反证点 M2)。
+
+    MV-197-5: 把 list_all 的组3 排序键改回 added_at ⇒ 本用例红。
+    """
+    early = _mk(store, "早期创建")           # 先创建
+    time.sleep(0.02)
+    late = _mk(store, "晚期创建")            # 后创建
+    # 晚期创建的任务先完成
+    assert store.take_pending(late["id"]) is not None
+    time.sleep(0.02)
+    assert store.mark_done(late["id"]) is True
+    # 早期创建的任务后完成
+    assert store.take_pending(early["id"]) is not None
+    time.sleep(0.02)
+    assert store.mark_done(early["id"]) is True
+    done_rows = [r for r in store.list_all() if r["status"] == "done"]
+    assert [r["id"] for r in done_rows] == [early["id"], late["id"]]
+    # 完成时刻确实降序 (按创建时刻排会得到相反次序 ⇒ 断言有牙齿)
+    assert done_rows[0]["finished_at"] > done_rows[1]["finished_at"]
+
+
+# ── SM7c: 存量库迁移 (AC-Q197-4 的存量口径) ─────────────────────────
+def _make_legacy_db(path):
+    """造一个 v1 存量库 (无 finished_at 列, 无 schema_version 行)。"""
+    c = sqlite3.connect(str(path))
+    c.executescript(
+        "CREATE TABLE schedule_tasks ("
+        " id TEXT PRIMARY KEY, title TEXT NOT NULL, detail TEXT NOT NULL,"
+        " priority TEXT NOT NULL DEFAULT 'normal',"
+        " status TEXT NOT NULL DEFAULT 'pending',"
+        " added_at REAL NOT NULL, executed_at REAL,"
+        " added_by TEXT NOT NULL DEFAULT '',"
+        " workflow TEXT NOT NULL DEFAULT 'auto',"
+        " workspace TEXT NOT NULL DEFAULT '',"
+        " session_id TEXT, run_id TEXT, last_error TEXT,"
+        " updated_at REAL NOT NULL);"
+        "CREATE TABLE schedule_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+    c.execute("INSERT INTO schedule_settings(key, value) "
+              "VALUES ('auto_execute_enabled', '1')")
+    c.execute("INSERT INTO schedule_tasks(id, title, detail, status, added_at, "
+              "updated_at) VALUES ('old-done','旧已完成','x','done',100.0,500.0)")
+    c.execute("INSERT INTO schedule_tasks(id, title, detail, status, added_at, "
+              "updated_at) VALUES ('old-pend','旧待执行','x','pending',200.0,200.0)")
+    c.commit()
+    c.close()
+
+
+def test_legacy_db_migrated_adds_finished_at(tmp_path):
+    """存量 v1 库 ⇒ 首次写连接自动迁移 (加列 + 回填 + 版本行)。
+
+    MV-197-6: 把迁移去掉 ⇒ 本用例红 (列缺失 / 存量 done 行 finished_at 为空)。
+    """
+    p = tmp_path / "legacy.db"
+    _make_legacy_db(p)
+    st = S.ScheduleStore(str(p))
+    # 迁移发生在写连接 ⇒ 一次写即触发
+    st.ensure_schema()
+    c = sqlite3.connect(str(p))
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(schedule_tasks)")}
+        ver = c.execute("SELECT value FROM schedule_settings "
+                        "WHERE key='schema_version'").fetchone()
+        old_done = c.execute("SELECT finished_at FROM schedule_tasks "
+                             "WHERE id='old-done'").fetchone()
+    finally:
+        c.close()
+    assert "finished_at" in cols, "存量库未加 finished_at 列"
+    assert ver is not None and int(ver[0]) >= S.SCHEMA_VERSION
+    # 存量 done 行以 updated_at 回填 (最后一次可用近似)
+    assert old_done is not None and old_done[0] is not None
+    assert abs(old_done[0] - 500.0) < 1e-6
+
+
+def test_migration_is_idempotent(tmp_path):
+    """迁移幂等: 重复 ensure_schema 不炸, 数据不丢, 版本行稳定。"""
+    p = tmp_path / "legacy.db"
+    _make_legacy_db(p)
+    st = S.ScheduleStore(str(p))
+    st.ensure_schema()
+    st.ensure_schema()
+    st.ensure_schema()
+    c = sqlite3.connect(str(p))
+    try:
+        ver = c.execute("SELECT value FROM schedule_settings "
+                        "WHERE key='schema_version'").fetchone()
+        n = c.execute("SELECT COUNT(*) FROM schedule_tasks").fetchone()[0]
+    finally:
+        c.close()
+    assert int(ver[0]) == S.SCHEMA_VERSION
+    assert n == 2
+
+
+def test_migrated_db_reads_do_not_crash(tmp_path):
+    """迁移后读路径正常 (排序表达式引用 finished_at 列不得报错)。"""
+    p = tmp_path / "legacy.db"
+    _make_legacy_db(p)
+    st = S.ScheduleStore(str(p))
+    st.ensure_schema()
+    rows = st.list_all()
+    assert len(rows) == 2
+    head = st.head_pending()
+    assert head is not None and head["id"] == "old-pend"
 
 
 # ── SM8: 读写分离 (issue #183) ────────────────────────────────────────
@@ -456,3 +631,237 @@ def test_snapshot_cycle_has_zero_write_statements(tmp_path, monkeypatch):
     assert offenders == [], f"snapshot 周期出现写语句: {offenders}"
     # 快照确实查了库 (不是空转假绿)
     assert any("SELECT" in s for s in trace.statements)
+
+
+# ── F-1 回流修复: 存量 v1 库读路径零写降级 (issue #197) ──────────────
+#
+# 背景 (docs/REVIEW-Q-20261102.md F-1, P1):
+#   存量 v1 库 (无 schema_version 行 / 无 finished_at 列) 上, 任何一次
+#   读 (list_all) 经 _read_conn → _schema_ready 判未就绪 → ensure_schema()
+#   在**写连接**上跑迁移 (ALTER + UPDATE + INSERT + COMMIT + journal_mode)
+#   ⇒ 读路径真写库; 只读库 (chmod 0444) 上直接抛 OperationalError。
+#
+# 本组守护的夹具是**未经任何写连接触碰**的 v1 库 —— 既有三个零写守护
+# (test_read_path_has_zero_write_statements 等) 的夹具都是 st.create(),
+# 走当前代码建库 ⇒ 建出来就是 v2 ⇒ 永远命中「已就绪」分支 ⇒ 对本路径
+# **零覆盖**。这正是 F-1 逃过既有守护的原因。
+
+def _make_v1_db(path):
+    """造一个**未经写连接触碰**的 v1 存量库。
+
+    刻意不用 ScheduleStore.create()/ensure_schema() —— 那两个调用走当前
+    代码, 会把库直接升到 v2 (带 finished_at 列 + schema_version 行) ⇒
+    构造不出「迁移尚未发生」的存量库场景。
+    """
+    c = sqlite3.connect(str(path))
+    c.executescript(
+        "CREATE TABLE schedule_tasks ("
+        " id TEXT PRIMARY KEY, title TEXT NOT NULL, detail TEXT NOT NULL,"
+        " priority TEXT NOT NULL DEFAULT 'normal',"
+        " status TEXT NOT NULL DEFAULT 'pending',"
+        " added_at REAL NOT NULL, executed_at REAL,"
+        " added_by TEXT NOT NULL DEFAULT '',"
+        " workflow TEXT NOT NULL DEFAULT 'auto',"
+        " workspace TEXT NOT NULL DEFAULT '',"
+        " session_id TEXT, run_id TEXT, last_error TEXT,"
+        " updated_at REAL NOT NULL);"
+        "CREATE TABLE schedule_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+    c.execute("INSERT INTO schedule_settings(key, value) "
+              "VALUES ('auto_execute_enabled', '1')")
+    c.execute("INSERT INTO schedule_tasks(id, title, detail, status, added_at, "
+              "updated_at) VALUES ('old-done','旧已完成','x','done',100.0,500.0)")
+    c.execute("INSERT INTO schedule_tasks(id, title, detail, status, added_at, "
+              "updated_at) VALUES ('old-pend','旧待执行','x','pending',200.0,200.0)")
+    c.commit()
+    c.close()
+
+
+def test_v1_legacy_db_read_path_has_zero_write_statements(tmp_path, monkeypatch):
+    """F-1 主守护: 存量 v1 库上 list_all() 发**零**写语句。
+
+    MV-F-1: 把 _read_conn 的懒建分支改回「未就绪就 ensure_schema()」
+    ⇒ 本用例红 (实测 6 条写语句: journal_mode=WAL / ALTER / BEGIN /
+    UPDATE / INSERT / COMMIT)。
+    """
+    p = str(tmp_path / "v1.db")
+    _make_v1_db(p)
+    st = S.ScheduleStore(p)
+
+    trace = _TraceConn().install(monkeypatch)
+    st.list_all()
+
+    offenders = [s for s in trace.statements if _WRITE_STMT_RE.search(s)]
+    assert offenders == [], f"存量 v1 库读路径出现写语句: {offenders}"
+    # 读路径确实查了库 (不是「压根没查」的空转假绿)
+    assert any("SELECT" in s for s in trace.statements)
+
+
+def test_v1_legacy_db_read_path_does_not_migrate(tmp_path):
+    """F-1: 读路径**不触发迁移** —— 读完库结构与版本行保持原样。
+
+    断言口径: 读完之后 finished_at 列仍不存在、schema_version 行仍不存在
+    ⇒ 迁移确实没跑 (而不是「跑了但被回滚」)。
+    """
+    p = str(tmp_path / "v1.db")
+    _make_v1_db(p)
+    st = S.ScheduleStore(p)
+    st.list_all()
+
+    c = sqlite3.connect(p)
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(schedule_tasks)")}
+        ver = c.execute("SELECT value FROM schedule_settings "
+                        "WHERE key='schema_version'").fetchone()
+    finally:
+        c.close()
+    assert "finished_at" not in cols, "读路径触发了迁移 (finished_at 列已加)"
+    assert ver is None, "读路径触发了迁移 (schema_version 行已写)"
+
+
+def test_v1_legacy_db_read_only_file_does_not_raise(tmp_path):
+    """F-1: 只读库 (chmod 0444) 上 list_all() **不抛异常**。
+
+    修复前: OperationalError attempt to write a readonly database
+    (读路径上的迁移要写库)。修复后: 纯读 ⇒ 正常返回行。
+    """
+    p = tmp_path / "ro.db"
+    _make_v1_db(p)
+    os.chmod(str(p), 0o444)
+    try:
+        st = S.ScheduleStore(str(p))
+        rows = st.list_all()
+        assert [r["id"] for r in rows] == ["old-pend", "old-done"]
+        # 其余读路径方法同样不得抛 (都走 _read_conn)
+        head = st.head_pending()
+        assert head is not None and head["id"] == "old-pend"
+        assert st.has_pending() is True
+        assert st.list_by_status("done")[0]["id"] == "old-done"
+    finally:
+        os.chmod(str(p), 0o600)      # 复原权限, 免得 tmp 清理失败
+
+
+def test_v1_legacy_db_read_order_matches_updated_at_desc(tmp_path):
+    """F-1 降级排序口径: 无 finished_at 列时终态组按 updated_at 降序。
+
+    存量 v1 库里没有完成时刻列 ⇒ 只能退回 updated_at (最后一次可用近似
+    完成时刻)。断言降级后终态组仍然「最近更新的在最上」, 且不崩。
+    """
+    p = tmp_path / "v1.db"
+    c = sqlite3.connect(str(p))
+    c.executescript(
+        "CREATE TABLE schedule_tasks ("
+        " id TEXT PRIMARY KEY, title TEXT NOT NULL, detail TEXT NOT NULL,"
+        " priority TEXT NOT NULL DEFAULT 'normal',"
+        " status TEXT NOT NULL DEFAULT 'pending',"
+        " added_at REAL NOT NULL, executed_at REAL,"
+        " added_by TEXT NOT NULL DEFAULT '',"
+        " workflow TEXT NOT NULL DEFAULT 'auto',"
+        " workspace TEXT NOT NULL DEFAULT '',"
+        " session_id TEXT, run_id TEXT, last_error TEXT,"
+        " updated_at REAL NOT NULL);"
+        "CREATE TABLE schedule_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+    c.execute("INSERT INTO schedule_settings(key, value) "
+              "VALUES ('auto_execute_enabled', '1')")
+    # 两个终态行: updated_at 分别是 500 与 900 ⇒ 降序应是 900 在前
+    c.execute("INSERT INTO schedule_tasks(id, title, detail, status, added_at, "
+              "updated_at) VALUES ('done-old','旧完成','x','done',100.0,500.0)")
+    c.execute("INSERT INTO schedule_tasks(id, title, detail, status, added_at, "
+              "updated_at) VALUES ('done-new','新完成','x','done',100.0,900.0)")
+    c.execute("INSERT INTO schedule_tasks(id, title, detail, status, added_at, "
+              "updated_at) VALUES ('pend','待执行','x','pending',200.0,200.0)")
+    c.commit()
+    c.close()
+
+    st = S.ScheduleStore(str(p))
+    rows = st.list_all()
+    assert [r["id"] for r in rows] == ["pend", "done-new", "done-old"]
+
+
+def test_write_path_still_migrates_legacy_db(tmp_path):
+    """F-1 回归锁: **写路径**仍要迁移存量 v1 库 (读降级不等于放弃迁移)。
+
+    MV-F-1: 把 _migrate_schema_on 去掉 ⇒ 本用例红 (列缺失 / 版本行缺失)。
+    """
+    p = tmp_path / "v1.db"
+    _make_v1_db(p)
+    st = S.ScheduleStore(str(p))
+    st.ensure_schema()                    # 写连接 ⇒ 迁移
+
+    c = sqlite3.connect(str(p))
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(schedule_tasks)")}
+        ver = c.execute("SELECT value FROM schedule_settings "
+                        "WHERE key='schema_version'").fetchone()
+    finally:
+        c.close()
+    assert "finished_at" in cols, "写路径未迁移存量库"
+    assert ver is not None and int(ver[0]) >= S.SCHEMA_VERSION
+
+
+def test_migrated_db_read_uses_finished_at_desc(tmp_path):
+    """F-1: 迁移到 v2 后, 终态组回到 finished_at 降序 (完成时刻口径)。
+
+    与降级口径 (updated_at) 对照 ⇒ 证明排序键是**动态**选的, 不是写死。
+    """
+    p = tmp_path / "v1.db"
+    _make_v1_db(p)
+    st = S.ScheduleStore(str(p))
+    st.ensure_schema()                    # 迁移到 v2
+
+    c = sqlite3.connect(str(p))
+    try:
+        # 两个终态行, updated_at 顺序与 finished_at 顺序**相反** ⇒
+        # 若排序键写死 updated_at, 断言必红。
+        c.execute("UPDATE schedule_tasks SET finished_at=900.0, updated_at=500.0 "
+                  "WHERE id='old-done'")
+        c.execute("INSERT INTO schedule_tasks(id, title, detail, status, "
+                  "added_at, finished_at, updated_at) "
+                  "VALUES('old-done2','旧完成2','x','done',100.0,300.0,800.0)")
+        c.commit()
+    finally:
+        c.close()
+
+    rows = st.list_all()
+    order = [r["id"] for r in rows]
+    assert order.index("old-done") < order.index("old-done2"), \
+        f"v2 库未按 finished_at 降序: {order}"
+
+
+def test_zero_byte_db_file_still_auto_creates_schema(tmp_path):
+    """F-1 边界: 0 字节空库文件仍走懒建 (AC-183-2 不得回归)。
+
+    为什么要这一条: 判据若按「文件是否存在」, 0 字节文件 (首次建库被
+    中断 / 部署侧 touch 出来的空文件) 会被误判成存量库 ⇒ 读路径查一张
+    不存在的表 ⇒ OperationalError: no such table。
+    """
+    p = tmp_path / "empty.db"
+    p.touch()
+    st = S.ScheduleStore(str(p))
+    assert st.list_all() == []
+    assert st.get_auto_execute() is True      # 种子已播种
+
+
+def test_drift_db_with_settings_table_dropped_still_self_heals(tmp_path):
+    """F-1 边界: 漂移库 (schedule_settings 被删) 读路径仍自愈, 不抛异常。
+
+    这是本卡在实现中实测到并修掉的一个**自造回归**: 懒建判据若只看
+    「schedule_tasks 表在不在」, 则「settings 表被删」的漂移库会被当成
+    存量库走只读降级 ⇒ get_auto_execute() 直接抛
+    `OperationalError: no such table: schedule_settings`
+    (基线行为是自愈: 懒建分支把 schema 补回来)。
+
+    ⇒ 判据必须查**两个**核心表都在, 才认定「库是建好的」。
+    """
+    p = tmp_path / "drift.db"
+    st = S.ScheduleStore(str(p))
+    st.create("任务")
+    c = sqlite3.connect(str(p))
+    try:
+        c.execute("DROP TABLE schedule_settings")
+        c.commit()
+    finally:
+        c.close()
+
+    st2 = S.ScheduleStore(str(p))               # 新实例 (重启视角)
+    assert st2.get_auto_execute() is True      # 漂移自愈, 不抛
+    assert len(st2.list_all()) == 1            # 数据没丢

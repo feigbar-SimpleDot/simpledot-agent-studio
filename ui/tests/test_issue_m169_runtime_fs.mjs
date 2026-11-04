@@ -161,8 +161,10 @@ function treeEntries(r) {
 // 动作条删除入口 (带 ✕ 前缀, 与确认框里的裸 "Delete" 区分)。
 // selection=null 时 canDelete 为假 ⇒ 该按钮消失 ⇒ "清选择"的 DOM 可观测面。
 function deleteButton(r) {
+  // issue #202 R4: 动作条删除入口的 ✕ 文字符号已换 SVG close 图标,
+  // 定位锚改文案 delete 并排除确认框内按钮 (closest 守卫)。
   return [...r.rootEl.querySelectorAll('button')]
-    .find((b) => /✕\s*delete/i.test(b.textContent || ''))
+    .find((b) => /delete/i.test(b.textContent || '') && !b.closest('[role=alertdialog]'))
 }
 
 // ══ R-A2: 上传闭环 (A2 的运行时升级) ═══════════════════════════════

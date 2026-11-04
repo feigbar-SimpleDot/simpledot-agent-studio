@@ -37,6 +37,14 @@ export MW_HOME=/mw_data
 export MW_REGISTRY=/mw_data/registry.json
 export MW_HERMES_HOME=/opt/data
 export MW_KANBAN_DB=/opt/data/kanban.db
+# issue #191: hermes CLI kanban_db_path() resolves HERMES_KANBAN_DB >
+# HERMES_KANBAN_HOME > get_default_hermes_root(); the MW_-prefixed vars above
+# are invisible to the hermes CLI, so a trimmed-env subprocess (agent spawning
+# `hermes kanban create` with only PATH/HOME) silently falls back to the shadow
+# DB ~/.hermes/kanban.db while mw reads /opt/data/kanban.db (zero errors until
+# show/complete blows up with unknown id). Exporting HERMES_HOME is the root
+# fix: every subprocess spawned by the mw process tree inherits it.
+export HERMES_HOME=/opt/data
 export MW_TASK_DIR_BASE=/share_workspace/tasks
 export MW_ALLOWED_WS_PREFIX=/share_workspace
 export PYTHONPATH=/opt/mwroot

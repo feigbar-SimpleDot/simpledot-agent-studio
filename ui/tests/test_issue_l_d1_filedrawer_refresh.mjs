@@ -470,9 +470,10 @@ test('L1: 删除成功 → 文件树重新拉取 (D-1 同源路径)', async () =
     })
     await r.settle()
 
-    // 动作条上的删除入口 (带 ✕ 前缀, 与确认框里的裸 "Delete" 区分)
+    // 动作条上的删除入口 (issue #202 R4: ✕ 文字符号已换 SVG close 图标,
+    // 定位锚改文案 delete; 与确认框里的裸 "Delete" 由 dialog 作用域区分)
     const delBtn = [...r.rootEl.querySelectorAll('button')]
-      .find((b) => /✕\s*delete/i.test(b.textContent || ''))
+      .find((b) => /delete/i.test(b.textContent || ''))
     assert(delBtn, '未找到动作条删除按钮')
     await r.act(async () => {
       delBtn.dispatchEvent(new r.window.MouseEvent('click', { bubbles: true }))
@@ -505,9 +506,10 @@ test('L1: ⟳ 手动刷新 → 文件树重新拉取 (旧缺陷下该路径同�
   const r = await renderDrawer()
   try {
     const before = r.listCalls().length
+    // issue #202 R4: ⟳ 文字符号已换 SVG refresh 图标, 定位锚改 aria-label
     const refreshBtn = [...r.rootEl.querySelectorAll('button')]
-      .find((b) => (b.textContent || '').trim() === '⟳')
-    assert(refreshBtn, '未找到 ⟳ 刷新按钮')
+      .find((b) => /refresh/i.test(b.getAttribute('aria-label') || ''))
+    assert(refreshBtn, '未找到刷新按钮 (aria-label=refresh)')
     await r.act(async () => {
       refreshBtn.dispatchEvent(new r.window.MouseEvent('click', { bubbles: true }))
     })

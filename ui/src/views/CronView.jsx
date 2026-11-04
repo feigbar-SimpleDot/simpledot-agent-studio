@@ -380,7 +380,7 @@ export default function CronView() {
       {phase === 'ready' && jobs.length === 0 && (
         <div className="empty flex flex-col items-center gap-2">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"
-               strokeLinecap="round" strokeLinejoin="round" className="w-10 h-10 opacity-40">
+               strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="w-10 h-10 opacity-40">
             <path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
           <div className="text-[13px] font-medium">{t('cron.empty.title')}</div>

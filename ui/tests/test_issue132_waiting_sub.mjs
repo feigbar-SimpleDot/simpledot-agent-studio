@@ -98,8 +98,10 @@ test('T1 classify WAITING 仍 → 等介入 (防串)', () => {
 test('T1 classify WORKING 不受影响', () => {
   const r = classify({ state: 'WORKING' }, tIdent)
   eq(r.sem, 'tboard.state_running', 'WORKING 语义不动')
-  eq(r.icon, '●', 'WORKING 图标与 WAITING_SUB 的 ⋯ 区分')
-  eq(classify({ state: 'WAITING_SUB' }, tIdent).icon, '⋯', 'WAITING_SUB 图标')
+  // issue #202 R4: 图标值由文字符号迁移为 SVG 键 (● → 'dot', ⋯ → 'ellipsis'),
+  // 断言的区分语义不变: WORKING 与 WAITING_SUB 图标必须不同键。
+  eq(r.icon, 'dot', 'WORKING 图标与 WAITING_SUB 的 ellipsis 区分')
+  eq(classify({ state: 'WAITING_SUB' }, tIdent).icon, 'ellipsis', 'WAITING_SUB 图标')
 })
 
 // ══════════════════════════════════════════════════════════════════

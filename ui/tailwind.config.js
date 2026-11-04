@@ -20,6 +20,8 @@ export default {
         ok: 'rgb(var(--c-ok) / <alpha-value>)',
         warn: 'rgb(var(--c-warn) / <alpha-value>)',
         bad: 'rgb(var(--c-bad) / <alpha-value>)',
+        // issue #202 R3-10: 真紫 (badge-purple 交接中态) — 与 warn 琥珀区分
+        violet: 'rgb(var(--c-violet) / <alpha-value>)',
       },
       fontFamily: {
         sans: ['-apple-system', 'BlinkMacSystemFont', 'PingFang SC', 'Microsoft YaHei', 'sans-serif'],

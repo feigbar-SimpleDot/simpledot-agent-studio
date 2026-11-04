@@ -471,13 +471,17 @@ def test_ct1_bad_shape_jobs_null(monkeypatch):
 
 
 def test_ct1_home_mismatch_is_500(monkeypatch):
-    """同源双保险: 桥回带 home 与 console 期望不等 → 500。"""
+    """同源双保险: 桥回带 home 与 console 期望不等 → 500。
+
+    issue #193 口径更新: 500 不再回显 str(e) (home 不一致文案含内部路径,
+    属泄漏面) ⇒ 固定文案 internal_error, 全量异常留服务端日志。
+    """
     _patch_bridge(monkeypatch, {"ok": True, "home": "/somewhere/else",
                                  "jobs": []})
     rcode, body = console.api_cron_jobs()
     assert rcode == 500
-    assert "home" in str(body.get("error", "")).lower() or \
-        "不一致" in str(body.get("error", ""))
+    assert body.get("error") == "internal_error"
+    assert "somewhere" not in str(body), "home 路径不得回显 (#193)"
 
 
 def test_ct1_invalid_job_id_rejected_before_bridge(monkeypatch):

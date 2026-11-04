@@ -17,9 +17,12 @@
         - K9 pw/workspace 分叉 + _map_path 生效 ⇒ reaper 与 harvest 同路径
   #172  新鲜度容差 env 化
         - K10 MW_FRESH_EPSILON_S 覆盖生效 + 非法值回落
+  #194/#200  固定 sleep 收尾改轮询等待
+        - K11 轮询等待口径 = 状态列 ∧ 事件行 (带超时上限) + 变异反证锚
 
 纯本地 ledger 测试, 不依赖 hermes CLI / 网络: 敲门通道与 urlopen 全 patch。
 """
+import ast
 import json
 import os
 import sys
@@ -46,6 +49,101 @@ from mw.harvest import (  # noqa: E402
 )
 
 GW = "http://127.0.0.1:9"  # 不会有人接的端口
+
+
+def _fixed_sleep_calls(path: Path) -> list:
+    """列出本文件里所有真实的 time.sleep(<常量>) 调用 (AST 判据, 带所在函数)。
+
+    #194/#200 的源码形态锚不能用文本 grep —— 判据自身的说明文字里也会
+    出现那串字面量而误报。只认真实的调用节点, 且参数必须是常量
+    (轮询步长 time.sleep(_RELAY_WAIT_STEP_S) 属变量, 不算硬 sleep)。
+
+    返回 [(行号, 常量值, 所在函数名), ...]。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    hits = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute)
+                    and func.attr == "sleep"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "time"):
+                continue
+            if node.args and isinstance(node.args[0], ast.Constant):
+                hits.append((node.lineno, node.args[0].value, fn.name))
+    return sorted(hits)
+
+
+# #194/#200 收尾纪律:
+#   1) 本卡改动的投递 helper 内**不得**有任何常量 sleep (旧形态是
+#      sleep(0.2) 等事件 emit 收尾 —— 必须换成带超时上限的轮询);
+#   2) 本文件其余位置的常量 sleep 走显式白名单 —— 新增未登记的常量
+#      sleep 即转红 (防止「换个写法又退回去」)。
+# 白名单条目: (所在函数名, 常量值)
+_ALLOWED_FIXED_SLEEPS = {
+    # 既有形态: _wait_event 的轮询步长 (本身就是合规的轮询等待 helper)
+    ("_wait_event", 0.05),
+}
+
+# 本卡改动的投递 helper (固定 sleep 的原宿主)
+_RELAY_SEND_HELPERS = ("_send_404_with_probe",)
+
+
+def _timeout_bound_ok(path: Path) -> bool:
+    """AST 判据: 轮询等待 helper 的超时上限必须真的生效。
+
+    变异反证 (PLAN §4 M12): 把 `deadline = time.time() + timeout` 换成
+    更大的常量 ⇒ 轮询变成无上限 ⇒ 本判据转红 (而不是让用例挂死 ——
+    挂死不是可诊断的失败形态)。
+
+    判据 (两条都要满足, 缺一即判红):
+      1) 轮询 helper 内存在 `time.time() + <名字>` 形态的 deadline
+         赋值, 且该名字是 helper 的形参 (timeout);
+      2) helper 内的循环 (While) 条件**真的引用了 deadline 变量名**。
+
+    第 2 条是回流修复 F-2 (P2) 补的: 只验第 1 条时, 「保留 deadline
+    赋值却把循环改成 `while True:`」这一同族形态仍判绿 —— 而那正是
+    挂死形态 (轮询无上界 ⇒ 用例永不返回), 挂死不是可诊断的失败形态。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if fn.name != "_wait_relay_settled":
+            continue
+        params = {a.arg for a in fn.args.args}
+        # 判据 1: 记下 deadline 变量名 (赋值目标), 供判据 2 比对
+        deadline_names = set()
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not isinstance(node.value, ast.BinOp):
+                continue
+            if not isinstance(node.value.op, ast.Add):
+                continue
+            right = node.value.right
+            if isinstance(right, ast.Name) and right.id in params:
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        deadline_names.add(tgt.id)
+        if not deadline_names:
+            continue
+        # 判据 2: 循环条件必须以 deadline 为界 (否则 deadline 赋值是装饰)
+        loops = [n for n in ast.walk(fn) if isinstance(n, ast.While)]
+        if not loops:
+            continue
+        for loop in loops:
+            refs = {n.id for n in ast.walk(loop.test)
+                    if isinstance(n, ast.Name)}
+            if not (refs & deadline_names):
+                return False
+        return True
+    return False
 
 
 def _led(tmp_path) -> Ledger:
@@ -257,10 +355,60 @@ def _seed_card(led: Ledger, task_id: str):
     led.record_initiator(task_id, "s_main")
 
 
-def _send_404_with_probe(led, task_id, probe):
+# ── #194/#200: 轮询等待 (替代固定 sleep) ──────────────────────────
+# 探测分支 ⇒ 该次投递期望落账的事件类型:
+#   "ok"  路由健康 ⇒ 首败即死信 ⇒ relay.notify_permanent_failure
+#   "404" 路由错配 ⇒ 退避 600s ⇒ relay.notify_gateway_misrouted
+#   "err" 不可判定 ⇒ 保守走旧死信 ⇒ relay.notify_permanent_failure
+_PROBE_EXPECT_EVENT = {
+    "ok": "relay.notify_permanent_failure",
+    "404": "relay.notify_gateway_misrouted",
+    "err": "relay.notify_permanent_failure",
+}
+
+# 轮询参数: 超时上限 5s (与既有 deadline 同档) + 步长 0.05s。
+_RELAY_WAIT_TIMEOUT_S = 5.0
+_RELAY_WAIT_STEP_S = 0.05
+
+
+def _wait_relay_settled(led: Ledger, task_id: str,
+                        expect_event: str | None = None,
+                        timeout: float = _RELAY_WAIT_TIMEOUT_S) -> bool:
+    """轮询等待一次 relay 投递的结果落账 (issue #194/#200: 固定 sleep 改轮询)。
+
+    落账口径 = 「状态列」(notify_dead_until 非空) ∧ 「事件行」(expect_event
+    存在时)。旧写法只等状态列, 之后用固定 sleep(0.2) 等事件 emit 收尾 ——
+    高负载 (89 文件逐文件并发) 下事件落账晚于 0.2s 窗口 ⇒ flaky。改轮询后
+    与负载无关 (issue #194 正文 / #200 观察项)。
+
+    超时后 break 退出 (不 fail-fast), 由调用方的既有断言以真实红信息失败,
+    保留可诊断性 (PLAN-Q-20261102 §2.1-4)。返回是否在超时内落账。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = led.conn.execute(
+            "SELECT notify_dead_until FROM harvest_contracts "
+            "WHERE task_id=?", (task_id,)).fetchone()
+        if row and row["notify_dead_until"]:
+            if not expect_event:
+                return True
+            if _events(led, task_id, expect_event):
+                return True
+        time.sleep(_RELAY_WAIT_STEP_S)
+    return False
+
+
+def _send_404_with_probe(led: Ledger, task_id: str, probe):
     """目标 chat 恒 404; 探测 GET /api/sessions 行为由 probe 决定。
 
     probe: "ok" ⇒ 200; "404" ⇒ HTTPError 404; "err" ⇒ 连接异常。
+
+    issue #194/#200 (2026-11-02): 收尾的固定 sleep(0.2) 改轮询等待 ——
+    轮询目标从「状态列落账」扩为「状态列 ∧ 事件行落账」(带超时上限)。
+    期望事件随探测分支而异 (PLAN-Q-20261102 §2.1-1):
+      "ok"  路由健康 ⇒ 首败即死信 ⇒ relay.notify_permanent_failure
+      "404" 路由错配 ⇒ 退避   ⇒ relay.notify_gateway_misrouted
+      "err" 不可判定 ⇒ 保守死信 ⇒ relay.notify_permanent_failure
     """
     def boom(rq, timeout=None):
         if rq.full_url.endswith("/api/sessions") and rq.get_method() == "GET":
@@ -274,15 +422,7 @@ def _send_404_with_probe(led, task_id, probe):
     with mock.patch("urllib.request.urlopen", side_effect=boom):
         reaper_mod._send_to_main("s_main", "报告", GW, "k", led.path,
                                  notify_task=task_id)
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            row = led.conn.execute(
-                "SELECT notify_dead_until FROM harvest_contracts "
-                "WHERE task_id=?", (task_id,)).fetchone()
-            if row and row["notify_dead_until"]:
-                break
-            time.sleep(0.05)
-        time.sleep(0.2)  # 等事件收尾
+        _wait_relay_settled(led, task_id, _PROBE_EXPECT_EVENT.get(probe))
 
 
 def test_k4_probe_healthy_keeps_dead_letter(tmp_path):
@@ -454,3 +594,95 @@ def test_k10b_epsilon_env_changes_stale_verdict(tmp_path):
         ok_wide, _ = verify_physical(contract, str(tmp_path), str(pws),
                                      baseline_ts=base)
         assert ok_wide is True, "上调容差到 10 后不应误标陈旧"
+
+
+# ════════════════════════════════════════════════════════════════
+# #194/#200 轮询等待纪律 (变异反证锚)
+# ════════════════════════════════════════════════════════════════
+
+def test_k11a_wait_helper_has_timeout_bound():
+    """源码形态锚: 轮询等待必须带超时上限 (PLAN §4 M12)。
+
+    变异反证: 把 `deadline = time.time() + timeout` 换成常量 ⇒ 本用例
+    **先**转红 (静态判据, 不等行为用例跑完) —— 否则行为用例会因轮询
+    无上限而挂死, 挂死不是可诊断的失败形态。
+    """
+    assert _timeout_bound_ok(Path(__file__)), \
+        "轮询等待缺超时上限 (PLAN §4 M12): deadline 未用 timeout 形参"
+
+
+def test_k11_wait_helper_polls_event_and_state(tmp_path):
+    """轮询等待的口径 = 状态列 ∧ 事件行, 且带超时上限。
+
+    变异反证: 把 expect_event 忽略 (只等状态列) ⇒ 本用例转红
+    —— 说明「轮询目标必须是事件行落账」这条纪律被真正钉住, 而不是
+    换了个写法的固定 sleep。
+    """
+    # fail-fast 前提: 轮询必须带超时上限 —— 否则本用例会挂死而非转红
+    assert _timeout_bound_ok(Path(__file__)), \
+        "轮询等待缺超时上限 (PLAN §4 M12): deadline 未用 timeout 形参"
+    led = _led(tmp_path)
+    try:
+        _seed_card(led, "t_194_wait")
+        led.conn.execute(
+            "UPDATE harvest_contracts SET notify_dead_until=? "
+            "WHERE task_id='t_194_wait'", (time.time() + 3600,))
+        led.conn.commit()
+        t0 = time.time()
+        ok = _wait_relay_settled(led, "t_194_wait",
+                                 "relay.notify_permanent_failure",
+                                 timeout=0.6)
+        elapsed = time.time() - t0
+        assert ok is False, "只落状态列时轮询不应判成功"
+        assert elapsed >= 0.5, f"轮询未等到超时上限就退出 (elapsed={elapsed:.3f})"
+    finally:
+        led.close()
+
+
+def test_k11b_wait_helper_returns_true_when_event_lands(tmp_path):
+    """状态列 + 事件行都落账 ⇒ 轮询立即返回 True (不必等满超时)。"""
+    led = _led(tmp_path)
+    try:
+        _seed_card(led, "t_194_wait_ok")
+        led.conn.execute(
+            "UPDATE harvest_contracts SET notify_dead_until=? "
+            "WHERE task_id='t_194_wait_ok'", (time.time() + 3600,))
+        led.conn.commit()
+        led.emit_event("relay.notify_permanent_failure", "t_194_wait_ok",
+                       {"reason": "session_not_found"})
+        t0 = time.time()
+        ok = _wait_relay_settled(led, "t_194_wait_ok",
+                                 "relay.notify_permanent_failure",
+                                 timeout=5.0)
+        elapsed = time.time() - t0
+        assert ok is True, "事件行已落账时轮询应判成功"
+        assert elapsed < 1.0, f"落账后未立即返回 (elapsed={elapsed:.3f})"
+    finally:
+        led.close()
+
+
+def test_k11c_source_has_no_fixed_sleep_tail():
+    """源码形态锚: 不得回退成「轮询 + 固定 sleep 收尾」。
+
+    变异反证: 在 _send_404_with_probe 里重新加回 time.sleep(0.2) ⇒
+    本用例转红 (issue #194 的原始形态)。
+
+    判据走 AST (不是文本 grep) —— 文本 grep 会把本用例自己的说明文字
+    也算进去而误报; AST 只认真实的 time.sleep(...) 调用节点。
+    """
+    hits = _fixed_sleep_calls(Path(__file__))
+    # (1) 本卡改动的投递 helper 内零常量 sleep
+    in_helper = [h for h in hits if h[2] in _RELAY_SEND_HELPERS]
+    assert not in_helper, \
+        f"投递 helper 内回退成固定 sleep 收尾 (issue #194): {in_helper}"
+    # (2) 其余位置的常量 sleep 必须在白名单内
+    unexpected = [h for h in hits
+                  if h[2] not in _RELAY_SEND_HELPERS
+                  and (h[2], h[1]) not in _ALLOWED_FIXED_SLEEPS]
+    assert not unexpected, \
+        f"新增未登记的固定 sleep (issue #194 纪律): {unexpected}"
+    # (3) 轮询必须有超时上限 (PLAN §4 M12) —— 摘掉上限即转红, 不挂死
+    assert _timeout_bound_ok(Path(__file__)), \
+        "轮询等待缺超时上限 (PLAN §4 M12): deadline 未用 timeout 形参"
+    src = Path(__file__).read_text(encoding="utf-8")
+    assert "_wait_relay_settled" in src, "轮询等待 helper 缺失"

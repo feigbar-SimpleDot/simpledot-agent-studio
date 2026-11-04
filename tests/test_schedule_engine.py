@@ -110,6 +110,13 @@ def test_active_run_blocks_countdown(tmp_path):
 
 # ── EN2: 归零触发取序 + 复查放弃 ─────────────────────────────────────
 def test_fire_at_zero_picks_head(tmp_path):
+    """归零触发取的是**创建最早**的任务 (added_at ASC)。
+
+    issue #197 取代 A8 裁决 (原为 added_at DESC ⇒ 后建先执行, 即用户
+    报的现象「后加入的任务被先执行了」)。
+
+    MV-197-7: 把取序改回 DESC ⇒ 本用例红。
+    """
     clock = FakeClock()
     eng, fired = make_engine(tmp_path, clock)
     a = eng.store.create("A")
@@ -117,12 +124,14 @@ def test_fire_at_zero_picks_head(tmp_path):
     b = eng.store.create("B")
     eng._tick()                       # 起表 ends_at = now+300
     assert eng.countdown_ends_at == clock.now + 300
+    assert eng.countdown_task_id == a["id"]   # 持有者 = 队首 (创建最早)
     clock.now += 301                  # 归零
     eng._tick()
-    # 取队首 = added_at DESC ⇒ B 先 (A8)
-    assert [t["id"] for t in fired] == [b["id"]]
-    assert eng.store.get(b["id"])["status"] == "running"
+    # 取队首 = added_at ASC ⇒ A 先 (#197)
+    assert [t["id"] for t in fired] == [a["id"]]
+    assert eng.store.get(a["id"])["status"] == "running"
     assert eng.countdown_ends_at is None
+    assert eng.countdown_task_id is None
 
 
 def test_fire_recheck_failure_abandons(tmp_path):
@@ -736,3 +745,251 @@ def test_gateway_free_when_idle(tmp_path, monkeypatch):
     _probe_stub(monkeypatch, {"gateway_busy": False, "active_agents": 0})
     free, reason = eng._gateway_free()
     assert free is True and reason is None
+
+
+# ════════════════════════════════════════════════════════════════════
+# Q197: 倒计时绑定持有者 (暂停/恢复顺位状态机)
+#
+# 状态机 (PLAN-Q-20261102 §1.4):
+#   IDLE (双 None) / ARMED(T, e) (持有者 T = pending 任务, 到期时刻 e)
+#     T1 IDLE + C(t) + head=T      ⇒ ARMED(T, now+300)      起表
+#     T2 ARMED + ¬C(t)             ⇒ IDLE                    撤表
+#     T3 ARMED(T) + status(T)≠pending ⇒ IDLE ⇒ 同轮重评 ⇒ ARMED(T', now+300)
+#                                    (顺位继承者拿**完整新表**)
+#     T4 ARMED(T) + now≥e + 复查过 ⇒ 触发 T (持有者) → running; IDLE
+#     T5 ARMED(T) + now≥e + 复查不过 ⇒ IDLE (弃轮, 下轮重数)
+#     T6 开关 OFF→ON                ⇒ restart_countdown ⇒ 下轮完整重数
+#     R1 恢复 (paused→pending)      ⇒ **不迁移** —— 恢复不顶当前持有者
+# ════════════════════════════════════════════════════════════════════
+
+
+def test_q197_countdown_binds_holder(tmp_path):
+    """起表时倒计时绑定持有者 (队首), 不再是「无主倒计时」。
+
+    MV-197-8: 把 _tick 起表分支的 countdown_task_id 赋值去掉 ⇒ 本用例红。
+    """
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    a = eng.store.create("A")
+    clock.now += 1
+    b = eng.store.create("B")
+    eng._tick()
+    assert eng.countdown_ends_at == clock.now + 300
+    assert eng.countdown_task_id == a["id"]        # 持有者 = 队首 (最早创建)
+    # 持有者与结束时刻同生同灭
+    eng.restart_countdown()
+    assert eng.countdown_ends_at is None
+    assert eng.countdown_task_id is None
+
+
+def test_q197_pause_holder_transfers_with_full_new_countdown(tmp_path):
+    """AC-Q197-7: 暂停持有者 ⇒ 停表 + 顺位继承者拿**完整新 5 分钟**。
+
+    变异反证点 M4: 若实现继承剩余 R 秒 ⇒ ends_at != 暂停时刻+300 ⇒ 红。
+    """
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    clock.now += 1
+    t2 = eng.store.create("T2")
+    eng._tick()
+    assert eng.countdown_task_id == t1["id"]
+    assert eng.countdown_ends_at == clock.now + 300
+    clock.now += 100                     # 已消耗 100s, 剩 200s
+    # 暂停持有者 T1
+    assert eng.store.pause(t1["id"]) is True
+    eng._tick()                          # ticker 重评 (同轮转移)
+    # 停表 + 转移给 T2 + 完整新表
+    assert eng.countdown_task_id == t2["id"]
+    assert eng.countdown_ends_at == clock.now + 300, "顺位继承者必须拿完整新表"
+    assert eng.countdown_ends_at != (clock.now + 200)
+
+
+def test_q197_pause_non_holder_keeps_countdown(tmp_path):
+    """AC-Q197-8: 暂停非队首 ⇒ 其倒计时**不受影响** (不重数)。"""
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    clock.now += 1
+    t2 = eng.store.create("T2")
+    clock.now += 1
+    t3 = eng.store.create("T3")
+    eng._tick()
+    ends_before = eng.countdown_ends_at
+    assert eng.countdown_task_id == t1["id"]
+    clock.now += 50
+    assert eng.store.pause(t3["id"]) is True
+    eng._tick()
+    # T1 仍持有表, 剩余时间不变 (不重数)
+    assert eng.countdown_task_id == t1["id"]
+    assert eng.countdown_ends_at == ends_before
+
+
+def test_q197_pause_only_task_revokes_countdown(tmp_path):
+    """AC-Q197-9: 暂停唯一任务 ⇒ 倒计时撤销 (无 pending 可执行)。"""
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    eng._tick()
+    assert eng.countdown_ends_at is not None
+    assert eng.store.pause(t1["id"]) is True
+    eng._tick()
+    assert eng.countdown_ends_at is None
+    assert eng.countdown_task_id is None
+    assert eng.snapshot()["countdown"] is None
+
+
+def test_q197_resume_returns_to_head_without_topping_holder(tmp_path):
+    """AC-Q197-10: 恢复回队首但**不顶掉**正在倒计时的任务。
+
+    场景: T1 暂停 → T2 继承新表 → 恢复 T1 ⇒ T2 的表继续走, 不重置。
+    变异反证点 M5: 若恢复顶掉持有者 ⇒ ends_at/持有者不变断言红。
+    """
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    clock.now += 1
+    t2 = eng.store.create("T2")
+    eng._tick()
+    assert eng.countdown_task_id == t1["id"]
+    assert eng.store.pause(t1["id"]) is True
+    eng._tick()
+    assert eng.countdown_task_id == t2["id"]
+    ends_before = eng.countdown_ends_at
+    clock.now += 60
+    # 恢复 T1 ⇒ 回到待执行列表第一位 (创建最早)
+    assert eng.store.resume(t1["id"]) is True
+    eng._tick()
+    # 持有者仍是 T2, 表不重置
+    assert eng.countdown_task_id == t2["id"]
+    assert eng.countdown_ends_at == ends_before
+    # T1 回到队首 (创建时间最早 ⇒ 升序第一位)
+    assert eng.store.head_pending()["id"] == t1["id"]
+
+
+def test_q197_countdown_fires_holder_not_new_head(tmp_path):
+    """AC-Q197-10③: 归零触发的是**持有者**, 不是归零瞬间的队首。
+
+    变异反证点 M3: 若归零时按队首取 ⇒ fired == [T1] ⇒ 本用例红。
+    """
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    clock.now += 1
+    t2 = eng.store.create("T2")
+    eng._tick()
+    assert eng.countdown_task_id == t1["id"]
+    assert eng.store.pause(t1["id"]) is True
+    eng._tick()                          # T2 继承
+    assert eng.countdown_task_id == t2["id"]
+    assert eng.store.resume(t1["id"]) is True   # T1 回到队首
+    eng._tick()
+    assert eng.countdown_task_id == t2["id"], "恢复不得顶掉持有者"
+    clock.now += 301
+    eng._tick()
+    # 归零触发持有者 T2, 不是队首 T1
+    assert [t["id"] for t in fired] == [t2["id"]]
+    assert eng.store.get(t2["id"])["status"] == "running"
+    assert eng.store.get(t1["id"])["status"] == "pending"
+
+
+def test_q197_pause_holder_again_transfers_again(tmp_path):
+    """AC-Q197-11: 持有者再被暂停 ⇒ 同规则再继承 (顺位继承者拿新表)。
+
+    场景接 AC-Q197-10: T1 暂停 → T2 继承新表 → 恢复 T1 (T1 回到队首)
+    → 在 T2 归零前暂停 T2 ⇒ 顺位继承者 (T1) 进入**新的完整 5 分钟**。
+    """
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    clock.now += 1
+    t2 = eng.store.create("T2")
+    eng._tick()
+    assert eng.countdown_task_id == t1["id"]
+    assert eng.store.pause(t1["id"]) is True
+    eng._tick()
+    assert eng.countdown_task_id == t2["id"]
+    assert eng.store.resume(t1["id"]) is True      # T1 回到待执行 (队首)
+    clock.now += 50
+    # 持有者 T2 再被暂停 ⇒ 顺位继承者 (T1) 拿新表
+    assert eng.store.pause(t2["id"]) is True
+    eng._tick()
+    assert eng.countdown_task_id == t1["id"]
+    assert eng.countdown_ends_at == clock.now + 300
+
+
+def test_q197_single_countdown_slot_invariant(tmp_path):
+    """AC-Q197-12: 恢复不得让引擎同时存在两个倒计时 (单槽结构天然保证)。"""
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    clock.now += 1
+    t2 = eng.store.create("T2")
+    eng._tick()
+    eng.store.pause(t1["id"])
+    eng._tick()
+    eng.store.resume(t1["id"])
+    eng._tick()
+    eng._tick()
+    # 仍是单槽: 一个 ends_at + 一个持有者
+    assert isinstance(eng.countdown_ends_at, (int, float))
+    assert eng.countdown_task_id is not None
+    assert eng.countdown_task_id in (t1["id"], t2["id"])
+
+
+def test_q197_run_now_fires_holder(tmp_path):
+    """AC-Q197-14 + #197: 「立即执行」触发的是持有者 (与归零同源)。"""
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("T1")
+    clock.now += 1
+    t2 = eng.store.create("T2")
+    eng._tick()
+    assert eng.store.pause(t1["id"]) is True
+    eng._tick()
+    assert eng.countdown_task_id == t2["id"]
+    assert eng.store.resume(t1["id"]) is True
+    ok, reason = eng.run_now()
+    assert ok, reason
+    assert [t["id"] for t in fired] == [t2["id"]]
+    assert eng.countdown_ends_at is None
+    assert eng.countdown_task_id is None
+
+
+def test_q197_snapshot_shows_holder(tmp_path):
+    """倒计时条显示的 next_task_* 是持有者 (与触发目标同源)。"""
+    clock = FakeClock()
+    eng, fired = make_engine(tmp_path, clock)
+    t1 = eng.store.create("标题一")
+    clock.now += 1
+    t2 = eng.store.create("标题二")
+    eng._tick()
+    assert eng.store.pause(t1["id"]) is True
+    eng._tick()
+    snap = eng.snapshot()
+    assert snap["countdown"]["next_task_id"] == t2["id"]
+    assert snap["countdown"]["next_task_title"] == "标题二"
+
+
+def test_q197_pause_api_wakes_ticker(tmp_path, monkeypatch):
+    """暂停动作必须唤醒 ticker (即时重评, 不等下一个 1s 轮询)。
+
+    MV-197-9: 把 _ACTIONS['pause'] 的 wake 改回 False ⇒ 本用例红。
+    """
+    monkeypatch.setenv("MW_SCHEDULE_DB", str(tmp_path / "sched.db"))
+    monkeypatch.setenv("MW_LEDGER_DB", str(tmp_path / "none.db"))
+    monkeypatch.setattr(S, "_engine", None)
+    monkeypatch.setattr(S, "_engine_path", None)
+    eng = S.get_engine()
+    eng._gateway_free = lambda: (True, None)
+    eng._spawn_fire = lambda task: None
+    code, body = S.api_schedule_create({"detail": "T1"})
+    assert code == 201
+    tid = body["task"]["id"]
+    woke = []
+    eng._wake = type("W", (), {"set": lambda self: woke.append(1),
+                               "wait": lambda self, t=None: False,
+                               "clear": lambda self: None})()
+    code, _ = S.api_schedule_action(tid, "pause")
+    assert code == 200
+    assert woke, "暂停未唤醒 ticker (持有者被暂停时倒计时不会即时转移)"

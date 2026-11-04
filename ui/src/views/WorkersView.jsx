@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
+import { Icon, ICONS } from '../components/icons.jsx'
 import { useTranslation } from 'react-i18next'
 import { api, fmtApiError } from '../api.js'
 import { Modal, Confirm, Toast } from '../components/ui.jsx'
@@ -147,7 +148,7 @@ function AvatarPicker({ name, avatar, busy, error, onFile }) {
         ) : (
           <span className="wcard-avatar-ph">{avatarInitial(name)}</span>
         )}
-        <span className="wcard-avatar-mask">📷 {t('workers.avatar_change_mask')}</span>
+        <span className="wcard-avatar-mask inline-flex items-center gap-1"><Icon d={ICONS.camera} className="w-3.5 h-3.5" />{t('workers.avatar_change_mask')}</span>
         {busy && <span className="wcard-spin" />}
       </button>
       <input ref={inputRef} type="file" className="hidden"
@@ -234,12 +235,12 @@ function WorkerCard({ name, entry, activeRunId, onAvatar, onView, onChat, onEdit
       </div>
       {/* 操作区: flex-wrap 保证 375px 换行不重叠 (AC-02) */}
       <div className="border-t border-line/60 pt-2.5 flex flex-wrap gap-2">
-        <button className="btn-ghost btn-sm" onClick={() => onView(name)}>👁 {t('workers.view_btn')}</button>
+        <button className="btn-ghost btn-sm" onClick={() => onView(name)}><Icon d={ICONS.eye} className="w-3.5 h-3.5" />{t('workers.view_btn')}</button>
         {entry.api_url && onChat && (
-          <button className="btn-ghost btn-sm" onClick={() => onChat(name)}>💬 {t('workers.chat_btn')}</button>
+          <button className="btn-ghost btn-sm" onClick={() => onChat(name)}><Icon d={ICONS.chat} className="w-3.5 h-3.5" />{t('workers.chat_btn')}</button>
         )}
-        <button className="btn-ghost btn-sm" onClick={() => onEdit(name)}>✎ {t('workers.edit_btn')}</button>
-        <button className="btn-ghost btn-sm" onClick={() => onSoul(name, entry.soul)}>📜 SOUL</button>
+        <button className="btn-ghost btn-sm" onClick={() => onEdit(name)}><Icon d={ICONS.pencil} className="w-3.5 h-3.5" />{t('workers.edit_btn')}</button>
+        <button className="btn-ghost btn-sm" onClick={() => onSoul(name, entry.soul)}><Icon d={ICONS.doc} className="w-3.5 h-3.5" />SOUL</button>
         <button className="btn-danger btn-sm" onClick={() => onDelete(name)}>{t('workers.delete_btn')}</button>
       </div>
     </div>
@@ -306,7 +307,7 @@ function WorkerDetail({ d, t }) {
       </div>
 
       <div className="rounded-xl border-l-4 border-accent bg-accent/5 px-4 py-3 text-[12px] text-dim leading-relaxed">
-        ℹ️ {t('workers.detail_soul_isolation_note')}
+        <span className="inline-flex items-start gap-1.5"><Icon d={ICONS.info} className="w-4 h-4 shrink-0 mt-0.5" />{t('workers.detail_soul_isolation_note')}</span>
       </div>
     </div>
   )
@@ -503,11 +504,11 @@ export default function WorkersView({ onChanged, onChat }) {
       {/* 工具栏 */}
       <div className="flex flex-wrap items-center gap-2.5">
         <button className="btn-primary" onClick={() => setDlg({ mode: 'register', f: {} })}>
-          <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+          <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
           {t('workers.register_btn')}
         </button>
         <button className="btn-ghost" onClick={() => setDlg({ mode: 'compose', f: {} })}>
-          🐳 {t('workers.dialog_new_title')}
+          <span className="inline-flex items-center gap-1.5"><Icon d={ICONS.cube} className="w-4 h-4" />{t('workers.dialog_new_title')}</span>
         </button>
         <span className="text-[11.5px] text-dim ml-1">{t('workers.toolbar_hint')}</span>
       </div>
@@ -530,7 +531,7 @@ export default function WorkersView({ onChanged, onChat }) {
         </div>
       ) : (
         <div className="empty">
-          <span className="text-3xl">🗂</span>
+          <Icon d={ICONS.inbox} className="w-8 h-8" />
           {t('workers.empty')}
         </div>
       )}
@@ -631,7 +632,7 @@ export default function WorkersView({ onChanged, onChat }) {
 
       {/* compose 生成弹窗 */}
       <Modal open={dlg?.mode === 'compose'} onClose={() => setDlg(null)}
-        title={`🐳 ${t('workers.dialog_new_title')}`} width="max-w-2xl"
+        title={t('workers.dialog_new_title')} width="max-w-2xl"
         footer={
           <>
             <button className="btn-ghost" onClick={() => setDlg(null)}>{t('common.close')}</button>
@@ -670,7 +671,7 @@ export default function WorkersView({ onChanged, onChat }) {
 
       {/* 查看弹窗 */}
       <Modal open={dlg?.mode === 'view'} onClose={() => setDlg(null)}
-        title={`👁 ${t('workers.view_btn')}: ${dlg?.name || ''}`} width="max-w-xl">
+        title={`${t('workers.view_btn')}: ${dlg?.name || ''}`} width="max-w-xl">
         {dlg?.mode === 'view' && (
           <div className="px-5 py-3">
             {dlg.loading && <div className="space-y-2 py-4">{[...Array(4)].map((_, i) => <div key={i} className="skeleton h-8" />)}</div>}
@@ -693,7 +694,7 @@ export default function WorkersView({ onChanged, onChat }) {
         }} />
 
       <Modal open={!!soulDlg} onClose={() => !soulDlg?.sending && setSoulDlg(null)}
-        title={soulDlg ? `📜 ${t('workers.soul_modal_title', { name: soulDlg.name })}` : ''}
+        title={soulDlg ? t('workers.soul_modal_title', { name: soulDlg.name }) : ''}
         width="max-w-3xl"
         footer={
           <>
@@ -718,7 +719,7 @@ export default function WorkersView({ onChanged, onChat }) {
                 }
               }}
               disabled={soulDlg?.sending}>
-              {soulDlg?.sending ? t('workers.deploying') : `🚀 ${t('workers.deploy_to_worker_btn')}`}
+              {soulDlg?.sending ? t('workers.deploying') : (<span className="inline-flex items-center gap-1.5"><Icon d={ICONS.send} className="w-3.5 h-3.5" />{t('workers.deploy_to_worker_btn')}</span>)}
             </button>
           </>
         }>

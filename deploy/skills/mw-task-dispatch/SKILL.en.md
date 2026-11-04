@@ -71,7 +71,7 @@ launch response:
 Fill **your own** Hermes `session_id` (reaper uses it to deliver worker reports back to you,
 `POST /api/sessions/<sid>/chat`).
 
-- From the "Start Team Work" button in the console: the request text already has `session_id: "<sid>"` injected, **use
+- From the "Start multi-agent collaboration" button in the console: the request text already has `session_id: "<sid>"` injected, **use
   it directly**.
 - If unsure of your `session_id`: read it from your system prompt (format `api_<timestamp>_<8hex>`), or copy it from the
   console session list.
@@ -114,6 +114,15 @@ curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/cards \
   mis-place into the task directory.
 - Idempotent: re-registering the same card does not double-count; one card cannot belong to two runs.
 - Response: `{registered, already_registered, skipped, card_count}`, cross-check each field.
+
+### Freezing / resuming the chain (hold / resume, issue #210)
+
+When a card cannot continue and you need to yield to the next inbox task,
+`POST /api/team-work/<run_id>/hold` freezes the chain (the worker process is
+**not** killed, `current_card_id` is left alone; the run's inbox task goes to
+`hold` and the next inbox task starts its countdown normally). When the user
+asks to resume this run, `POST /api/team-work/<run_id>/hold/resume` thaws it
+(a second ACTIVE run ⇒ 409).
 
 ### Field rules (violating → 400/422 rejection)
 

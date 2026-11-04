@@ -22,9 +22,14 @@
 
 @layer components {
   /* ── 按钮体系 (LangUI: rounded-lg + 明确层级) ── */
+  /* issue #202 R3-6/7 (走查 P1-6/7): transition-all 显式列属性 (只动会变的
+     属性, 避免 all 连布局属性一起过渡); 补 :active scale(0.97) 按压反馈
+     (全站按钮零按压反馈修复, AC-R3-7)。 */
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2
-           text-sm font-medium transition-all duration-150 cursor-pointer
+           text-sm font-medium cursor-pointer
+           transition-[color,background-color,border-color,box-shadow,transform,filter]
+           duration-150 active:scale-[0.97]
            select-none whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed;
   }
   .btn-primary {
@@ -51,7 +56,7 @@
   /* ── 输入 ── */
   .input {
     @apply w-full rounded-lg bg-canvas border border-line px-3 py-2 text-sm text-ink
-           placeholder:text-dim/60 transition-colors
+           placeholder:text-dim transition-colors
            focus:outline-none focus:border-accent focus:ring-2 focus:ring-accent/25;
   }
   .label { @apply block text-xs font-semibold text-ink mb-1.5; }
@@ -70,7 +75,10 @@
   /* F5 (2026-10-13, issue #5 状态机统一): 新增 handoff / waiting 两态徽章 —
      紫 = 交接中(run 推进间隙), 琥珀 = 等介入(reaper 判定闲置)。 与
      主色 accent 视觉区分, 但保持 badge 体系圆角胶囊一致。 */
-  .badge-purple { @apply badge bg-warn/10 text-warn ring-1 ring-inset ring-warn/25; }
+  /* issue #202 R3-10 (走查 P1-13): badge-purple 原借 warn token 与
+     badge-amber 撞色说谎 (交接中/等介入两态分不开) —— 改用真紫 --c-violet,
+     双主题各自取色, 与 amber 肉眼可分辨。 */
+  .badge-purple { @apply badge bg-violet/15 text-violet ring-1 ring-inset ring-violet/30; }
   .badge-amber  { @apply badge bg-warn/15 text-warn ring-1 ring-inset ring-warn/35; }
   /* 派生态专属: 整行着底色, 让 UI 看「这是交接中」/「等介入」一眼区分 */
   .data-state-handoff  { background: linear-gradient(90deg, rgb(var(--c-warn)/0.08) 0%, transparent 100%); }
@@ -78,8 +86,10 @@
 
   /* ── 表格 ── */
   .tbl { @apply w-full border-collapse text-sm; }
+  /* issue #202 R3-9 (走查 P1-10): 表头去 uppercase + tracking 放大 (AI 感
+     标签样式), 句子大小写。 */
   .tbl thead th {
-    @apply text-left text-[11px] font-semibold uppercase tracking-wider text-dim
+    @apply text-left text-[11px] font-semibold text-dim
            px-4 py-3 border-b border-line bg-panel2/40 whitespace-nowrap;
   }
   .tbl tbody td { @apply px-4 py-3 border-b border-line/50 align-middle; }
@@ -199,7 +209,7 @@
 @keyframes sas-rot { to { transform: rotate(360deg); } }
 .sas-status-bar .elapsed {
   margin-left: auto; font-variant-numeric: tabular-nums;
-  font-size: 11px; color: rgb(var(--c-dim) / .7);
+  font-size: 11px; color: rgb(var(--c-dim));
 }
 
 /* ── 任务看板移动适配 (UIUX-DESIGN §3.8): 触控目标 ≥44px, 防横向溢出 ── */
@@ -233,7 +243,10 @@
   object-fit: cover;
   display: block;
 }
-/* 默认占位符: 品牌蓝底 + 名称首字符, 双主题各取同源 token (DESIGN §2.2) */
+/* 默认占位符: 品牌蓝底 + 名称首字符, 双主题各取同源 token (DESIGN §2.2)
+   issue #202 R3-10 (走查 P1-11): 本块去裸 hex —— 品牌底 fallback 走
+   accent token, 前景/遮罩走 canvas/scrim token (值与原 hex 恒等:
+   dark canvas=2 6 23=#020617, scrim-ink=255 255 255=#fff)。 */
 .wcard-avatar-ph {
   display: flex;
   align-items: center;
@@ -242,19 +255,19 @@
   font-weight: 700;
   font-size: 23px;                 /* 头像边长 × 0.42 */
   line-height: 1;
-  background: var(--brand-dot, #1878D8);
-  color: #ffffff;
+  background: var(--brand-dot, rgb(var(--c-accent)));
+  color: rgb(var(--c-canvas));
 }
 .dark .wcard-avatar-ph {
-  background: var(--brand-dot-dark, #4DABF7);
-  color: #020617;
+  background: var(--brand-dot-dark, rgb(var(--c-accent)));
+  color: rgb(var(--c-canvas));
 }
 /* hover 遮罩: 半透明 + 更换文案, 150ms 淡入 */
 .wcard-avatar-mask {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
-  background: rgb(2 6 23 / 0.55);
-  color: #fff;
+  background: rgb(var(--c-scrim) / 0.55);
+  color: rgb(var(--c-scrim-ink));
   font-size: 11px;
   opacity: 0;
   transition: opacity 150ms ease;
@@ -435,3 +448,40 @@
   flex-shrink: 0;
 }
 .anim-stopped .spin { animation-play-state: paused; }
+
+/* ── issue #202 R3 (走查 P0-1/P0-2) 全局可访问性兜底 ─────────────────── */
+
+/* P0-2 (hallmark Floor 26a): :focus-visible 焦点环全局兜底 —— token 化
+   outline, 双主题下均可见 (accent 对 dark panel 6.5:1 / light panel 4.9:1)。
+   输入框自带 focus ring (box-shadow) 不受影响; 键盘遍历所有可聚焦元素
+   出现可见环 (AC-R3-2)。 */
+:focus-visible {
+  outline: 2px solid rgb(var(--c-accent));
+  outline-offset: 2px;
+}
+
+/* P0-1 (hallmark Floor 27 / emil Accessibility): prefers-reduced-motion
+   全局降级 —— sas-shimmer / wcard-pulse / sas-rot(spinner) / animate-pulse /
+   animate-spin 等无限动画在系统偏好 reduce 下停止 (迭代次数收敛为 1 +
+   时长归零 = 等效静态化, 落点即动画终态: 脉冲环淡出、shimmer 静止渐变、
+   spinner 静止圆环)。位移/缩放类过渡同样收敛为即时 (只留 ≤150ms opacity
+   语义的过渡自然退化)。与既有 JS 侧 .anim-stopped 钩子互补: 本块管系统
+   偏好, .anim-stopped 管页面隐藏/手动暂停。AC-R3-1。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* 无限动画显式停死 (双保险, computed animation-name 直接 none):
+     shimmer 状态条 / 状态条 spinner / 打字点 / worker 脉冲环 / 上传 spinner /
+     全局 spinner / Tailwind animate-pulse|spin */
+  .sas-status-bar, .sas-status-bar .spin, .sas-typing-dot,
+  .wcard-gfx-working::after, .wcard-spin, .spin,
+  .animate-pulse, .animate-spin {
+    animation: none !important;
+  }
+  /* shimmer 静态化后保留渐变底 (进行中语义), 停在中间帧 */
+  .sas-status-bar { background-position: 50% 0; }
+}

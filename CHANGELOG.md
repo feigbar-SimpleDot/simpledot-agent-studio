@@ -6,6 +6,692 @@ first. Prose is English per the repo root-doc convention (see
 spans. Process/review/test notes live outside the repo under the task
 workspace `docs/` and are referenced by card id, not duplicated here.
 
+## Unreleased — Dashboard fix batch (2026-11-05): the desktop navigation returns to the left-sidebar shell, workers split into a working zone (large card, animated border, current-run label) and a one-line idle list, and worker 24h tokens move to a dedicated bar chart
+
+Range: two commits `51b407e` + `6bd2736`, i.e. `9c1d297..6bd2736`
+(7 files, +433/−310). Frontend only — **zero backend change**
+(`git diff --name-only 9c1d297..6bd2736 -- mw/` is empty). This batch
+reverts the previous batch's R1 shell decision (the top tab bar) while
+keeping its R2/R4/R5 deliverables.
+
+### Added
+
+- **Worker two-zone display** (`51b407e`) — the two-state equal-weight
+  card grid is replaced by two zones. The **working zone** renders each
+  working worker as a large card with an animated accent border
+  (`wcard-live`: border opacity 0.35↔0.85 + glow, 2.4s loop, pure CSS
+  on the existing `--c-accent` token; stopped under
+  `prefers-reduced-motion` and by the `.anim-stopped` hook) plus a
+  **current-run label** — the run title is `display_title` falling back
+  to `initial_task` from the `team_work_active` segment (no new
+  endpoint); workers live only via SSE with no active run show no run
+  label. The **idle zone** renders each idle worker as exactly one
+  line: 24px avatar, name, and a single chat button — no token line,
+  no status badge, no card border; the list scrolls inside
+  `max-h-[320px]`. The working/idle derivation (`live[]` /
+  `team_work_active` hit = working, registry-online otherwise = idle,
+  offline hidden) is unchanged.
+- **Worker 24h token bar chart** (`51b407e`) — a third chart card in
+  the Z2 chart area ("Worker Tokens · Last 24h"), x-axis = worker
+  profile (lexicographic), y-axis = 24h token total, fed by the
+  existing read-only `GET /api/workers/token-usage` (zero backend
+  change). A `source == "none"` profile keeps the missing-data
+  discipline: a gray dashed hollow stub with `—`, never a fake zero.
+  The run-level token chart from the previous batch is untouched.
+  The chart's error state is a placeholder card with a retry button;
+  other zones are unaffected.
+- Four new dashboard i18n keys, symmetric in both locales
+  (`z1_working_title`, `z1_idle_empty`, `r4_run_label`,
+  `z2_worker_token_title`).
+
+### Changed
+
+- **The desktop shell returns to the left-sidebar layout** (`51b407e`)
+  — the `h-14` three-segment top tab bar introduced by the previous
+  batch is reverted: the desktop layout is again `<aside>` (w-60,
+  collapsible to w-[68px]) + main, with the chat tabs back in the
+  sidebar and the sidebar footer (reaper heartbeat dot + tagline)
+  restored. The view title/subtitle block deleted by the previous
+  batch stays deleted (main ruling — the header keeps only the
+  right-aligned action group). The mobile (<768px) top-tab layout is
+  byte-identical to before this batch — zero mobile change.
+- **Worker token lines are removed from the cards** (`51b407e`) — the
+  per-card 24h token line from the previous batch is dropped from both
+  zones; token display is now exclusively the dedicated bar chart.
+  The `dashboard.r4_token_24h` i18n key is deleted accordingly.
+- **`tokenUsage` state is tri-state** (`51b407e`) — `{data, loading,
+  error}` replaces the silent null fallback, so an endpoint failure
+  surfaces in the chart card instead of rendering an empty chart.
+- **Review follow-ups** (`6bd2736`) — indentation normalization in the
+  App.jsx chat-tabs block (whitespace-only) and an optional `ariaLabel`
+  prop on the shared bar-chart component so the two charts are
+  distinguishable to screen readers.
+
+### Tests
+
+- `npm test` (all ui test files): PASS (exit 0), including the
+  dashboard-view anchors and the App shell anchors; the
+  `test_issue58_tokens.mjs` key-count anchor moved 858 → 861 (net +3:
+  four added, one removed) in the same commit as the locale changes
+  (INV-09 discipline).
+- `pytest tests/test_i18n_protocol_guard.py`: 16 passed;
+  `tools/i18n_docs_sync.py --strict`: exit 0.
+- Real-browser acceptance on the deployed instance covered all ACs with
+  zero defects (desktop sidebar layout, portrait top-tab layout,
+  single-line idle rows, animated border, chart values matching the
+  endpoint to the pixel). Notes live under the task workspace
+  `docs/dashboard-fix-20261105/` (`REVIEW.md`, `TEST-REPORT.md`,
+  `IMPL-NOTES.md`).
+
+### Notes
+
+- Deployment: the console bundle and the locale files changed, so
+  `git pull` alone is not enough — run `./deploy/install.sh` and
+  restart the container. After deploying, confirm `/api/settings`
+  `ui_stamp` `build_md5` equals
+  `git show HEAD:ui/dist/index.html | md5sum`
+  (`8cb5bead660571d0ccb298adfebed972`, superseding the previous
+  batch's `ce00faf7…`).
+
+## Unreleased — Dashboard UI batch (2026-11-05): the console navigation moves from the sidebar to a top tab bar, the dashboard chain card becomes a step-dot strip, worker cards go two-state with a 24h token line, and the countdown zone gains an LCD readout with a run-now button
+
+Range: three commits `625df18` + `d82a827` + `0784ac8`, i.e.
+`b89f218..0784ac8` (9 files, +849/−408). The backend adds three read-only
+surfaces only — no schema change, no write-path change; the rest is the
+console bundle, the locale files and the test anchors.
+
+### Added
+
+- **`GET /api/workers/token-usage`** (`625df18`) — per-worker token
+  aggregation over a rolling window (`?window_s`, default 86400; invalid
+  or non-positive values fall back to the default). `harvest_contracts`
+  is joined to `task_sessions` on `task_id` for the worker identity; a
+  card counts when its `tokens.captured_at` (falling back to
+  `updated_at` when missing) falls inside the window. The
+  captured/missing discipline mirrors `_aggregate_run_tokens`: only
+  `tokens.source == "api"` snapshots contribute, summed per bucket
+  against dirty `total` fields. Per-profile `source` is `api` (all
+  captured), `partial` (mixed) or `none` (nothing captured — the
+  frontend shows a placeholder, never a fake zero). The route is
+  registered before the `/api/workers/` prefix match, the same
+  discipline as `/api/workers/live`, so `token-usage` is never mistaken
+  for a worker name.
+- **`display_title` on six serialization exits** (`625df18`) — a new
+  pure function `derive_run_title(initial_task)` (single-line, leading
+  markdown stripped, trim; first line ≤ 24 kept whole, whole line ≤ 40
+  kept whole, otherwise truncated to 40 including the ellipsis) adds a
+  `display_title` key to the launch response, the session-reuse
+  conflict response, `_api_tasks_active`, `api_tasks` active, the
+  `/api/team-works` list and the run detail. `initial_task` is kept
+  verbatim; nothing is stored and nothing is backfilled — the title is
+  derived at read time.
+- **`total_s` in the schedule countdown snapshot** (`625df18`) — the
+  `/api/schedule/state` countdown block gains `total_s` (= `COUNTDOWN_S`)
+  as an added key, the progress-bar denominator, so the frontend no
+  longer hard-codes 300.
+- **Z0 command zone** (`d82a827`) — an LCD-style countdown readout as
+  the visual subject, the next-task line, a progress bar driven by
+  `remaining_s / total_s`, and a **run-now** button wired to the
+  existing `POST /api/schedule/run-now` (zero backend change): enabled
+  only while a countdown is active with no busy reason and
+  auto-execute on, disabled with a per-reason hint otherwise, and
+  guarded against double-fire with an in-flight flag.
+- **Worker two-state cards** (`d82a827`) — working workers first,
+  idle after, equal-weight cards in one flex-wrap list; each card shows
+  the 24h token line from `/api/workers/token-usage` (`—` when
+  `source == "none"`). Offline workers are no longer rendered in the
+  dashboard zone.
+- **C2 chain card step-dot strip** (`d82a827`) — the Team Work chain
+  renders as a compact card with a step-dot strip (pending / current /
+  done / dropped sections) instead of the previous full card list.
+- Twelve new dashboard i18n keys, symmetric in both locales; the
+  flattened key-count anchor moves 846 → 858.
+
+### Changed
+
+- **The sidebar is retired** (`d82a827`) — the desktop layout's
+  left `<aside>` navigation is replaced by an `h-14` three-segment top
+  bar (brand | horizontally scrollable TABs | action group). The
+  default landing view stays `dashboard` with the same stateless
+  no-memory semantics.
+- **The cockpit batch's dimmed-inactive-worker capsules are superseded**
+  — the 32px gray capsule zone from the previous batch is removed from
+  the dashboard in favour of the two-state equal-weight cards above
+  (the `.worker-dim` class itself stays for the full WorkersView page).
+- **Run-now race hardening** (`0784ac8`) — the countdown-zero trigger
+  gets an independent `zeroFired` reset latch (dedup ref + unmount
+  cleanup) so a re-armed countdown can fire again, and one inbox route
+  handler returns directly instead of falling through.
+
+### Tests
+
+- Backend `pytest tests -q`: 1243 passed, 8 skipped — byte-identical to
+  the `b89f218` baseline (zero new red); `derive_run_title` unit cases
+  and token-usage window/fallback/none/partial semantics verified on a
+  temp ledger.
+- `npm test`: all 15 files PASS (exit 0), identical to baseline; the
+  `test_issue58_tokens.mjs` key-count anchor moved 846 → 858 in the
+  same commit as the locale additions (INV-09 discipline).
+- Real-browser acceptance on an isolated instance covered all 37 ACCEPT
+  criteria with P0 fully passing (run-now really fires, three
+  concurrent triggers produce a single run, zero-crossing fired in
+  1997 ms measured). Notes live under the task workspace
+  `docs/dashboard-ui-20261105/` (`REVIEW.md`, `TEST-REPORT.md`,
+  `FIX-NOTES.md`).
+
+### Notes
+
+- Deployment: the middleware (`mw/console.py`, `mw/schedule.py`), the
+  console bundle and the locale files all changed, so `git pull` alone
+  is not enough — run `./deploy/install.sh` and restart the container.
+  After deploying, confirm `/api/settings` `ui_stamp` `build_md5`
+  equals `git show HEAD:ui/dist/index.html | md5sum`
+  (`ce00faf7f13b8e5f1d0b4be432f06fde`).
+- Follow-ups filed, not blocking: the token-usage aggregation scans
+  `harvest_contracts` without an index on the join key (same order of
+  cost as `/api/team-works` today), and two orphan i18n keys from the
+  cockpit batch remain.
+
+## Unreleased — Dashboard cockpit batch (2026-11-05): the dashboard becomes
+the console's landing page and turns into a cockpit — a quick-add entry, an
+active-worker zoom zone with jump-to-chat, token charts for the last 10
+runs, and dimmed inactive workers
+
+Range: two commits `61da854` + `58a8f4c`, i.e.
+`214d416..58a8f4c` (11 files, +980/−337). Frontend only — **zero backend
+change** (`git diff --name-only 214d416..58a8f4c -- mw/` is empty). This
+CHANGELOG entry itself was added by the delivery-closure commit on top
+of that range.
+
+### Added
+
+- **Real charts via Chart.js v4** (`4.6.1`, tree-shaken registration —
+  `BarController`/`BarElement`/`CategoryScale`/`LinearScale`/
+  `DoughnutController`/`ArcElement`/`Tooltip` only, no `chart.js/auto`):
+  a token bar chart over the last 10 closed/aborted runs (values from
+  `token_total.total_tokens`; runs without token data render as dashed
+  stubs instead of fake zeros) and an inbox doughnut. Chart colors read
+  the `--c-*` theme variables and re-resolve on theme or locale switch
+  through one shared MutationObserver — no canvas remount, no new timers.
+- **Quick-add entry** in the top command bar — the page's only solid
+  primary button, reusing the 「添加任务」/ "Add Task" i18n key — opening
+  the existing team-work modal in place, without switching views.
+- **Active-worker zoom zone**: 260x168 cards with 64px avatars and a
+  full-width jump-to-chat button wired to the existing chat-tab flow;
+  inactive workers collapse to 32px gray capsules (`.worker-dim`
+  grayscales the avatar only, name contrast stays >= 4.5:1 in both
+  themes).
+- Eight new dashboard i18n keys, symmetric in both locales; the
+  flattened key-count anchor moves 837 → 845.
+
+### Changed
+
+- The default view is now `dashboard` (was `schedule`), keeping the
+  stateless no-memory semantics — no view persistence was introduced.
+- The dashboard re-flowed from a uniform grid into four zones (command
+  bar / active zone / charts / detail cards); all five legacy cards
+  keep their information, `CardFrame` per-card loading/error/retry
+  included.
+- The full `/api/workers` payload is fetched exactly once at first
+  paint and is guarded out of the 5s poll (payload red line).
+
+### Tests
+
+- `ui/tests/test_dashboard_view.mjs`: T1 default-landing sync, T2
+  endpoint guard rewritten (exactly one full workers call, absent from
+  `refreshAll`), new T13/T14 pure-function guards and T15
+  anti-regression for the language-switch fix;
+  `ui/tests/test_issue202_ui_pkg.mjs` default-view assertion synced;
+  `ui/tests/test_issue58_tokens.mjs` key-count anchor bumped to 845.
+
+### Notes
+
+- Verification: code review PASS (0 blockers; the single NIT — a <= 5s
+  bar-chart gap after language switch — was fixed in `58a8f4c` with the
+  T15 guard), tester PASS 34/34 criteria with 0 defects and 0 NOT
+  TESTED on an isolated instance under real Chromium in both locales
+  and both themes; the `npm test` failure set is identical to
+  baseline. Notes live under the task workspace
+  `docs/dashboard-cockpit-20261105/` (`REVIEW.md`, `TEST-REPORT.md`,
+  `FIX-NIT1.md`).
+- Deployment: nothing here is live until the user pulls and
+  re-installs; after deploying, confirm `/api/settings` `ui_stamp`
+  `build_md5` equals `git show HEAD:ui/dist/index.html | md5sum`
+  (`2899cb2db6b4c75be2eab57d432c5f25`).
+- Known observation filed as a follow-up issue: `/api/workers` echoes
+  `api_key` in plaintext and the full bundle sits in frontend memory
+  (historical endpoint behavior; this batch converged it to one
+  first-paint fetch with a static guard — the thorough fix is backend
+  field trimming or a dedicated lightweight endpoint).
+
+## Unreleased — Rename batch (2026-11-05): the console's task-creation
+entry stops naming the task type — 「发起多智能体协作(任务)」/ "Start
+multi-agent collaboration" becomes 「添加任务」/ "Add Task", because the
+inbox is now the single task-creation point and the entry no longer has
+to distinguish task types
+
+Range: two commits `d9f8ce1` + `2c8b383`, i.e.
+`c319c7f..2c8b383` (9 files, +93/−94). Frontend i18n values, tests,
+dist and tracked docs only — **zero backend change**
+(`git diff --name-only c319c7f..2c8b383 -- mw/` is empty). This
+CHANGELOG entry itself was added by the delivery-closure commit on top
+of that range.
+
+### Changed
+
+- **The entry button no longer announces what kind of task it creates**
+  — four user-facing i18n keys, `chat.session.start_teamwork_btn`
+  (top-bar core-features button + chat empty-state guide button),
+  `chat.team_work_modal.title` (modal title),
+  `chat.session.empty_hint_intro` (chat empty-state hint) and
+  `schedule.empty.hint` (inbox empty-state hint), were reworded from
+  「发起多智能体协作(任务)」/ "Start multi-agent collaboration" to
+  「添加任务」/ "Add Task" in both locales. Key names are untouched and
+  the flattened key-count anchor stays at 837 — values only.
+  `chat.multi_agent_card.title` (「🤝 多智能体协作任务」/ "🤝 Multi-agent
+  collaboration task") is **kept** per adjudication A5: it labels the
+  run's task card in the conversation flow, not the entry button.
+
+### Tests
+
+- The four assertions pinning the old strings —
+  `ui/tests/test_issue141_run_badge_inbox.mjs` L56/L65 and
+  `ui/tests/test_issue164b_entry.mjs` L224/L228 — were updated to the
+  new values in the same commit; `npm test` is green across 33 suites,
+  including the 837 key-count anchor and the dist-sync gates.
+
+### Docs
+
+- Eight tracked-document references to the old button name were synced
+  to the new name: `docs/main-soul.en.md` and `docs/main-soul.zh-cn.md`
+  (1 each) and `deploy/skills/mw-task-dispatch/SKILL.en.md` /
+  `SKILL.zh-cn.md` (3 each); `tools/i18n_docs_sync.py --strict` is
+  green.
+
+### Notes
+
+- Verification: review PASS, tests READY (T-1..T-5), doc audit PASS
+  with zero blockers — old-name residue in user-visible copy is 0
+  (A5 exempt), the dist rebuild is byte-reproducible (sha256
+  `3aef09bf6d92af2a87fba0a377c68a43855d9336525c747b9f5799d0a12c259b`,
+  identical before and after a clean rebuild), real-Chromium rendering
+  shows the new name in both locales (top bar / modal / empty states),
+  and an end-to-end modal submit against an isolated backend landed in
+  the queue. Notes live under the task workspace
+  `docs/rename-20261105/` (`REVIEW.md`, `TEST-REPORT.md`,
+  `DOC-AUDIT.md`).
+- Deployment: nothing here is live until the user pulls and re-installs;
+  after deploying, confirm the untracked `mw/ui_dist` copy's stamp
+  `build_md5` matches `ui/dist` (TEST-REPORT O-3), otherwise browsers
+  may still serve the old UI.
+- Known non-issues kept by adjudication: source/test comments still
+  naming the old button (O-1, not a violation per ANALYSIS B5/B6/D4)
+  and the retained card title (A5).
+
+## Unreleased — Issue batch Z (2026-11-05): the hold feature gets its
+operating surface — a Hold button on the active chain, a Resume button
+on held rows, and the main-side hold protocol written down
+
+Range: two commits `dd6591b` + `a6a2923`, i.e.
+`3719078..a6a2923` (13 files, +510/−156). Frontend only plus docs —
+**zero backend change**
+(`git diff --name-only 3719078..a6a2923 -- mw/` is empty). The audit
+corrections listed under "Docs corrections" and this entry itself were
+added by the delivery-closure commits on top of that range.
+
+### Added
+
+- **A chain could be held by the backend but not by anyone** — issue #210
+  shipped the `HOLD` state, the `/api/team-work/<run_id>/hold` and
+  `/hold/resume` endpoints and the `schedule_linkage` linkage, but the
+  console had no button for any of it and no document said how main is
+  supposed to hold a chain. The active chain's current-task card now
+  carries a **Hold** button (zh「挂起」/ en "Hold") and every held row in
+  the history list carries a **Resume** button (zh「恢复」/ en "Resume");
+  both go through the existing `setConfirm` second-confirmation dialog,
+  disable themselves while the request is in flight (a physical double
+  click produces exactly one POST), and refresh the board afterwards.
+- **The hold protocol is now written down for main** — `docs/main-soul.en.md`
+  and `docs/main-soul.zh-cn.md` gained a `hold / resume` protocol section
+  covering the six points the requirements listed: trigger (only on an
+  explicit user instruction — main must never hold on its own), post-hold
+  behaviour (no advance, no dispatch, check the run status on a knock),
+  error handling (409 "another run is already running" is reported
+  faithfully and main never auto-closes another run to free the slot;
+  404 means check the run_id; `was_already:true` is acknowledged
+  normally), acknowledgement (every call is reported back to the user),
+  the boundary restated (hold ≠ abandon, hold kills no worker process and
+  leaves `current_card_id` alone), and the schedule-linkage half-failure.
+  `deploy/skills/mw-task-dispatch/SKILL.{en,zh-cn}.md` carry the two curl
+  examples and the protocol summary in the same commit.
+
+### Changed
+
+- **17 new bilingual locale keys** (`tboard.hold_*` / `tboard.resume_*` /
+  `tboard.confirm_hold_*` / `tboard.confirm_resume_*`), so the locale
+  flatten anchor moved 820 → 837 and the `tboard` anchor 131 → 148, both
+  languages in the same commit; the key sets stay symmetric at 837/837.
+- **The `fmtApiError` call-site anchor moved 16 → 18** — the two new
+  `catch` blocks call it as a fallback; the 409 business message is
+  passed through from `e.message` instead, so the server's wording
+  ("another run is already running") reaches the user rather than a
+  generic client-error template.
+- **The hold result is classified into three toasts** — idempotent
+  (`was_already`), schedule half-failure (`schedule_linkage` starts with
+  `failed`, warned rather than dressed up as success), and plain success.
+- **The en `reply_conflict` toast wording was aligned with zh** (declared
+  deliberately) — `tboard.reply_conflict` en read "Reply accepted, but ⚠
+  {conflict}" while zh read 「已提交，但 ⚠ {conflict}」; en now reads
+  "Submitted, but ⚠ {conflict}", a faithful translation of the zh
+  wording. The zh string itself is unchanged; the two locales are now
+  semantically identical.
+
+### Docs corrections
+
+- **The s6 documentation audit's five findings were fixed in the closure
+  commits** — `design.md` §4.6 no longer claims the board has "no resume
+  entry point" (the Resume button exists; the paragraph now describes it
+  and adds the board hold/resume operating surface: button placement,
+  second confirmation, user-initiated-only outside the 5s poll, the
+  three-toast classification and the 17 locale keys); the §11.7 endpoint
+  table's two hold rows now list `frontend (TasksBoardView)` in their
+  Called-by column; the stale `runStatus()` comment in
+  `ui/src/views/TasksBoardView.jsx` that still said "no resume action
+  entry" was rewritten and folded into `dd6591b` itself — the commit that
+  had introduced the contradiction and already carried the `ui/dist`
+  rebuild (the minifier strips comments, so the bundle is byte-identical
+  either way, md5 `4981db03…`, keeping `check_dist_sync` C4 green); and both
+  `mw-task-dispatch` SKILL locales gained the sixth protocol bullet
+  (Schedule linkage / 排期联动) their "verbatim in sync with main-soul"
+  claim had been missing.
+
+### Notes
+
+- **Verification** — `python3 tools/i18n_docs_sync.py` exits 0; the new
+  guard `ui/tests/test_issue210_hold_buttons.mjs` passes 10/10; the
+  backend hold guards pass 23 passed / 2 skipped (the skips are the
+  environment's missing cron venv, not a defect); `cd ui && npm test` is
+  green over 33 suites; `deploy/check_dist_sync.sh` reports C1/C3/C4 green
+  and C2 red on a pre-existing local runtime-copy drift unrelated to this
+  batch; the tracked `ui/dist/index.html` rebuilds byte-identically
+  (md5 `4981db03c8b5181f2941ad40879a505a`).
+- **Deployment** — this batch changes the console bundle and the deploy
+  skill / SOUL templates: run `git pull`, then `./deploy/install.sh`.
+
+## Unreleased — Issue batch Y (2026-11-04): three doc-sync corrections
+close the X-batch audit's historical-legacy items, and one English-only
+fix keeps the root-doc language gate green
+
+Range: four commits `c3cd580` + `24c70a5` + `1f02cb4` + `4463864`, i.e.
+`9db0edc..4463864` (4 files, +15/−9). Docs only — zero code, zero UI.
+This entry and the `DEPLOY.md` §5 trigger-condition addition listed under
+"Notes" were added by the delivery-closure commit on top of that range.
+
+### Docs
+
+- **`design.md` §11.7 now registers `/api/workers/live` (#221)** — the endpoint
+  has existed since `745b76a` (SSE-FIX-F2) and was never listed in the
+  authoritative endpoint table. The new row names the read-only
+  `sse_bridge` in-memory snapshot (`live[]` + `active_run_ids`), records that
+  it performs **zero health probes** and deliberately does not reuse
+  `/api/workers`, and notes that the route must be registered before the
+  `/api/workers/` prefix match (`mw/console.py:5167-5170`). Called by: the
+  DashboardView worker-live card (`ui/src/views/DashboardView.jsx:184`) and
+  the reaper knock path.
+- **The orchestration skill's launch request body names the key the API
+  actually reads (#222)** — `team-work-chain-orchestration` (both locales)
+  wrote `workflow_id / session_id / project_workspace / steps`, but
+  `api_team_work_launch` (`mw/console.py:907`) reads `initial_task` (required,
+  400 when missing), `session_id` (required), `steps` (non-empty array) and
+  the optional `project_workspace` — it never reads `workflow_id`. Both
+  locales now say `initial_task / session_id / project_workspace / steps`.
+  The two places that describe `workflow_id` as *user input* and as
+  *silently ignored by launch* are unchanged: they describe reality.
+- **`DEPLOY.md` §5 no longer claims the console upgrade is atomic (#223)** —
+  the sentence predated issue #125 and contradicted the same document's own
+  "#125 route A" paragraph. `mw/` is a single directory bind mount, so
+  `git pull` + restart applies the Python proxy immediately, but the
+  frontend bundle is served from a deploy-time copy (`install.sh` copies the
+  tracked `ui/dist` build into `mw/ui_dist/`), so new UI only takes effect
+  after `./deploy/install.sh` has rebuilt that copy. The stale-browser-cache
+  remedy is unchanged.
+
+### Fixed
+
+- **The new endpoint row was written in Chinese and flipped the root-doc
+  language gate** — the first draft of the §11.7 row introduced 34 CJK
+  characters into `design.md`, turning `tools/i18n_docs_sync.py` from exit 0
+  into exit 1 (F1: root docs are English-only outside code blocks). The row
+  is now English with identical semantics; `i18n_docs_sync.py` exits 0.
+
+### Notes
+
+- **Verification** — AC-Y1/Y2/Y3 criteria re-run independently (the
+  `/api/workers/live` row is present with four columns and matches the
+  `mw/console.py:3380` docstring; both locales' launch key lists are
+  `initial_task`-based with zero `workflow_id` residue; the old
+  "always applies the Python" wording is gone and the stale-browser-cache
+  remedy is preserved). `tools/i18n_docs_sync.py` exits 0; `pytest` is
+  1251 passed; `cd ui && npm test` is green end to end (32 guard files).
+  `deploy/check_dist_sync.sh` still reports C2 RED — a pre-existing local
+  runtime-copy drift, unrelated to this batch (the batch touches no `ui/`
+  or `mw/` file).
+- **`DEPLOY.md` §5 quick path now names the frontend trigger (audit Y-3)** —
+  the batch introduced the backend/frontend two-path distinction in the
+  explanatory paragraph but not in the operational trigger list, so the
+  closure commit adds the third trigger class: a pull that changes the
+  tracked frontend artifact (`ui/dist/index.html` / `ui/src`) requires
+  re-running `./deploy/install.sh`, because `git pull` + restart does not
+  refresh the `mw/ui_dist` deploy-time copy.
+- **Deployment** — this batch changes documentation only; no container
+  restart is required for it to take effect.
+
+## Unreleased — Issue batch X (2026-11-04): the console grows a read-only
+dashboard tab, and the new-task entry is unified on the inbox
+
+Range: four commits `42b71a8` + `422631c` + `8018fc1` + `2f04708`, i.e.
+`7dc07e6..2f04708` (12 files, +799/−140). This entry and the `SKILL.en.md`
+button-label fix listed under "Notes" were added by the delivery-closure
+commit on top of that range.
+
+### Added
+
+- **A read-only dashboard tab (#220 batch requirement)** — the console NAV
+  gained a "总览/Dashboard" tab (second position, right after the inbox and
+  before the kanban, heroicons chart-bar). `ui/src/views/DashboardView.jsx`
+  answers five questions with five read-only cards: **C1** system health (the
+  reaper heartbeat tri-state lamp on the real `dot-ok/dot-bad/dot-dim` classes
+  + `auto_execute` badge + a countdown that ticks locally each second and
+  re-calibrates from the server `ends_at`), **C2** active chains (the ACTIVE
+  team-works list with the board's own token-label semantics), **C3** inbox
+  queue (frontend aggregation of `schedule/tasks`; done counts only the last
+  24h; a yellow badge appears when holds > 0), **C4** worker liveness (a
+  direct `/api/workers/live` call inside the component behind an `r.ok` gate —
+  deliberately not the full `/api/workers` probe), and **C5** recent closures
+  (`include_closed`, filtered to CLOSED/ABORTED, sorted by `closed_at` desc,
+  top 5). One 5s timer drives all five cards, paused while `document.hidden`
+  and refreshed immediately on `visibilitychange`. 32 new bilingual keys (the
+  locale flatten anchor moved 788 → 820, per the INV-09 precedent); the new
+  guard `ui/tests/test_dashboard_view.mjs` (T1..T12, wired at the tail of
+  `npm test`) pins the five-card contract, including counter-anchors for the
+  M-1/M-2/D-1 regressions. The default landing tab is still the inbox.
+
+### Fixed
+
+- **The reaper lamp was invisible (M-1)** — C1 used `bg-green/bg-red/bg-slate`
+  classes that have no CSS rules in the bundle, so the lamp rendered as
+  transparent dots; it now uses the same `dot-ok/dot-bad/dot-dim` set as the
+  top bar, verified in both themes.
+- **A failing `/api/workers/live` looked like an empty queue (M-2)** — C4's
+  bare fetch ignored the response status, so a 500-with-JSON landed as the
+  silent "no live workers" empty state; it now checks `r.ok` and falls into
+  the error state with a working retry button.
+- **Dashboard interpolations rendered literally (D-1, P0)** — the new locale
+  entries used `{{n}}` double braces while this repo's i18next is configured
+  for single-brace interpolation (`{x}`), so the countdown, card counts and
+  token figures showed as literal `{{n}}` / `{{assignee}}` / `{{status}}`;
+  all dashboard entries now use the repo convention (zero double braces in
+  both locales and in `dist`, guard anchor T12).
+- **C2 token totals always showed 0 (D-2)** — `fmtTokens` was handed the
+  `token_total` dict instead of a number and its `typeof n !== 'number'`
+  guard returned `'0'` for every run; C2 now uses a local `runTokenLabel`
+  following the TasksBoardView dict semantics, showing "—" when a total is
+  unavailable instead of a fake 0.
+
+### Docs
+
+- **The skill's new-task entry is now the inbox (X-1, #220)** —
+  `deploy/skills/mw-task-dispatch` and `team-work-chain-orchestration` (all
+  four bilingual files) now state that the only call point for creating a new
+  Team Work task is enqueueing via `POST /api/schedule/tasks` — the same entry
+  as the web console's start-teamwork button — with the mainline
+  `inbox任务 -> 启动 -> 创建run -> 创建卡片`; `launch` is re-characterised as
+  the execution mechanism after a trigger, not the new-task entry. The
+  orchestration sections (launch response, steps registration, advance
+  rotation, settlement) were left untouched per the zero-deletion rule.
+
+### Notes
+
+- **en skill button label fixed in this closure commit (B-1)** — the two
+  sentences `42b71a8` added to `SKILL.en.md` referred to the console button by
+  its Chinese name, contradicting the same file's existing English wording and
+  the `en.json` label; they now read `"Start multi-agent collaboration"
+  button`. `SKILL.zh-cn.md` keeps the Chinese label, matching `zh.json`.
+- **Verification** — AC-X1 criteria 1-5 all PASS (static re-run on the batch
+  range); the dashboard acceptance turned green after the `2f04708` D-1/D-2
+  fixes; `cd ui && npm test` is green end to end (32 guard files, the
+  dashboard guard at 12/12), the locale flatten sets are symmetric at
+  820/820, and `tools/i18n_docs_sync.py --strict` exits 0.
+- **Deployment** — this batch changes the console bundle and the deploy skill
+  templates: run `git pull`, then `./deploy/install.sh`. **None of this batch
+  is live until the user pulls, installs and restarts.**
+
+## Unreleased — Issue batch W (2026-11-04): the dist gate now catches source
+drift, the chat renders every message exactly once, and main confirms relay receipts
+
+Range: six commits `e72bc04` + `be3a0da` + `532bacc` + `f24b469` + `6b886e5` +
+`1a73abb`, i.e. `0c2fbc4..1a73abb` (8 files, +444/−108). This entry and the
+`deploy/verify.sh` / `DEPLOY.md` gate-wording syncs listed under "Notes" were
+added by the delivery-closure commit on top of that range.
+
+### Fixed
+
+- **A chat reply could be rendered two (even three) times (#216)** — fixed in
+  two progressive commits. `f24b469` unified the dedup source of truth on
+  `seenIdsRef` and added a content-level fallback for the user echo; the
+  acceptance run then proved the assistant half was still broken (`D-W-1`): the
+  SSE `assistant.completed` registers a gateway string id (`msg_…`) while the
+  polling tick filters on console integer ids — two namespaces that never
+  intersect, so the registration never hit and the first 4s tick after the turn
+  closed re-appended the streamed reply (the first bubble carried the decode
+  speed, the duplicate did not). `1a73abb` fixes the root cause by giving the
+  assistant echo the same content-level fallback as the user echo inside the
+  tick's append updater — namespace-agnostic, one-shot, and it never swallows a
+  later same-text message. New guard `ui/tests/test_issue216_dup_render.mjs`
+  (T1..T7, wired into `npm test`) pins both fixes, including T6 which replays
+  the real 170 id shapes; the guard was verified red on `f24b469` (T6/T7 fail,
+  assistant bubbles = 2) and green on `1a73abb`. Retested on the 170 machine:
+  user bubble exactly 1, assistant body exactly 1, decode speed exactly 1, no
+  duplicates after +22s, a repeated same-text message is not swallowed, reload
+  renders history cleanly. Both fix commits rebuild `ui/dist` in the same commit.
+- **The dist gate had a blind spot for source drift (#215-1)** —
+  `deploy/check_dist_sync.sh` grew from three checks to **four**: new C4 turns
+  red when `ui/src`'s last commit is newer than `ui/dist`'s and they are not
+  the same commit (the exact shape of DEF-V-1: source changed, artifact not
+  rebuilt). A same-commit rebuild stays green, and shallow clones / non-git
+  directories are SKIPPED rather than falsely red. C1/C2/C3 logic is untouched.
+
+### Tests
+
+- **The manual runner missed the V-batch cases (#215-3)** —
+  `tests/test_team_work_ledger.py`'s `main()` entry gained the three
+  `tmp_path`-style V-batch cases via a `tempfile` adapter (18 → 21 cases, all
+  executed, not silently skipped); the pytest path stays at 27 passed.
+- **The 213/214 inbox guard ran nowhere (#215-4)** —
+  `ui/tests/test_issue213_214_inbox_detail_hold.mjs` is now wired into the
+  `ui/package.json` `test` chain (13/13 PASS inside `npm test`).
+
+### Docs
+
+- **main's SOUL now instructs a relay receipt (#217)** — both
+  `docs/main-soul.zh-cn.md` and `docs/main-soul.en.md` gained a hard
+  instruction: right after reading a worker report and ruling on the card,
+  `POST /api/relay/confirm` once with `{"task_id": "<task_id>"}` (expects 200
+  `{"ok": true, ...}`; idempotent; 400/404 distinguishable). This clears
+  `notify_confirmed_at` and the backoff/dead-letter fields, removing the
+  avoidable run-level empty-slot knock on the chain-tail card stuck behind a
+  fully-synchronous 200 that never arrives (#205 residue).
+
+### Notes
+
+- **Gate wording synced in this closure commit** — `deploy/verify.sh`'s dist-sync
+  failure hint now says C1/C2/C3/C4, and `DEPLOY.md`'s gate description lists
+  the fourth condition (src↔dist source drift).
+- **Verification** — the W-batch acceptance passed AC-1..AC-5 (AC-4 after the
+  `1a73abb` fix and the 170 retest); `cd ui && npm test` is green end to end,
+  `tests/test_team_work_ledger.py` passes 27/27 under pytest and 21/21 under
+  its manual runner, and the static review found 0 MAJOR / 0 MINOR.
+- **Deployment** — this batch changes the console bundle and the deploy gate:
+  run `git pull`, then `./deploy/install.sh`. **None of this batch is live
+  until the user pulls, installs and restarts.**
+
+## Unreleased — Issue batch V (2026-11-04): the inbox shows a task's detail,
+and a frozen run is visible as "On hold"
+
+Range: five commits `385bc3c` + `22645ff` + `aea925b` + `e2a50ce` + `bd37e3f`,
+i.e. `b2f7e2c..bd37e3f` (`git rev-list --count b2f7e2c..HEAD` = 5). This
+entry and the `design.md` / `DEPLOY.md` registrations listed under "Notes"
+were added by the delivery-closure commit on top of that range.
+
+### Fixed
+
+- **The inbox never showed what a task actually was (#213)** — clicking a row's
+  content area now expands the task's full `detail` in place (a chevron marks
+  the state, `aria-expanded` carries it, Enter/Space toggle it, the action
+  buttons stop propagation so they never toggle the row by accident). Long
+  details scroll inside a 240px panel instead of being cut off, and an empty
+  detail renders an explicit empty state.
+- **A frozen run and a frozen inbox task were invisible (#214)** — a HOLD run
+  now appears in the run list under both the `include_closed` and the
+  `include_archived` projections (the default ACTIVE-only projection is
+  unchanged), and it carries an "On hold" badge in the board's history. The
+  inbox renders held tasks in their own group directly above the "Not
+  started" group, so a held task sits at the top of the pending stack without
+  ever entering the execution queue.
+- **A failed ledger migration was swallowed (#214)** — the ledger's schema
+  migration used to discard sqlite errors, which could leave a half-migrated
+  database running unnoticed. It now raises instead: the migration is
+  transactional, verifies the row count, copies columns by explicit
+  intersection, and a failure aborts the console request rather than leaving
+  the old schema in place. DEPLOY.md §5.4 and the §4 troubleshooting rows
+  were rewritten to this fail-loud posture in the delivery-closure commit
+  (a failed migration raises `RuntimeError`, `Ledger()` construction fails,
+  the transaction rolls back, and console endpoints answer `500
+  internal_error` — the process does not crash). The pre-migration backup
+  (`ledger.db.pre-hold-migration`) and the
+  verification query are unchanged.
+
+### Notes
+
+- **Five new bilingual keys** (`schedule.detail.*`, `schedule.group.hold`,
+  `schedule.state.hold`, `tboard.run_status_hold`); the locale key sets stay
+  symmetric at 788/788 and the `tboard` subset at 131.
+- **Verification** — the V-batch acceptance run passed all 14 criteria; the
+  new frontend guard passes 13/13, `tests/test_team_work_ledger.py` passes
+  27/27, and the migration was re-verified against a hand-built legacy
+  database (both the pre-HOLD schema and the "schema already current but
+  `user_version` still 0" case) with the row count preserved.
+- **Deployment** — this batch changes the console server, the ledger store and
+  the console bundle: run `git pull`, then `./deploy/install.sh`, and restart
+  the container. **None of this batch is live until the user pulls, installs
+  and restarts.** The runtime bundle copies (`/share_workspace/ui_dist` and
+  `mw/ui_dist`) still hold the previous build until `install.sh` syncs them:
+  after deploying, `deploy/check_dist_sync.sh` must report GREEN, and the
+  three V-batch acceptance points — inbox detail expand/collapse, the hold
+  group above the pending group, and the board's HOLD badge — must be
+  re-verified on the deployed instance. The deployment itself is the user's
+  action.
+
 ## Unreleased — Issue batch U (2026-11-04): a Team Work run can be frozen and thawed, and the chat shows the LLM's decode speed
 
 Range: three commits `9b8a1fb` + `d353158` + `5048815`, i.e. `8293fce..5048815`

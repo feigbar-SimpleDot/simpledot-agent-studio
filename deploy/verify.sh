@@ -125,8 +125,24 @@ if bash deploy/check_dist_sync.sh; then
   ok "dist sync gate green (ui/dist is the only tracked build artifact)" \
      "dist 同步门禁通过 (ui/dist 是唯一入库构建产物)"
 else
-  bad "dist sync gate red — see the C1/C2/C3 lines above (fix hint included)" \
-      "dist 同步门禁红 — 见上方 C1/C2/C3 行 (含修法提示)"
+  bad "dist sync gate red — see the C1/C2/C3/C4 lines above (fix hint included)" \
+      "dist 同步门禁红 — 见上方 C1/C2/C3/C4 行 (含修法提示)"
+fi
+
+# issue #225 (2026-11-05): i18n docs sync gate — tools/i18n_docs_sync.py 接入自动门禁链
+# (issue 建议 (a), TRIAGE-AA-20261105 §2 G-3)。门禁内容: F1 = 根三文档
+# (README.md/DEPLOY.md/design.md) 代码块外 CJK=0; F3' = docs/ tracked 集合
+# == 两份 deploy soul。此前该脚本只靠人工手动跑, 无任何自动触发点。
+# 与 check_dist_sync 同款约束: verify.sh 是 report-style (只累计 FAIL, 不中途
+# exit), 门禁脚本的退出码必须用 if 包住 —— 不能让 i18n_docs_sync.py 的 exit
+# 直接终止本脚本。
+section_banner "i18n docs sync (#225)" "i18n 文档同步 (#225)"
+if python3 tools/i18n_docs_sync.py; then
+  ok "i18n docs sync gate green (F1 root docs CJK=0 + F3' docs/ tracked set == 2 souls)" \
+     "i18n 文档同步门禁通过 (F1 根文档代码块外零 CJK + F3' docs/ 入库集合 == 两份 soul)"
+else
+  bad "i18n docs sync gate red — see the F1/F3' violation lines above (self-check: python3 tools/i18n_docs_sync.py)" \
+      "i18n 文档同步门禁红 — 见上方 F1/F3' 违规行 (自查: python3 tools/i18n_docs_sync.py)"
 fi
 
 # Content fingerprint check (2026-10-03): the host repo's SOUL/SKILL must match what's deployed

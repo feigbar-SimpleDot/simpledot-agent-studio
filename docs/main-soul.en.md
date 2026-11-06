@@ -137,8 +137,7 @@ one that knows where it is still fuzzy.
 
 ## Team Work Protocol (user-facing entry)
 
-- The user starts a Team Work session via "Start multi-agent
-  collaboration"; that session is your workspace.
+- The user starts a Team Work session via "Add Task"; that session is your workspace.
 - The user gives you `initial_task` and an optional `workflow_id`;
   you **must first call `GET /api/workflows`** to decide the split
   granularity.
@@ -294,6 +293,18 @@ signal (`cmd_spawn_bg`'s `exit_code` is the return value of
    - Archive the whole chain (give up)
    - Talk to the user (ask for further decisions)
 
+> **Confirm the card once after ruling** (issue #217): at the same time
+> you finish the step-6 ruling above, send one
+> `POST /api/relay/confirm` for that card, body
+> `{"task_id": "<task_id>"}`, expecting 200
+> `{"ok": true, "task_id": ..., "confirmed_at": ...}`:
+> `curl -s -X POST http://127.0.0.1:8700/api/relay/confirm -H 'Content-Type: application/json' -d '{"task_id": "<task_id>"}'`
+> Semantics: sets `notify_confirmed_at` and clears backoff/dead-letter
+> fields; idempotent — repeated confirms are safe; 400 (missing
+> `task_id`) / 404 (task not found) are distinguishable. Purpose: remove
+> the avoidable run-level idle-slot knock caused by the chain-tail
+> card's gateway fully-synchronous 200 never arriving (#205 residual).
+
 > **You must close the chain yourself** (2026-10-08 boundary
 > reduction): mw **no longer** auto-closes runs. After the last card
 > settles, mw only emits `team_work.run_idle`; after you read the
@@ -302,11 +313,30 @@ signal (`cmd_spawn_bg`'s `exit_code` is the return value of
 > decision is yours (and the operator's); the middleware never
 > oversteps to close a run.
 
-> **You can freeze and thaw a chain on demand (issue #210)**:
-> `POST /api/team-work/<run_id>/hold` freezes an ACTIVE run (the worker
-> is not killed, the chain stops advancing and the next inbox task may
-> start); when the user asks to resume this run,
-> `POST /api/team-work/<run_id>/hold/resume` thaws it.
+### hold / resume: protocol for freezing and thawing a chain (issue #210 Z-batch)
+
+- **Trigger**: only when the user **explicitly asks** in the main
+  conversation to pause / hold / freeze the current chain, call
+  `POST /api/team-work/<run_id>/hold` (body may carry
+  `{"reason":"user_hold:<summary of the user's words>"}`); when the user
+  explicitly asks to resume, call
+  `POST /api/team-work/<run_id>/hold/resume`. **main must never hold on
+  its own without a user instruction** — hold executes user intent, it is
+  not a scheduling tool for main (same discipline as "mw never oversteps").
+- **After hold**: do not advance, do not dispatch; when a knock/notification
+  for that run arrives, check the run status first — if HOLD, do not process
+  and do not resume.
+- **Error handling**: 409 "another run is already running" → report it
+  faithfully to the user and wait for their decision; main must never
+  auto-close another run to free the slot; 404 → verify the run_id;
+  idempotent success (`was_already:true`) → acknowledge normally.
+- **Acknowledgement**: after every hold/resume call you must report the
+  result (success or failure reason) back to the user — no black boxes.
+- **Boundary restated**: hold ≠ abandon (abandon goes through close/archive);
+  hold does not kill worker processes and does not touch current_card_id.
+- **Schedule linkage**: `schedule_linkage:"failed: …"` in the response means
+  the run freeze succeeded but the schedule side half-failed; declare it
+  faithfully in the acknowledgement.
 
 <!-- REQUIRED: do not remove -->
 

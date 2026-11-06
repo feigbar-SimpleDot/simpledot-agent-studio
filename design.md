@@ -437,6 +437,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_team_work_one_active
 > `current_card_handoff_at` / `last_waiting_at`) are added by
 > `ADD COLUMN` migrations, and the issue #210 CHECK migration rebuilds
 > the table to the full 17-column shape — see §4.5 and DEPLOY.md §5.4.
+> The rebuild copies rows through an **explicit intersection** of the
+> old and new column sets (never `INSERT ... SELECT *`, which breaks
+> silently on column drift — issue #214), and a failing migration is
+> **fail-loud**: it raises and rolls back instead of leaving a
+> half-migrated schema (issue #214).
 
 **Run state machine (issue #210 added `HOLD`):**
 
@@ -630,7 +635,12 @@ three `hold_*` audit columns, issue #210) both run on the first write
 connection as table rebuilds — new table, copy, drop, rename — each
 guarded by a content check on the stored DDL and a row-count
 verification that rolls back on a mismatch (operator's view:
-DEPLOY.md §5.4).
+DEPLOY.md §5.4). Failure posture (issue #214, same wording as
+DEPLOY.md §5.4): a sqlite-level error in the migration is not
+swallowed — it raises `RuntimeError`, the `Ledger()` construction
+fails and the transaction rolls back with no half-migrated schema;
+the console process keeps running and the affected endpoints answer
+`500 internal_error` with the failure logged.
 
 Concretely, a read connection only creates the database when the core
 tables (`schedule_tasks` and `schedule_settings`) do not exist yet (a
@@ -660,6 +670,50 @@ busy criterion reads `list_by_status('running')`
 (`mw/schedule.py:_busy_reason`), which never returns `hold` rows, so
 the next pending task starts its countdown normally while a task is
 held (issue #210).
+
+### 4.6 Inbox frontend presentation (issues #213 / #214)
+
+**Task-detail expand/collapse (#213).** Each inbox row's content area
+is a click target (`role="button"`, `tabIndex=0`, `aria-expanded`
+carries the state; Enter/Space toggle it) that expands the task's full
+`detail` in place below the row — a chevron marks the state, the text
+keeps its newlines (`whitespace-pre-wrap`), details longer than the
+panel scroll inside a 240px box instead of being cut off, and an empty
+`detail` renders an explicit empty state. The row's action buttons
+(pause/cancel/…) sit in a container that stops event propagation, so
+opening a detail can never fire a state-changing action — the
+mis-click the issue was filed about. The expanded set is keyed by task
+id and survives the polling refreshes.
+
+**HOLD presentation (#214; board operating surface added in the #210
+Z batch).** The inbox renders held tasks in their own `hold` group
+placed directly above the pending group (five frontend groups total,
+see §11.7 `/api/schedule/tasks`), with the state badge
+`schedule.state.hold` in yellow — a held task is visibly neither done
+nor queued, and it gets **no** action buttons (it never enters the
+execution queue). On the Team Work board a `HOLD` run shows in the
+history list with a yellow, non-pulsing "On hold" badge
+(`tboard.run_status_hold`) **and a Resume button**: it goes through the
+shared second-confirmation dialog and then calls
+`POST /api/team-work/<run_id>/hold/resume` (§11.7). The API/LLM path
+remains available alongside the button — the main-side hold protocol is
+written down in `docs/main-soul.{en,zh-cn}.md`.
+
+**Board hold/resume buttons (#210 Z batch).** The Team Work console
+carries the hold feature's operating surface: ① the current-task card
+(the ACTIVE run) has a **Hold** button (`tboard.hold_btn`) that goes
+through the same `setConfirm` second-confirmation dialog and then calls
+`POST /api/team-work/<run_id>/hold`; ② every `HOLD` row in the history
+list carries the **Resume** button described above; ③ both buttons are
+user-initiated only — neither ever fires from the 5s polling refresh —
+and each disables itself while its request is in flight, so a physical
+double click produces exactly one POST; the board refreshes after the
+result, the response is classified into three toasts (idempotent
+`was_already` / schedule half-failure `schedule_linkage:"failed: …"`
+warned rather than dressed up as success / plain success), and a 409
+passes the server's business message through verbatim; ④ all copy goes
+through 17 new bilingual locale keys (`tboard.hold_*` /
+`tboard.resume_*` / `tboard.confirm_hold_*` / `tboard.confirm_resume_*`).
 
 ---
 
@@ -1529,12 +1583,20 @@ force-skipped by main as an explicit product decision.
 |------|------|------|--------|
 | `/api/workflows` | GET | list workflow templates | LLM / frontend |
 | `/api/workflows/<id>` | PUT / DELETE | create/update/delete workflow | frontend |
+| `/api/decision-paths` | GET | decision-path routing table (issue #70): each path carries `match.any_of` / `none_of` / `route_to` / `role_tags` / `forbidden_for_main`; `route_to` is a semantic role name, never a profile name (worker selection stays a main-side runtime match against `/api/workers` scope tags); a missing or broken yaml degrades to `{"paths": []}` and never 500s | LLM (main, before splitting the first card) |
+| `/api/decision-paths/classify` | GET | coarse classification verdict for one raw input text (`?text=`; the parameter is required — absent is a 400, an empty string is valid and yields `path_id: null` + fallback `ask_user`): answers `path_id` / `label` / `matched_signals` / `vetoed_signals` / `score` / `fallback`; a pure function over the same word lists as `/api/decision-paths`, so the classification rule lives in exactly one place — issue #95 | LLM (main SOUL decision entry) |
 | `/api/workers` | GET / PUT | list / register worker registry entries | LLM / frontend |
 | `/api/workers/<name>` | GET / DELETE | worker detail (api_key redacted) / delete | frontend |
 | `/api/workers/<name>/avatar` | GET | serve worker avatar bytes (file on disk, routed before the worker-detail fallback; see §11.5) | frontend |
+| `/api/workers/live` | GET | worker live snapshot (`live[]` + `active_run_ids`; read-only view of sse_bridge in-memory state; zero health probes — deliberately not reusing `/api/workers`; the route must be registered before the `/api/workers/` prefix match) | frontend (DashboardView worker live card) / reaper knock path |
+| `/api/workers/token-usage` | GET | per-worker token aggregation over a rolling window (`?window_s` default 86400, invalid/non-positive falls back): `harvest_contracts` JOIN `task_sessions` on `task_id` for the worker identity, a card counts when `tokens.captured_at` (fallback `updated_at`) falls inside the window; captured/missing discipline mirrors `_aggregate_run_tokens` (only `source=="api"` snapshots contribute); per-profile `source` = `api` / `partial` / `none` (`none` = nothing captured, the frontend shows a placeholder, never a fake zero); the route must be registered before the `/api/workers/` prefix match (same discipline as `live`) — dashboard-ui-20261105 R4 | frontend (DashboardView worker token bar chart, dashboard-fix-20261105 R-C) |
+| `/api/workers/subscribe_sse` | POST | tells the console process to start an SSE bridge daemon thread subscribing to a worker gateway's `/v1/runs/<run_id>/events` (`run_id` / `profile` / `session_id` required; `api_url` / `api_key` default from the registry); the caller is the `mw.cli __spawn-bg` subprocess, which exits right after `Popen`, so the console owns the thread lifecycle decoupled from the spawner — v9 | internal (`mw.cli` spawn path; not frontend / LLM) |
+| `/api/soul-template` | GET | worker SOUL generic template content, used to prefill the UI SOUL dialog; the language is resolved by `mw/i18n.resolve_lang()` (`soul_template.en.md` / `soul_template.zh-cn.md`) | frontend |
 | `/api/team-work/launch` | POST | register all cards + dispatch the first | LLM |
-| `/api/team-work/<run_id>/hold` | POST | freeze one ACTIVE run: ACTIVE→HOLD, records hold_reason/actor/time; does not kill the worker and does not clear current_card_id; idempotent on an already-HOLD run (200, was_already:true); 404 unknown run / 409 on a non-ACTIVE run; the run's running inbox task is set to `hold` (schedule_linkage reports the outcome) — issue #210 | LLM / operator |
-| `/api/team-work/<run_id>/hold/resume` | POST | thaw one HOLD run: HOLD→ACTIVE; a second ACTIVE run ⇒ 409 (partial UNIQUE index); the run's held inbox tasks return to `pending` at the queue head (added_at = min(pending.added_at) − 1); idempotent on an already-ACTIVE run — issue #210 | LLM / operator |
+| `/api/team-work/<run_id>/hold` | POST | freeze one ACTIVE run: ACTIVE→HOLD, records hold_reason/actor/time; does not kill the worker and does not clear current_card_id; idempotent on an already-HOLD run (200, was_already:true); 404 unknown run / 409 on a non-ACTIVE run; the run's running inbox task is set to `hold` (schedule_linkage reports the outcome) — issue #210 | frontend (TasksBoardView) / LLM / operator |
+| `/api/team-work/<run_id>/hold/resume` | POST | thaw one HOLD run: HOLD→ACTIVE; a second ACTIVE run ⇒ 409 (partial UNIQUE index); the run's held inbox tasks return to `pending` at the queue head (added_at = min(pending.added_at) − 1); idempotent on an already-ACTIVE run — issue #210 | frontend (TasksBoardView) / LLM / operator |
+| `/api/team-works` | GET | list Team Work runs (`mw/ledger.py:list_team_works`, newest first by `created_at DESC`) with a status whitelist that depends on the query flags: default (no flags) = `ACTIVE` only — the "one current run" semantics, unchanged; `?include_closed=true` = `ACTIVE`/`HOLD`/`CLOSED`/`ABORTED`; `?include_archived=true` = the above plus `ARCHIVED`. `HOLD` became visible under both flags in issue #214 (the board pulls with `include_closed=true`, so a frozen run shows in its history list); the default ACTIVE-only projection never includes `HOLD` | frontend / LLM |
+| `/api/team-work/rotate` | POST | deprecated stub — always `410` with a fixed message: the endpoint was removed in the 2026-10-02 revert and TODO.md advancement is done by main editing the file directly; the route is kept only so legacy callers get an explicit gone-answer | legacy callers (deprecated) |
 | `/api/dispatch` | POST | spawn a worker for one claimed card | LLM |
 | `/api/resume` | POST | relay a clarification answer to the worker's same session | LLM |
 | `/api/relay/confirm` | POST | explicit main-side receipt of a delivered report (`{"task_id": ...}`); idempotent, a dead-lettered card recovers on one receipt (issue #119) | LLM |
@@ -1546,6 +1608,13 @@ force-skipped by main as an explicit product decision.
 | `/api/tasks` | GET | task status (kanban + ledger); the list is a whitelist projection (`result` reduced to a `has_result` boolean, `harvest_log` / `workspace` / `exit_code` / `question` / `options` stripped, `block_kind` kept); `?fields=active` returns the active-run summary only and carries the derived boolean `current_card_delivery_failed` (same criterion as the detail `delivery.delivery_failed`, issue #178); each entry additionally carries the two derived delivery booleans `delivery_failed` / `delivery_dead` (auxiliary surface only — issue #167); the active-run summary additionally carries the derived run-level keys `state` / `holder_state` (issue #141 — fail-open `null` when derivation fails, the key is always present) and the `current_card_*` keys are always present with defaults when the current card has no contract row (issue #190) | frontend |
 | `/api/tasks/<id>` | GET | single task detail with the full record (`result` / `harvest_log` / `workspace` / `exit_code`); plus the `delivery` dictionary (`notify_attempts` / `notify_confirmed_at` / `notify_last_failed_at` / `notify_last_error` / `notify_dead_until` / `last_notified_at` + the derived booleans `delivery_failed` / `delivery_dead`); 404 when the task does not exist. **The detail endpoint remains the full delivery-observability surface** (the 5s console polling goes through `?fields=active`, which since issue #178 carries only the derived `current_card_delivery_failed` boolean — the badge surface) — issue #167 | frontend |
 | `/api/heartbeat` | GET | reaper liveness heartbeat (`reaper_alive` + `reaper_heartbeat_age_s`); the liveness rule is identical to the one in `/api/workers` | frontend |
+| `/api/task/cancel` | POST | cancel one task: kills the mw-side `spawn-bg` process and marks the ledger row `CANCELLED` so the reaper stops settling and knocking; `task_id` is required (422 when missing); mw only stops its own driver — the kanban card lifecycle belongs to main (1A boundary) | frontend (TasksBoardView cancel) |
+| `/api/task/archive` | POST | archive a leftover / historical task: marks the ledger row `ARCHIVED` and also kills the spawn wrapper — issue #104 root cause 4 aligned this path with `/api/task/cancel` so an archived card's worker stops producing commits; `task_id` is required (422 when missing) | frontend (TasksBoardView archive) |
+| `/api/reaper/status` | POST | reaper liveness diagnostics without ssh: `pgrep` lines for `mw.cli reaper` processes, the spawn dir and recent spawn-marker mtimes — call this first to decide whether a manual reap is needed | operator / LLM (ops diagnostics) |
+| `/api/reaper/reap-once` | POST | drive one reap cycle immediately through a `mw.cli reaper --once` subprocess (60s cap; answers `ok` / `returncode` / `stdout_tail` / `stderr_tail`) — the manual settlement trigger for when the reaper looks dead and ssh is unavailable | operator / LLM |
+| `/api/reaper/debug-todo-scan` | POST | deep diagnostics for stuck cards: per pending/errored ledger row shows the state, the TODO.md result-field parse result and which gate blocked the result scan (read-only, no harvest side effects) — diagnoses the reap-once-returns-empty-but-cards-stay-stuck case | operator / LLM |
+| `/api/events` | GET | SSE long connection (`text/event-stream`, one JSON per event line) streaming ledger task events; `?after=<id>` replays missed rows and the client's EventSource auto-reconnects carrying `last-event-id`; chat streaming deliberately does not use this surface — it carries task events, not chat messages (the chat stream goes through the gateway session surface) | LLM / external consumer (not the frontend chat) |
+| `/api/webhooks` | GET / POST | list the registered webhook callbacks (`has_secret` boolean only — the secret is never echoed) / register one (`{url, events[], secret}`; the url must be http(s), a non-list `events` is a 422; 201 on success); matched events are delivered on a daemon thread and delivery failures are logged only; deletion goes through `DELETE /api/webhooks/<id>` | LLM / operator |
 | `/api/settings` | GET / PUT | public settings | frontend |
 | `/api/compose/generate` | POST | generate worker compose | frontend |
 | `/api/upload` | POST | upload one file to the shared volume (base64 JSON body `{"name", "data"}`, data-URL prefix or bare base64; ≤20 MB per file; the name is sanitised to `[A-Za-z0-9_.-]` and the stored file is `<ts>_<token>_<name>` under `MW_UPLOAD_DIR` (default `/share_workspace/uploads`), so a worker container mounting that same volume can read it by absolute path); answers `{ok, path (absolute), name, bytes}`; over-limit / missing-data / bad-base64 are `422` with a fixed message (no exception echo) — issue #211 (the Team Work dialog attaches files this way and appends the absolute paths to the queued task detail, see §11.2) | frontend (chat attachments; the Team Work dialog) |
@@ -1553,6 +1622,8 @@ force-skipped by main as an explicit product decision.
 | `/api/gwconfig` | GET | gateway config | frontend |
 | `/api/lang` | GET | deployment language (see §10) | frontend |
 | `/api/w/<path>` | GET/PUT/POST | passthrough to worker gateway | frontend |
+| `/api/pixel/status` | GET | pixel-office availability (`enabled` from the settings/env switch, `running` from the proxy probe) — the frontend decides whether to show the pixel tab and whether the `/pixel` iframe proxy is usable | frontend |
+| `/api/webui/status` | GET | webui same-origin proxy availability (`enabled` from the `webui_proxy_enabled` settings key > env `WEBUI_PROXY_ENABLED` > auto-detect), so the frontend entry auto-points at `/webui/`; deliberately kept out of `SETTINGS_DEFAULTS` — a read-only probe that must not be pinned from the settings page — issue #196 | frontend |
 | `/webui` (+ `/webui/<path>`) | GET/POST/PUT/PATCH/DELETE | same-origin reverse proxy to the container-internal hermes-webui (prefix stripped; 302 never followed; a `3xx` `Location` whose `next=` is exactly the root (`/` or `%2F`) is rewritten to `next=/webui/` so a login round-trip lands back under the proxy — issue #199; SSE passed through line by line; enabled by the `webui_proxy_enabled` settings key > env `WEBUI_PROXY_ENABLED` > auto-detect of `/webui/start.sh`; answers `404 webui proxy disabled` when off) — issue #131 option B | user's browser |
 | `/api/sessions/<sid>/messages` | GET | proxy to the gateway session transcript; with `want`/`before` the console serves a windowed page itself (tail-anchored, cursor `o:<n>`), without those parameters it stays a plain passthrough (the rollback switch) | frontend |
 | `/api/cron/jobs` | GET | list cron jobs plus ticker liveness; the data plane is a JSON bridge to a venv subprocess (the console interpreter cannot import `cron.*`), and `state` is the derived `effective_job_state` | frontend |
@@ -1560,8 +1631,8 @@ force-skipped by main as an explicit product decision.
 | `/api/cron/jobs/<id>/pause` | POST | pause one job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
 | `/api/cron/jobs/<id>/resume` | POST | resume one paused job (action whitelist; 404 when the job is gone, 409 on a state conflict) | frontend |
 | `/api/cron/jobs/<id>/trigger` | POST | queue one job for the next scheduler tick (action whitelist; next-tick semantics, not a forced fire; 409 on a terminal job) | frontend |
-| `/api/schedule/tasks` | GET / POST | list the schedule queue (GET), pre-ordered server-side in four groups (running first, then `pending`, then `paused`, then finished+cancelled — issue #197 split `paused` into its own group; `hold` shares the `paused` band, issue #210), each group ordered `added_at ASC` with the terminal group ordered by completion moment `finished_at DESC` (§4.5), plus `next_task_id` (the head of the pending queue — **not** the countdown holder, which `/api/schedule/state` exposes as `countdown.next_task_id`; the two differ after a resume, §4.5) — the only schedule read surface that carries the whole list; and queue one schedule task (POST, 201): `detail` is required (400), `priority` must be one of `urgent`/`high`/`normal`/`low` (400), the title is derived from the first non-empty line of `detail`, and the write triggers an immediate re-evaluation of the engine — issue #164 | frontend |
-| `/api/schedule/state` | GET | the schedule engine snapshot: the persisted `auto_execute` switch, the countdown block (`active` / `ends_at` / `remaining_s` / `next_task_id` / `next_task_title`, `null` when no countdown is running; since issue #197 `next_task_id` is the countdown **holder** per §4.5, not necessarily the head of the queue), the `busy_reason` (`inbox_running` / `active_run` / `gateway_busy` / `gateway_probe_unavailable` / `null`; `inbox_running` means an inbox task is in `running` state — issue #206) and the `running_task_id` — issue #164; the `gateway_busy` reason covers both a busy gateway and a gateway reporting active agents, and the probe-unavailable case is kept distinct (issue #181) | frontend |
+| `/api/schedule/tasks` | GET / POST | list the schedule queue (GET), pre-ordered server-side in **four bands** (running first, then `pending`, then `paused` — `hold` rows share the `paused` band server-side, issue #210; `mw/schedule.py` is unchanged on this axis), then finished+cancelled — issue #197 split `paused` into its own group; the **frontend** renders the queue as **five groups** (running → hold → pending → paused → done+cancelled): `hold` is an independent group rendered directly above the pending group, not a member of the paused band — issue #214 (UX-V OQ-V-2), §4.5), each group ordered `added_at ASC` with the terminal group ordered by completion moment `finished_at DESC` (§4.5), plus `next_task_id` (the head of the pending queue — **not** the countdown holder, which `/api/schedule/state` exposes as `countdown.next_task_id`; the two differ after a resume, §4.5) — the only schedule read surface that carries the whole list; and queue one schedule task (POST, 201): `detail` is required (400), `priority` must be one of `urgent`/`high`/`normal`/`low` (400), the title is derived from the first non-empty line of `detail`, and the write triggers an immediate re-evaluation of the engine — issue #164 | frontend |
+| `/api/schedule/state` | GET | the schedule engine snapshot: the persisted `auto_execute` switch, the countdown block (`active` / `ends_at` / `remaining_s` / `total_s` / `next_task_id` / `next_task_title`, `null` when no countdown is running; `total_s` = the full countdown length, the progress-bar denominator added in dashboard-ui-20261105 R5; since issue #197 `next_task_id` is the countdown **holder** per §4.5, not necessarily the head of the queue), the `busy_reason` (`inbox_running` / `active_run` / `gateway_busy` / `gateway_probe_unavailable` / `null`; `inbox_running` means an inbox task is in `running` state — issue #206) and the `running_task_id` — issue #164; the `gateway_busy` reason covers both a busy gateway and a gateway reporting active agents, and the probe-unavailable case is kept distinct (issue #181) | frontend |
 | `/api/schedule/settings` | POST | persist the `auto_execute` switch; turning it **off** cancels the running countdown (the ticker drops it within its next tick, because the trigger condition no longer holds); turning it **on** again explicitly zeroes the countdown and starts a **full** five-minute countdown — it does not resume the remaining time of the previous one — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/update` | POST | edit a queued task; only a `paused` task may be edited (409 otherwise) and the row stays `paused` after the edit; `detail` (400 when blank) and `priority` (400 when invalid) are validated — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/pause` | POST | `pending -> paused`; a task that does not exist is a 404, an illegal transition is a 409 — issue #164 | frontend |

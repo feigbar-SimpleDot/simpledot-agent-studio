@@ -404,8 +404,11 @@ export default function WorkersView({ onChanged, onChat }) {
       setDlg((d) => ({ ...d, error: t('workers.err_name_charset') })); return
     }
     if (!(f.api_url || '').trim()) { setDlg((d) => ({ ...d, error: t('workers.err_api_url_required') })); return }
-    if ((f.api_key || '').trim().length < 16) { setDlg((d) => ({ ...d, error: t('workers.err_api_key_required_length') })); return }
+    // issue #228: 编辑态 api_key「留空 = 不修改」—— GET /api/workers 已剥离
+    // api_key, 弹窗不再回填明文, 故 16 位必填只在注册(新增)时校验; 编辑态
+    // 留空由后端 api_registry_save 合并语义保留旧密钥。
     const isEdit = dlg.mode === 'edit'
+    if (!isEdit && (f.api_key || '').trim().length < 16) { setDlg((d) => ({ ...d, error: t('workers.err_api_key_required_length') })); return }
     try {
       const next = { ...workers }
       if (isEdit && dlg.origName && dlg.origName !== name) delete next[dlg.origName]
@@ -414,8 +417,9 @@ export default function WorkersView({ onChanged, onChat }) {
       const entry = {
         runner: 'api',
         api_url: f.api_url.trim(),
-        api_key: f.api_key.trim(),
       }
+      // issue #228: 编辑态留空 = 不提交该字段 (后端保留旧值); 显式新值照常覆盖。
+      if ((f.api_key || '').trim()) entry.api_key = f.api_key.trim()
       // 简介: main 拆解时读它做语义匹配(比裸标签更有料), 有内容才写
       const desc = (f.description || '').trim()
       if (desc) entry.description = desc
@@ -461,7 +465,9 @@ export default function WorkersView({ onChanged, onChat }) {
     const e = workers[name] || {}
     setDlg({
       mode: 'edit', origName: name,
-      f: { name, api_url: e.api_url || '', api_key: e.api_key || '',
+      // issue #228: api_key 不再从 GET 回填 (后端已剥离, 明文不出服务端);
+      // 留空 = 不修改, 由后端合并语义保留旧密钥。
+      f: { name, api_url: e.api_url || '', api_key: '',
            description: e.description || '',
            tags: (e.scope?.tags || []).join(', '),
            excludes: (e.scope?.excludes || []).join(', '),
@@ -599,10 +605,15 @@ export default function WorkersView({ onChanged, onChat }) {
               <div className="hint">{t('workers.field.api_url_hint')}</div>
             </div>
             <div>
-              <label className="label">{t('workers.field.api_key')} *</label>
-              <input className="input" placeholder={t('workers.field.api_key_hint')}
+              {/* issue #228: 编辑态 api_key 不回填明文, 「留空 = 不修改」 */}
+              <label className="label">{t('workers.field.api_key')}{dlg.mode === 'edit' ? '' : ' *'}</label>
+              <input className="input"
+                placeholder={t(dlg.mode === 'edit' ? 'workers.field.api_key_edit_hint' : 'workers.field.api_key_hint')}
                 defaultValue={dlg.f.api_key || ''}
                 onChange={(e) => setDlg((d) => ({ ...d, f: { ...d.f, api_key: e.target.value } }))} />
+              {dlg.mode === 'edit' && (
+                <div className="hint">{t('workers.field.api_key_edit_hint')}</div>
+              )}
             </div>
             <div>
               <label className="label">{t('workers.field.tagline_label')}</label>

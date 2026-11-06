@@ -1342,20 +1342,6 @@ def _worker_alive_for_reap(ledger, sess, base, task_id, now) -> tuple:
     return False, "liveness_unknown"
 
 
-def _relay_suppress_window(threshold_s: float) -> float:
-    """F4b (2026-10-09): relay 送达抑制窗口 (秒)。
-
-    env MW_REAPER_RELAY_SUPPRESS_WINDOW_S; 未设/非法 → 默认 =
-    threshold (stuck_after_min*60)。语义: 距本 run 最近一次 relay
-    送达不足一个 stuck 窗口 → main 刚被唤醒, 不该再被兜底敲门打扰。
-    """
-    v = os.environ.get("MW_REAPER_RELAY_SUPPRESS_WINDOW_S", "")
-    try:
-        return float(v) if v else threshold_s
-    except ValueError:
-        return threshold_s
-
-
 def _query_initiator_last_active(sid: str) -> float | None:
     """F4b (2026-10-09): 经 gateway 读 initiator session 的 last_active (epoch)。
 
@@ -1723,177 +1709,82 @@ def _notify_main_of_session_hang(ledger, base, results, registry=None,
 
 
 def _notify_null_slot(ledger, active_run, results, registry=None,
-                     stuck_after_min=30, base="."):
-    """F4 (2026-10-04): NULL 槽兜底敲门。
+                      stuck_after_min=30, base="."):
+    """F4 (issue #205 升级): 纯 run 级活性敲门。
 
-    形状: run ACTIVE + current_card_id=NULL + 名下还有未结算卡
-    (PENDING/ERROR/BLOCKED)。语义 = main 把上一张结算后没有 advance
-    下一张 (忘派 / turn 死在中间 / resume 没接住), 整条链掉进
-    「reaper 只看 current_card → NULL → 什么都不做」的盲区。
-    本次 201 演练 t_321617ab 卡死 26 分钟零敲门就是这个形状。
+    形状: run ACTIVE + current_card_id IS NULL + 槽位闲置超 stuck 窗口
+    + 窗口内未敲过 —— 四条件全部 run 级 (只读 team_work_runs, 不碰
+    harvest_contracts / task 级标志位)。main advance (占槽) 或 close
+    (非 ACTIVE) 任一发生, 触发条件即自灭 —— 天然自失效。
 
-    方案2 把结算面收窄到 current_card 是对的, 但收窄后 NULL 槽成了
-    静默黑洞 —— 兜底敲门补上这个洞: 闲置超过 stuck 窗口敲一次,
-    run 级去重 (last_null_slot_knock_at), 不刷屏。
+    旧版 task 级判定已按 issue #205 根因裁决全部移除: 「名下有未结算
+    卡」附加条件 (全结算盲区)、dispatched/all_undispatched 双基准、
+    worker 活体抑制层、relay 送达抑制层、文案中的 pending 卡清单。
+    task 级 confirmed/标志位不是活性信号; 报告重投职责完整交还 relay
+    (relay 扫描 SQL 红线通道, 本次一字未动)。
+
+    `base` 为未用参数, 保留以兼容调用点与既有测试的调用形态。
     """
     if not active_run:
         return
     if active_run.get("current_card_id") is not None:
-        return  # 有当前卡, 走正常 stuck 路径
+        return  # 槽被占, 走 stuck 路径
     run_id = active_run["run_id"]
-    pending = ledger.pending_in_team_work(run_id)
-    if not pending:
-        return  # 名下没有未结算卡 = 链真的走完了, 不是卡死
     threshold = stuck_after_min * 60
     now = time.time()
+
+    # 去重: run 级窗口戳 (last_null_slot_knock_at, 语义不变)
     last_knock = active_run.get("last_null_slot_knock_at")
     if last_knock and (now - last_knock) < threshold:
         return  # 本窗口已敲过
 
-    # SSE-FIX-F4 (2026-10-08, F3b 移植): 闲置基准只算**真正派发过**的卡
-    # (存在 spawn marker 或 last_progress_at 非空)。从未派发的排队卡
-    # last_progress_at 为 NULL, 旧兜底落到 updated_at = launch 时刻 →
-    # 槽位一空闲置度瞬间 = 距 launch 分钟数, 拿排队卡出生时间当心跳,
-    # 必然误报。剔除后:
-    #   - 有已派发卡 → 以它们最近的 progress/notified 时刻为基准;
-    #   - 名下全部未派发 (链刚 launch、main 还没派第一张) → 以 run 行
-    #     created_at/updated_at 为基准, 文案改「等待 main 派发」。
-    dispatched = [r for r in pending
-                  if read_marker(base, r["task_id"])
-                  or _row_get(r, "last_progress_at")]
-    all_undispatched = not dispatched
-    if all_undispatched:
-        # F4b (2026-10-09): 闲置基准 = NULL 槽起点。
-        # current_card_cleared_at = 上次被清成 NULL 的时刻;
-        # NULL (run 出生即 NULL / 迁移前旧行) 兜底 created_at,
-        # 行为退化为「距 launch 闲置」但不劣于现状 (REQ §5 兼容)。
-        # 旧代码 updated_at 列在 team_work_runs 根本不存在,
-        # 永远落 created_at → 「等待 main 派发 95.9 分钟」误报。
-        #
-        # s2 (issue #9 / AC9-3 (a) 创建时间基准误敲): 严控 created_at
-        # 兜底必须满足至少一个真实信号:
-        #   (i)  current_card_cleared_at 存在 → 走它, 不回到 created_at,
-        #        排除「距 launch N 分钟」误敲;
-        #   (ii) 仅 created_at 兜底且距 launch < 软静默阈值
-        #        (默认 600s = 10min, 远大于 stuck_after_min 默认 30min
-        #         折合 1800s 已超, 但若 main 设了很短 stuck_after 也兜底)
-        #        → run 刚出生一拍即落, 不敲。
-        cleared_at = active_run.get("current_card_cleared_at")
-        created_at = active_run.get("created_at")
-        base_ts = cleared_at or created_at
-        if not base_ts:
+    # 闲置基准: 清槽时刻 (clear_team_work_current_card 写入);
+    # NULL (run 出生即空槽 / 迁移前旧行) 兜底 created_at + 出生宽限。
+    cleared_at = active_run.get("current_card_cleared_at")
+    created_at = active_run.get("created_at")
+    base_ts = cleared_at or created_at
+    if not base_ts:
+        return
+    if not cleared_at and created_at:
+        grace_s = int(os.environ.get("MW_REAPER_LAUNCH_GRACE_S", "600"))
+        if (now - created_at) < grace_s:
+            results.append({"task_id": run_id,
+                            "trigger": "null_slot_knock",
+                            "verdict": "SUPPRESSED_LAUNCH_GRACE",
+                            "note": (f"run 出生 {int(now - created_at)}s "
+                                     f"< grace {grace_s}s, main 可能"
+                                     "还在派第一张, 不敲")})
             return
-        stamps = [base_ts]
-        # 软静默期: 若只能用 created_at (即刚出生跑/迁移前旧行没 cleared_at),
-        # 距离 now 不足 MW_REAPER_LAUNCH_GRACE_S (默认 600s) 时, 直接
-        # 视为「run 刚 birth, main 还没派第一张」, 不敲 —— 旧版的「挂 95min
-        # 等待派发」误报就是这条路径。clear 戳存在的卡不受此限。
-        if not cleared_at and created_at:
-            grace_s = int(os.environ.get(
-                "MW_REAPER_LAUNCH_GRACE_S", "600"))
-            if (now - created_at) < grace_s:
-                results.append({"task_id": run_id,
-                               "trigger": "null_slot_knock",
-                               "verdict": "SUPPRESSED_LAUNCH_GRACE",
-                               "note": (f"run 出生 {int(now - created_at)}s "
-                                       f"< grace {grace_s}s, main 可能"
-                                       "还在派第一张, 不敲")})
-                return
-    else:
-        stamps = []
-        for r in dispatched:
-            for col in ("last_progress_at", "last_notified_at", "updated_at"):
-                v = _row_get(r, col)
-                if v:
-                    stamps.append(v)
-        if not stamps:
-            return
-    idle = now - max(stamps)
+    idle = now - base_ts
     if idle <= threshold:
         return
 
-    # SSE-FIX-F3/F4: 敲前对名下已派发卡的 worker 做活体查询 ——
-    # 任一 worker 活着 (thinking 或事件新鲜) 即抑制, 不敲。
+    # initiator 活体抑制 (run 级, 保留): main 正在 turn 里推进不打扰。
+    # sid 直接读 run 行 initiator_session (不再反查 pending 卡)。
+    # env 开关 MW_REAPER_INITIATOR_LIVENESS 口径不变。
+    sid = active_run.get("initiator_session")
     suppress_window_s = int(os.environ.get(
         "MW_REAPER_SUPPRESS_WINDOW_S", "60"))
-    for r in dispatched:
-        try:
-            sess = ledger.get_session(r["task_id"])
-            profile = _row_get(sess, "profile")
-            session_id = _row_get(sess, "session_id")
-            if sess and session_id and profile:
-                entry = _query_console_liveness(profile, session_id)
-                if _is_alive_entry(entry, now, suppress_window_s):
-                    results.append({"task_id": run_id,
-                                  "trigger": "null_slot_knock",
-                                  "verdict": "SUPPRESSED_ALIVE",
-                                  "note": (f"{r['task_id']} worker 活跃 "
-                                          f"(console live: "
-                                          f"{entry.get('last_event_type','?')} "
-                                          f"{int(now - (entry.get('last_event_ts') or 0))}s 前)")})
-                    return
-        except Exception:
-            pass  # fail-open: 查询异常不抑制, 继续走敲门判定
-
-    # F4b 层2 (2026-10-09): relay 送达抑制 —— 本 run 名下任一卡
-    # (含刚结算的当前卡) 的 relay 报告在窗口内已确认/在途送达
-    # initiator → main 刚被唤醒正在处理, 兜底敲门是重复打扰, 不敲。
-    relay_window_s = _relay_suppress_window(threshold)
-    try:
-        _rr = ledger.conn.execute(
-            "SELECT MAX(COALESCE(notify_confirmed_at, last_notified_at)) "
-            "AS last_relay FROM harvest_contracts "
-            "WHERE team_work_run_id=?", (run_id,)).fetchone()
-        _last_relay = _rr["last_relay"] if _rr else None
-        if _last_relay and (now - _last_relay) < relay_window_s:
-            results.append({"task_id": run_id,
-                           "trigger": "null_slot_knock",
-                           "verdict": "SUPPRESSED_RELAY",
-                           "note": (f"relay {int(now - _last_relay)}s 前已"
-                                    f"送达 initiator, main 刚被唤醒")})
-            return
-    except Exception:
-        pass  # fail-open: 查询异常不抑制, 继续走后续判定
-
-    # F4b 层3 (2026-10-09): initiator 活体抑制 (默认开,
-    # MW_REAPER_INITIATOR_LIVENESS="0" 关闭)。main session 在抑制
-    # 窗口内有活动 → 正在 turn 里推进, 不敲。每 run 至多 1 次
-    # gateway HTTP (只查 initiator 一个 session)。
-    # s2 (issue #9 / AC9-2) 不再加「all delivered 也抑制」层 —— 与
-    # F4b RELAY 抑制层 (relay_window_s 默认 = threshold_s) 重叠, 只会
-    # 把「已 delivered 但 main 已转入新一轮沉睡」的合理敲门场景误拦;
-    # stuck_notify 那条路径的 delivered 守门才是唯一刚需 (那里没
-    # F4b RELAY 抑制覆盖)。
-    sid = ledger.get_initiator(pending[0]["task_id"])
     if os.environ.get("MW_REAPER_INITIATOR_LIVENESS", "1") != "0":
-        try:  # F4b fail-open: 活体查询异常不抑制, 继续走敲门
+        try:  # fail-open: 活体查询异常不抑制, 继续走敲门 (AC-8)
             if sid:
                 _la = _query_initiator_last_active(sid)
                 if _la and (now - _la) < suppress_window_s:
                     results.append({"task_id": run_id,
-                                   "trigger": "null_slot_knock",
-                                   "verdict": "SUPPRESSED_INITIATOR",
-                                   "note": (f"initiator {sid} "
-                                           f"{int(now - _la)}s 前有活动")})
+                                    "trigger": "null_slot_knock",
+                                    "verdict": "SUPPRESSED_INITIATOR",
+                                    "note": (f"initiator {sid} "
+                                             f"{int(now - _la)}s 前有活动")})
                     return
         except Exception:
-            pass  # fail-open: 异常不抑制, 照敲 (AC-8)
-
+            pass  # fail-open: 异常不抑制, 照敲
     if not sid:
         return
     mins = round(idle / 60, 1)
-    ids = ", ".join(r["task_id"] for r in pending[:5])
-    if all_undispatched:
-        # 全部未派发 = main 侧还没 advance, 不是 worker 的锅
-        msg = (f"【mw 兜底敲门】run {run_id[:12]} 已 {mins} 分钟"
-               f"等待 main 派发。名下 {len(pending)} 张未结算: {ids}。"
-               f" 请 advance 下一张 (POST /api/team-work/{run_id}/advance) "
-               f"或 close run (POST /api/team-work/{run_id}/close)。")
-    else:
-        msg = (f"【mw 兜底敲门】run {run_id[:12]} 闲置 {mins} 分钟。"
-               f"名下 {len(pending)} 张未结算: {ids}。"
-               f" worker 活跃可忽略, 否则 close run "
-               f"(POST /api/team-work/{run_id}/close)。")
+    msg = (f"【mw 兜底敲门】run {run_id[:12]} 槽位已空 {mins} 分钟\n"
+           f"(current_card_id=NULL)。链未走完请 advance 下一张\n"
+           f"(POST /api/team-work/{run_id}/advance)；链已走完请 close run\n"
+           f"(POST /api/team-work/{run_id}/close)。")
     gw = os.environ.get("MW_GATEWAY_URL", "http://127.0.0.1:8642")
     key = os.environ.get("API_SERVER_KEY", "")
     if not key:
@@ -1904,158 +1795,13 @@ def _notify_null_slot(ledger, active_run, results, registry=None,
             "WHERE run_id=?", (now, run_id))
         ledger.conn.commit()
         _send_to_main(sid, msg, gw, key, ledger.path,
-                     registry=registry, notify_task=None)
+                      registry=registry, notify_task=None)
         ledger.emit_event("team_work.null_slot_knock", run_id,
-                         {"idle_minutes": mins, "pending": ids})
+                          {"idle_minutes": mins})
         results.append({"task_id": run_id, "trigger": "null_slot_knock",
-                       "verdict": "NOTIFIED"})
-    except Exception as e:
-        results.append({"task_id": run_id, "trigger": "null_slot_knock",
-                       "verdict": "ERROR", "error": str(e)[:150]})
-
-
-def _undelivered_knock_max() -> int:
-    """「已收割未送达」兜底敲门的次数上限 (issue #177, 2026-10-31)。
-
-    env MW_REAPER_UNDELIVERED_KNOCK_MAX (默认 3); 非法值/非正数回落 3
-    (容错口径同 _binding_event_dedup_min)。计数面复用 mw_events
-    (team_work.undelivered_knock 事件, run 级), 零 schema 变更。
-    """
-    v = os.environ.get("MW_REAPER_UNDELIVERED_KNOCK_MAX", "")
-    try:
-        n = int(v) if v else 3
-    except (TypeError, ValueError):
-        return 3
-    return n if n > 0 else 3
-
-
-def _notify_undelivered_harvest(ledger, active_run, results, registry=None,
-                                stuck_after_min=30, base="."):
-    """F4 补档 (2026-10-25 issue #103): 「已收割未送达 main」空窗敲门。
-
-    形状: run ACTIVE + current_card_id=NULL (槽位空) + 名下存在
-    HARVESTED 且 notify_confirmed_at IS NULL 的卡 + 闲置 > stuck 窗口。
-
-    为什么原 F4 覆盖不到 (issue #103 实案 t_dc11c891):
-      原 F4 的锚点是「run 派发/等待」—— 名下有未结算卡 (PENDING/ERROR/
-      BLOCKED) 才敲。而「已收割未送达」的卡既不未结算 (HARVESTED), 槽位
-      又已清空 (结算时清槽), 原 F4 直接 return ⇒ 8 次投递全失败后 main
-      侧 23+ 分钟零信号, 靠人工追问才发现交付已落袋。
-
-    去重: 复用 run 级 last_null_slot_knock_at (同一窗口至多敲一次),
-    避免与原 F4 互相刷屏。
-    """
-    if not active_run:
-        return
-    if active_run.get("current_card_id") is not None:
-        return  # 有当前卡, 走正常结算/stuck 路径
-    run_id = active_run["run_id"]
-    # 「已收割未送达」候选卡
-    try:
-        undelivered = ledger.harvested_undelivered(run_id)
-    except Exception:
-        return
-    if not undelivered:
-        return  # 名下没有已收割未送达卡 = 不是这个空窗
-    threshold = stuck_after_min * 60
-    now = time.time()
-    last_knock = active_run.get("last_null_slot_knock_at")
-    if last_knock and (now - last_knock) < threshold:
-        return  # 本窗口已敲过 (与原 F4 共用去重戳)
-    # 闲置基准: 这些卡最后一次有动静的时刻 (结算/投递尝试) —— 用最早
-    # 的那个, 保证「最久没送达的那张」决定闲置时长。
-    stamps = []
-    for r in undelivered:
-        for col in ("notify_last_failed_at", "last_notified_at",
-                    "last_progress_at", "updated_at"):
-            v = _row_get(r, col)
-            if v:
-                stamps.append(float(v))
-    if not stamps:
-        return
-    idle = now - min(stamps)
-    if idle <= threshold:
-        return  # 还在 stuck 窗口内, 不敲
-    # issue #177 (2026-10-31): 兜底敲门有界化 —— 计数面复用 mw_events
-    # (run 级 team_work.undelivered_knock 事件, 零 schema 变更), 只统计
-    # 「最新报告之后」的敲门: set_worker_report 内容变化会刷新 updated_at
-    # 并清 confirmed_at ⇒ 新报告 = 新事件 ⇒ 计数自然归零 (重新武装口径)。
-    try:
-        newest_report = max(float(_row_get(r, "updated_at") or 0.0)
-                            for r in undelivered)
-    except Exception:
-        newest_report = 0.0
-    try:
-        cnt = ledger.conn.execute(
-            "SELECT COUNT(*) AS n FROM mw_events "
-            "WHERE task_id=? AND event_type='team_work.undelivered_knock' "
-            "AND created_at > ?", (run_id, newest_report)).fetchone()
-        knock_count = int(cnt["n"]) if cnt else 0
-    except Exception:
-        knock_count = 0  # 查询异常 ⇒ 不拦敲门 (宁可多敲, 不可漏敲)
-    if knock_count >= _undelivered_knock_max():
-        # 达限: 不再敲。仅首次达限时 emit exhausted 事件 (存在性去重与
-        # 计数同口径: 最新报告之后已有 exhausted 事件 ⇒ 不重复)。
-        try:
-            seen = ledger.conn.execute(
-                "SELECT 1 FROM mw_events WHERE task_id=? "
-                "AND event_type='team_work.undelivered_knock_exhausted' "
-                "AND created_at > ? LIMIT 1",
-                (run_id, newest_report)).fetchone()
-            if not seen:
-                ledger.emit_event(
-                    "team_work.undelivered_knock_exhausted", run_id, {
-                        "knocks": knock_count,
-                        "max": _undelivered_knock_max(),
-                        "cards": ", ".join(r["task_id"]
-                                           for r in undelivered[:5]),
-                        "next_action": (
-                            "manual: 兜底敲门已达上限, 平台不再自动重敲; "
-                            "请人工 GET /api/tasks 读报告后补 "
-                            "notify_confirmed_at / resume / re-route"),
-                    })
-        except Exception:
-            pass
-        results.append({"task_id": run_id, "trigger": "undelivered_knock",
-                        "verdict": "SKIP",
-                        "note": f"knock_exhausted({knock_count})"})
-        return
-    ids = ", ".join(r["task_id"] for r in undelivered[:5])
-    n = len(undelivered)
-    # 投递失败留痕信息 (issue #103): 让敲门文案带上失败次数/原因, main
-    # 一眼看出「不是没收到, 是投递一直失败」。
-    detail = ""
-    try:
-        r0 = undelivered[0]
-        att = _row_get(r0, "notify_attempts") or 0
-        err = (_row_get(r0, "notify_last_error") or "")[:80]
-        detail = f" (relay 投递已失败 {att} 次" + (f": {err}" if err else "") + ")"
-    except Exception:
-        pass
-    sid = ledger.get_initiator(undelivered[0]["task_id"])
-    if not sid:
-        return
-    gw = os.environ.get("MW_GATEWAY_URL", "http://127.0.0.1:8642")
-    key = os.environ.get("API_SERVER_KEY", "")
-    if not key:
-        return
-    mins = round(idle / 60, 1)
-    msg = (f"【mw 兜底敲门】run {run_id[:12]} 有 {n} 张已结算卡未送达 main"
-           f"{detail}。闲置 {mins} 分钟。卡: {ids}。"
-           f" 请 GET /api/tasks 读报告后裁决, 或确认已处理。")
-    try:
-        ledger.conn.execute(
-            "UPDATE team_work_runs SET last_null_slot_knock_at=? "
-            "WHERE run_id=?", (now, run_id))
-        ledger.conn.commit()
-        _send_to_main(sid, msg, gw, key, ledger.path,
-                     registry=registry, notify_task=None)
-        ledger.emit_event("team_work.undelivered_knock", run_id,
-                         {"idle_minutes": mins, "cards": ids, "count": n})
-        results.append({"task_id": run_id, "trigger": "undelivered_knock",
                         "verdict": "NOTIFIED"})
     except Exception as e:
-        results.append({"task_id": run_id, "trigger": "undelivered_knock",
+        results.append({"task_id": run_id, "trigger": "null_slot_knock",
                         "verdict": "ERROR", "error": str(e)[:150]})
 
 
@@ -2319,25 +2065,15 @@ def reap_once(*, ledger: Ledger, hermes_home: str, base: str,
     except Exception as e:
         results.append({"task_id": "_meta", "trigger": "session_hang",
                        "verdict": "ERROR", "error": str(e)[:200]})
-    # 3.5) F4: NULL 槽兜底敲门 —— run ACTIVE 但 current_card_id=NULL
-    # 且名下有未结算卡时, 正常 stuck 路径 (只看 current_card) 完全静默,
-    # 这里补敲一次。放在 stuck 之后: 有当前卡时本函数直接 return, 不重复。
+    # 3.5) F4 (issue #205): 纯 run 级活性敲门 —— run ACTIVE 但
+    # current_card_id=NULL 且槽位闲置超窗时敲一次「advance 或 close」。
+    # 判定全 run 级、自失效; 报告重投由 relay (红线通道) 负责。
+    # 放在 stuck 之后: 有当前卡时本函数直接 return, 不重复。
     try:
         _notify_null_slot(ledger, active_run, results, registry=registry,
                          stuck_after_min=stuck_after_min, base=base)
     except Exception as e:
         results.append({"task_id": "_meta", "trigger": "null_slot_knock",
-                       "verdict": "ERROR", "error": str(e)[:200]})
-    # 3.6) F4 补档 (2026-10-25 issue #103): 「已收割未送达 main」空窗
-    # 敲门。原 F4 锚在「名下有未结算卡」, 收割后槽清空的卡不在其中 ⇒
-    # 投递全失败时 main 侧零信号 (issue #103 实案 23+ 分钟)。放在原 F4
-    # 之后: 两者共用 last_null_slot_knock_at 去重戳, 同窗口至多敲一次。
-    try:
-        _notify_undelivered_harvest(ledger, active_run, results,
-                                    registry=registry,
-                                    stuck_after_min=stuck_after_min, base=base)
-    except Exception as e:
-        results.append({"task_id": "_meta", "trigger": "undelivered_knock",
                        "verdict": "ERROR", "error": str(e)[:200]})
     # 3.7) issue #114: 终态卡新产出告警 —— 已结算 (终态) 的卡在工作区
     # 仍有结算后的新文件写入/git 活动时, 敲一次 main (每 task 只一次,

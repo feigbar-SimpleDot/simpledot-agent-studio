@@ -221,11 +221,11 @@ test('E5b 3 个死键双边已删 (btn.new / form.new_title / toast.created)', (
 test('E5c empty.hint 双边指向协作入口 (不再指向已删的新建按钮)', () => {
   assert(!en.schedule.empty.hint.includes('New Task'),
     'en empty.hint 仍指向已删的 New Task 按钮')
-  assert(en.schedule.empty.hint.includes('multi-agent collaboration'),
+  assert(en.schedule.empty.hint.includes('Add Task'),
     'en empty.hint 未指向协作入口')
   assert(!zh.schedule.empty.hint.includes('新建任务'),
     'zh empty.hint 仍指向已删的新建任务按钮')
-  assert(zh.schedule.empty.hint.includes('发起多智能体协作'),
+  assert(zh.schedule.empty.hint.includes('添加任务'),
     'zh empty.hint 未指向协作入口')
 })
 test('E5d 协作入口按钮词条与 toast 键双边在位 (入口文案链完整)', () => {

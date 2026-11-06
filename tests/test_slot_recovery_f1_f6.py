@@ -8,7 +8,7 @@
   F3  resume 超时 → 视为已受理 (ok=True, 拨回 PENDING), 非超时错误仍抛
   F4  run ACTIVE + 槽 NULL + 名下有未结算卡 + 闲置超阈值 → 兜底敲门一次
   F4b 同窗口第二次不重复敲 (run 级去重)
-  F4c 名下无未结算卡 → 不敲 (链走完了)
+  F4c 全结算+槽空超窗 → 必敲 (issue #205 盲区修复, 语义反转)
   F5  set_worker_report 内容变化 → 清 dead_until/attempts
   F5b _send_to_main 429 → 短退避不计 attempts; 200 → confirm_delivered
   F6  stuck 敲门活体抑制: 探 worker 最后消息 timestamp, 距 now < 窗口
@@ -296,11 +296,11 @@ def test_f4_null_slot_knock():
     os.environ["API_SERVER_KEY"] = "test-key"
     try:
         _seed_run_with_card(led, "run_f4", "t_f4", current=None)
-        # 把闲置时间拉到阈值之外
+        # 把闲置时间拉到阈值之外 (issue #205: 闲置基准 = run 级清槽时刻)
         old = time.time() - 3600
         led.conn.execute(
-            "UPDATE harvest_contracts SET last_progress_at=?, updated_at=? "
-            "WHERE task_id='t_f4'", (old, old))
+            "UPDATE team_work_runs SET current_card_cleared_at=? "
+            "WHERE run_id='run_f4'", (old,))
         led.conn.commit()
         sent, fake = _sent_messages()
         with mock.patch.object(reaper, "_send_to_main", fake):
@@ -310,7 +310,8 @@ def test_f4_null_slot_knock():
                                     registry={}, stuck_after_min=5)
         check("F4 兜底敲门发出", len(sent) == 1, f"got {len(sent)}")
         check("F4 消息含兜底敲门", sent and "兜底敲门" in sent[0][1])
-        check("F4 消息列出未结算卡", sent and "t_f4" in sent[0][1])
+        check("F4 消息 run 级槽位已空", sent and "槽位已空" in sent[0][1])
+        check("F4 消息含 advance", sent and "advance" in sent[0][1])
         run2 = led.get_team_work("run_f4")
         check("F4 记录 knock 时刻",
               run2.get("last_null_slot_knock_at") is not None)
@@ -324,21 +325,24 @@ def test_f4_null_slot_knock():
         os.unlink(path)
 
 
-def test_f4c_no_pending_no_knock():
+def test_f4c_all_settled_null_slot_knocks():
+    """issue #205 语义反转: 全结算+槽空超窗 ⇒ 必敲 (旧代码此处静默盲区)。"""
     led, path = fresh_ledger()
     try:
         _seed_run_with_card(led, "run_f4c", "t_f4c", current=None)
         led.set_harvest("t_f4c", "HARVESTED", exit_code=0)
         old = time.time() - 3600
         led.conn.execute(
-            "UPDATE harvest_contracts SET updated_at=? WHERE task_id='t_f4c'",
-            (old,))
+            "UPDATE team_work_runs SET current_card_cleared_at=? "
+            "WHERE run_id='run_f4c'", (old,))
         led.conn.commit()
         sent, fake = _sent_messages()
         with mock.patch.object(reaper, "_send_to_main", fake):
             reaper._notify_null_slot(led, led.get_active_team_work(), [],
                                     registry={}, stuck_after_min=5)
-        check("F4c 链走完 (无未结算卡) 不敲", len(sent) == 0, f"got {sent}")
+        check("F4c 全结算+槽空超窗必敲", len(sent) == 1, f"got {sent}")
+        check("F4c 文案 run 级 (无 task id)",
+              sent and "槽位已空" in sent[0][1] and "t_f4c" not in sent[0][1])
     finally:
         led.close()
         os.unlink(path)

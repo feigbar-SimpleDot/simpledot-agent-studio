@@ -100,7 +100,7 @@ task.stuck
 # console.settings.* / console.team_work.* / console.soul.read_failed:
 #   值逐字=console.py 校验消息原文 (42 键, 脚本核对全部在码)。按架构
 #   §5.2 这些是 API error message 域词条; 前端卡 t_2899c2a3 已完成
-#   ui/** i18next 词条表(778 keys, 随 ui/src/i18n/locales/*.json 增删同步)覆盖前端展示, 后端 error 值写时 t()
+#   ui/** i18next 词条表(键数随 ui/src/i18n/locales/*.json 增删同步)覆盖前端展示, 后端 error 值写时 t()
 #   接线属 §5.3 登记遗留, 由 final-submit/code-review 裁决统一接线,
 #   本卡不越界重排 console.py 校验函数 (零逻辑红线最小 diff)。
 # console.lang.*: GET /api/lang 与前端语言面板词条, 值预抄自架构文档;

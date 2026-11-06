@@ -138,7 +138,7 @@ export const api = {
   // issue #75 s9 M-1: net() 包在最内层 —— 下方 .catch() 的 fail-soft 兜底
   // 语义逐字不变 (仍返回 stub), 但错误对象已是带 endpoint 的 ApiError。
   workflows: () => net(
-    fetch('/api/workflows').then((r) => j(r, '/api/workflows')),
+    fetch('/api/workflows', { signal: AbortSignal.timeout(5000) }).then((r) => j(r, '/api/workflows')),
     '/api/workflows').catch(() => ({
     // Stub fallback: 后端尚未实现时,前端不阻塞
     // [en] E2 fix: description routed through t() (locale-aware stub copy).
@@ -197,6 +197,19 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {}),
+    }).then(j),
+  // issue #210 补入口 (Z批): run 冻结/恢复。契约零改动，仅前端封装。
+  teamWorkHold: (runId, body) =>
+    fetch(`/api/team-work/${encodeURIComponent(runId)}/hold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || { operator: 'console-ui' }),
+    }).then(j),
+  teamWorkResume: (runId, body) =>
+    fetch(`/api/team-work/${encodeURIComponent(runId)}/hold/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || { operator: 'console-ui' }),
     }).then(j),
   // 工作目录: 列 /share_workspace/projects/ 下所有目录 + 新建
   // issue #75 s9 M-1: net() 在内层, fail-soft .catch() 语义不变。

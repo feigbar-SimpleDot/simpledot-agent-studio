@@ -289,15 +289,18 @@ function sealTurnThinking(setMessages, auth) {
 // 轮询、回合末权威收口全部住在这里, 不再有两套 switch 漏改风险。
 // deps: { setMessages, setRunInfo, setPhase, turnDedupRef, reasoningSeenRef,
 //         reasoningTimerRef, runIdRef, fetchMessages,
-//         setDecodeRate, fetchSessionTokens }   // #212 新增两依赖
+//         setDecodeRate, fetchSessionTokens, seenIdsRef }   // #212 新增两依赖; #216 新增 seenIdsRef
 // fetchMessages: async () => raw[]  (GET session messages, reasoning 轮询数据源)
 // fetchSessionTokens: async () => {output_tokens, reasoning_tokens} | null
 //   (#212: GET /api/sessions/{sid} 五桶快照, 失败返回 null, 回合首尾各取一次)
+// seenIdsRef: 轮询路径的 gateway id 水位 (#216: 流路径收口的 message_id 同步
+//   登记进来, 两条渲染路径去重归一真源; 缺省 null = 不登记, 既有调用方零破坏)
 function buildTurnStreamHandler(deps) {
   // #212 两依赖为可选 (缺省 no-op): 既有守护测试与任何未接线的调用方零破坏。
   const { setMessages, setRunInfo, setPhase, turnDedupRef,
           reasoningSeenRef, reasoningTimerRef, runIdRef, fetchMessages,
-          setDecodeRate = () => {}, fetchSessionTokens = async () => null } = deps
+          setDecodeRate = () => {}, fetchSessionTokens = async () => null,
+          seenIdsRef = null } = deps
   // 原子定位「最后一个 streaming 的 assistant 气泡」(无 index 竞态, 语义不变):
   // React 保证 updater 串行, 快速连续 delta 只作用在同一气泡上, 不碎片化。
   const findStreaming = (m) => {
@@ -362,6 +365,7 @@ function buildTurnStreamHandler(deps) {
   let firstDeltaAt = null     // 本回合首个 delta 到达时刻 (精确口径分母起点)
   let turnStartAt = Date.now()
   let baseTokens = null       // 回合起点 session token 快照 (null=取不到)
+  let baseTokensPromise = null // #226: 基线 Promise —— 收口时基线未落位则 await 它, 消竞态
   let lastApproxTps = null    // 收口前的最后近似值, 随校准结果一并落消息
   const trackDelta = (n) => {
     if (decodeSealed || !(n > 0)) return
@@ -378,6 +382,13 @@ function buildTurnStreamHandler(deps) {
   }
   const sealDecode = () => { decodeSealed = true; decodeWin = [] }
   // 回合收口后异步校准: 任一快照缺失/时长非正/无增量 → 静默跳过 (宁缺勿假)。
+  // #226 修复 (TRIAGE-AA §2 G-2): 旧实现两处静默失败面导致收口后速度消失 ——
+  // ① 基线竞态: run.completed 先于基线快照落位到达时 baseTokens 仍为 null;
+  // ② token 差值未落账: gateway 的 token 计数经后台 writer 异步刷入 session
+  //    库 (hermes_state_usage.queue_token_counts → _token_writer_loop),
+  //    run.completed 刚发出时首查快照常仍是回合前值 → Δ=0 → 静默 return。
+  // 修 = 基线改 await Promise; 尾快照有界重试 (4 次 × 700ms) 等差值落账。
+  // 精确值仍宁缺勿假; 校准最终失败时收口行由渲染层回退实时近似 (见 approxFallback)。
   const calibrateDecode = (evName) => {
     if (evName !== 'run.completed') return
     const endAt = Date.now()
@@ -385,10 +396,23 @@ function buildTurnStreamHandler(deps) {
     const approx = lastApproxTps
     ;(async () => {
       try {
-        const after = await fetchSessionTokens()
-        if (!after || !baseTokens || genSec <= 0) return
-        const dOut = Math.max(0, (after.output_tokens || 0) - (baseTokens.output_tokens || 0))
-        const dRea = Math.max(0, (after.reasoning_tokens || 0) - (baseTokens.reasoning_tokens || 0))
+        const base = baseTokens != null
+          ? baseTokens
+          : await (baseTokensPromise || Promise.resolve(null))
+        if (!base || genSec <= 0) return
+        let dOut = 0
+        let dRea = 0
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const after = await fetchSessionTokens()
+          if (after) {
+            dOut = Math.max(0, (after.output_tokens || 0) - (base.output_tokens || 0))
+            dRea = Math.max(0, (after.reasoning_tokens || 0) - (base.reasoning_tokens || 0))
+            if (dOut > 0 || dRea > 0) break
+          }
+          if (attempt < 3 && typeof setTimeout === 'function') {
+            await new Promise((r) => setTimeout(r, 700))
+          }
+        }
         if (dOut <= 0 && dRea <= 0) return
         setMessages((m) => {
           for (let i = m.length - 1; i >= 0; i--) {
@@ -414,9 +438,12 @@ function buildTurnStreamHandler(deps) {
         setRunInfo({ status: 'running' })
         setPhase('thinking')
         // #212: 记回合起点时刻 + 抓 session token 基线快照 (失败静默,
-        // 基线缺失时回合末校准整体跳过)
+        // 基线缺失时回合末校准整体跳过)。#226: 保留基线 Promise,
+        // run.completed 早于基线落位时由校准侧 await, 不再整回合跳过。
         turnStartAt = Date.now()
-        Promise.resolve(fetchSessionTokens()).then((b) => { baseTokens = b || null }).catch(() => {})
+        baseTokensPromise = Promise.resolve(fetchSessionTokens())
+          .then((b) => { baseTokens = b || null; return baseTokens })
+          .catch(() => { baseTokens = null; return null })
         // 回合开始: 重建去重指纹集(thinking 此后装已渲染的真 reasoning 片段)
         // + reasoning 消费游标, 并启动 1.5s reasoning 轮询
         turnDedupRef.current = { thinking: new Set(), msgIds: new Set() }
@@ -462,6 +489,11 @@ function buildTurnStreamHandler(deps) {
         if (d.message_id && turnDedupRef.current) {
           turnDedupRef.current.msgIds.add(d.message_id)
         }
+        // issue #216: 同步登记进轮询路径的 id 水位 seenIdsRef (去重单一真源)。
+        // 重复渲染根因: 流路径渲染的消息 id 从不写入 seenIdsRef, 回合结束
+        // busy=false 后 4s 轮询 tick 把同一批已持久化消息判为「从未见过」整条
+        // 重复追加 (用户消息 + assistant 正文各重复一次)。
+        if (d.message_id && seenIdsRef) seenIdsRef.current.add(d.message_id)
         if (d.content) setMessages((m) => {
           const i = findStreaming(m)
           if (i < 0) return [...m, { role: 'assistant', text: d.content, streaming: true, ts: Date.now() / 1000 }]
@@ -1067,7 +1099,36 @@ const ChatView = React.forwardRef(function ChatView(
           for (const e of freshRaw) seen.add(e.id)
           const fresh = windowedToMessages(freshRaw)
           if (fresh.length) {
-            setMessages((m) => [...m, ...fresh])
+            // issue #216 (D-W-1 修复): user + assistant 回声内容级兜底。
+            // user: send() 本地追加的气泡无 gateway id, 回声漏过 id 水位。
+            // assistant (D-W-1 根因): SSE assistant.completed 的 message_id
+            // 是 gateway 字符串 id (msg_…), 窗口端点 id 是 console 整数 id,
+            // 两个命名空间永不相交 —— id 水位对 assistant 回声完全无效, 收口
+            // 后 4s tick 把流式已渲染的正文整条重复追加。内容级兜底与 id
+            // 命名空间无关: 只比对本批 fresh 之前紧邻的尾部同 role 气泡,
+            // 同文则吞掉 —— fresh 各条 id 已在上方入 seen, 吞并一次性生效,
+            // 不拦后续同文新消息。
+            setMessages((m) => {
+              let lastUser = null
+              let lastAssistant = null
+              for (let i = m.length - 1; i >= 0; i--) {
+                if (!lastUser && m[i].role === 'user') lastUser = m[i]
+                else if (!lastAssistant && m[i].role === 'assistant') lastAssistant = m[i]
+                if (lastUser && lastAssistant) break
+              }
+              const drop = new Set()
+              if (lastUser) {
+                const j = fresh.findIndex((f) => f.role === 'user')
+                if (j >= 0 && (fresh[j].text || '') === (lastUser.text || '')) drop.add(j)
+              }
+              if (lastAssistant) {
+                const k = fresh.findIndex((f) => f.role === 'assistant')
+                if (k >= 0 && (fresh[k].text || '') === (lastAssistant.text || '')) drop.add(k)
+              }
+              if (!drop.size) return [...m, ...fresh]
+              const kept = fresh.filter((_, idx) => !drop.has(idx))
+              return kept.length ? [...m, ...kept] : m
+            })
           }
         }
       } catch { /* 网络/权限问题静默, 下轮再试 */ }
@@ -1234,7 +1295,7 @@ const ChatView = React.forwardRef(function ChatView(
       abortRef.current = ac
       const handler = buildTurnStreamHandler({
         setMessages, setRunInfo, setPhase, turnDedupRef, reasoningSeenRef,
-        reasoningTimerRef, runIdRef,
+        reasoningTimerRef, runIdRef, seenIdsRef,
         fetchMessages: async () => ((await g.getMessages(sid)) || {}).data || [],
         // #212: 实时近似 setter + session 五桶快照 (同源代理 GET /api/sessions/{sid},
         // 非 2xx/异常 → null, 校准侧 fail-open)
@@ -1377,7 +1438,7 @@ const ChatView = React.forwardRef(function ChatView(
       // 事件处理与 runStream 共用公共工厂 (DESIGN D6), 不再维护两套 switch
       const handler = buildTurnStreamHandler({
         setMessages, setRunInfo, setPhase, turnDedupRef, reasoningSeenRef,
-        reasoningTimerRef, runIdRef,
+        reasoningTimerRef, runIdRef, seenIdsRef,
         fetchMessages: async () => ((await g.getMessages(sid)) || {}).data || [],
         // #212: 实时近似 setter + session 五桶快照 (同源代理 GET /api/sessions/{sid},
         // 非 2xx/异常 → null, 校准侧 fail-open)
@@ -1912,6 +1973,12 @@ const ChatView = React.forwardRef(function ChatView(
           const mTs = m.ts && fmtTime(m.ts)
           // 协作任务摘要卡: 只影响渲染呈现, 发送内容零改动 (§4.2)
           const card = m.role === 'user' ? parseDispatchCard(m.text) : null
+          // #226: 收口行回退 —— 校准失败(基线缺失/差值未落账)时, 本回合最后一条
+          // assistant 气泡用实时近似的最后真实值兜底显示 (decodeRate 收口后仍保留,
+          // 新回合 setDecodeRate(null) 起零, 属真实测量非造假)。
+          const approxFallback = m.role === 'assistant' && !m.decodeStats && !m.streaming &&
+            !busy && decodeRate != null && decodeRate.tps > 0 &&
+            !messages.slice(i + 1).some((x) => x.role === 'assistant')
           return (
           <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
             {card ? (
@@ -2050,17 +2117,24 @@ const ChatView = React.forwardRef(function ChatView(
                 )}
                 {/* #212: 回合 decode 速度收口行 — 近似(收口前最后窗口值) +
                     精确(session output_tokens Δ ÷ 生成时长); reasoning 独立分桶
-                    (PLAN-U §2.3), 有值才显示; 校准缺失时整行不渲染 (宁缺勿假) */}
-                {m.decodeStats && (
+                    (PLAN-U §2.3), 有值才显示; 校准缺失时回退实时近似 (#226),
+                    近似也没有才整行不渲染 (宁缺勿假) */}
+                {(m.decodeStats || approxFallback) && (
                   <div className="text-[10.5px] text-dim pl-1 select-none"
                        title={t('chat.decode_speed.tooltip')}>
                     {t('chat.decode_speed.label')}
-                    {m.decodeStats.approxTps != null && m.decodeStats.approxTps > 0 &&
-                      `: ${t('chat.decode_speed.approx', { n: Math.round(m.decodeStats.approxTps) })}`}
-                    {m.decodeStats.exactTps != null &&
-                      `${m.decodeStats.approxTps != null && m.decodeStats.approxTps > 0 ? ' · ' : ': '}${t('chat.decode_speed.exact', { n: m.decodeStats.exactTps.toFixed(1) })}`}
-                    {m.decodeStats.reasoningTps > 0 &&
-                      ` ${t('chat.decode_speed.reasoning_suffix', { n: m.decodeStats.reasoningTps.toFixed(1) })}`}
+                    {m.decodeStats ? (
+                      <>
+                        {m.decodeStats.approxTps != null && m.decodeStats.approxTps > 0 &&
+                          `: ${t('chat.decode_speed.approx', { n: Math.round(m.decodeStats.approxTps) })}`}
+                        {m.decodeStats.exactTps != null &&
+                          `${m.decodeStats.approxTps != null && m.decodeStats.approxTps > 0 ? ' · ' : ': '}${t('chat.decode_speed.exact', { n: m.decodeStats.exactTps.toFixed(1) })}`}
+                        {m.decodeStats.reasoningTps > 0 &&
+                          ` ${t('chat.decode_speed.reasoning_suffix', { n: m.decodeStats.reasoningTps.toFixed(1) })}`}
+                      </>
+                    ) : (
+                      `: ${t('chat.decode_speed.approx', { n: Math.round(decodeRate.tps) })}`
+                    )}
                   </div>
                 )}
               </div>

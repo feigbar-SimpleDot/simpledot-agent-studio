@@ -860,6 +860,9 @@ class ScheduleEngine:
             cd = {"active": True,
                   "ends_at": ends,
                   "remaining_s": max(0, int(ends - self.clock())),
+                  # dashboard-ui-20261105 R5 (ANALYSIS 裁决 2 可选项): 倒计时
+                  # 总时长只增键, 供驾驶舱进度条分母 (免前端硬编码 300)
+                  "total_s": COUNTDOWN_S,
                   "next_task_id": holder["id"] if holder else None,
                   "next_task_title": holder["title"] if holder else None}
         running = self.store.list_by_status("running")

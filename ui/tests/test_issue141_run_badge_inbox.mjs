@@ -53,7 +53,7 @@ const RENAMED_ZH = {
   'chat.team_work_modal.queued_toast': '已加入收件箱队列',
   'schedule.busy_hint': '当前有任务执行中, 收件箱排队中',
   'schedule.empty.title': '收件箱还是空的',
-  'schedule.empty.hint': '点击顶栏「发起多智能体协作」, 任务会加入收件箱队列',
+  'schedule.empty.hint': '点击顶栏「添加任务」, 任务会加入收件箱队列',
   'schedule.form.edit_title': '修改收件箱任务',
 }
 const RENAMED_EN = {
@@ -62,7 +62,7 @@ const RENAMED_EN = {
   'chat.team_work_modal.queued_toast': 'Added to the inbox queue',
   'schedule.busy_hint': 'A task is running; inbox is queued',
   'schedule.empty.title': 'Inbox is empty',
-  'schedule.empty.hint': 'Click "Start multi-agent collaboration" in the top bar to join the inbox queue',
+  'schedule.empty.hint': 'Click "Add Task" in the top bar to join the inbox queue',
   'schedule.form.edit_title': 'Edit Inbox Task',
 }
 test('T1 zh 7 键改名值逐字 (MV-141-C)', () => {

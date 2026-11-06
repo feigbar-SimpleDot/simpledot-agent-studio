@@ -35,8 +35,11 @@ function ok(cond, msg) {
 }
 
 // ── R1 · 默认首页 = inbox (AC-R1-1~3 静态面) ─────────────────────────
-ok(/useState\('schedule'\)/.test(app) && !/useState\('tasks-board'\)/.test(app),
-  'R1: App 初始 view = schedule (inbox), tasks-board 硬编码清零')
+// dashboard-cockpit-20261105 OQ-2 裁决 (main, 留痕): 固定落地页 schedule →
+// dashboard。AC 不变式 = 「恒固定落地、零视图记忆」(下方 sas-view 无记忆断言
+// 原样保留), 落点值随 OQ 裁决更新 —— ACCEPT R-2 允许的断言合理变更。
+ok(/useState\('dashboard'\)/.test(app) && !/useState\('tasks-board'\)/.test(app),
+  'R1: App 初始 view = dashboard (固定落地), tasks-board 硬编码清零')
 ok(!/localStorage\.getItem\(['"]sas-view['"]/.test(app),
   'R1: 未引入视图记忆 (OQ-A 固定 inbox)')
 ok(/sas-chat-tabs/.test(app) && /sas-theme/.test(app),

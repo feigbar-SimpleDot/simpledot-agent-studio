@@ -7,7 +7,7 @@
 #
 # Exit code: 0 = all green, non-zero = at least one check is red.
 #
-# Contract (three checks; route-A background: DEPLOY.md console-frontend
+# Contract (four checks; route-A background: DEPLOY.md console-frontend
 # notes + deploy/install.sh §3 comment):
 #   C1  mw/ui_dist/** must NOT be tracked by git.
 #       Route A made mw/ui_dist a deploy-time copy of ui/dist; the repo keeps
@@ -23,6 +23,14 @@
 #       - neither exists: bare clone, not deployed yet — legitimately SKIPPED.
 #   C3  ui/dist/index.html must exist — the one tracked build artifact must
 #       never be lost.
+#   C4  ui/src must not be newer than ui/dist (issue #215-1 / DEF-V-1):
+#       compare the last commit touching ui/src vs the last commit touching
+#       ui/dist (%ct timestamps). src newer AND a different commit => RED
+#       (source changed, build artifact not rebuilt in the same commit).
+#       Boundaries (PLAN-W §6.2): a same-commit src+dist rebuild is GREEN
+#       (no timestamp comparison); a shallow clone / rewritten history with
+#       no visible commit for either path, or a non-git directory, is
+#       SKIPPED — an undecidable gate must never paint a false red.
 #
 # Why C2 keeps a SKIPPED state at all: under route A a bare clone (cloned but
 # not deployed yet) legitimately has NO mw/ui_dist at all — a valid state the
@@ -134,6 +142,34 @@ else
   bad "     fix: cd ui && npm run build, then commit the rebuilt ui/dist/index.html" \
       "     修法: cd ui && npm run build, 再提交重建后的 ui/dist/index.html"
   FAIL=1
+fi
+
+# ── C4: ui/src must not be newer than ui/dist (issue #215-1 / DEF-V-1) ───
+# 源码最后 commit 晚于产物最后 commit 且非同 commit 重建 ⇒ 源码改了产物没
+# 重建。边界口径 (PLAN-W §6.2): 同 commit 重建视为绿 (不比时间戳); 浅克隆/
+# 可见历史无该路径 commit 或非 git 目录 ⇒ SKIPPED (判据不可判不得假红,
+# 与 C1 的非 git 工作树 SKIPPED 同款哲学)。
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  src_ts=$(git log -1 --format=%ct -- ui/src 2>/dev/null || true)
+  dist_ts=$(git log -1 --format=%ct -- ui/dist 2>/dev/null || true)
+  src_c=$(git log -1 --format=%H -- ui/src 2>/dev/null || true)
+  dist_c=$(git log -1 --format=%H -- ui/dist 2>/dev/null || true)
+  if [ -z "${src_ts}" ] || [ -z "${dist_c}" ]; then
+    say "C4 SKIPPED: no visible commit for ui/src or ui/dist (shallow clone / fresh repo) — undecidable" \
+        "C4 跳过: 可见历史内无 ui/src 或 ui/dist 的 commit (浅克隆/新仓) — 无从判定"
+  elif [ "${src_ts}" -gt "${dist_ts}" ] && [ "${src_c}" != "${dist_c}" ]; then
+    bad "C4 RED: source drift — ui/src last commit ${src_c:0:7} is newer than ui/dist last commit ${dist_c:0:7} (source changed, build artifact not rebuilt)" \
+        "C4 红: 源码漂移 — ui/src 最后 commit (${src_c:0:7}) 晚于 ui/dist 最后 commit (${dist_c:0:7}) — 源码改了产物没重建"
+    bad "     fix: cd ui && npm run build, then commit the rebuilt ui/dist together with the source change in the same commit" \
+        "     修法: cd ui && npm run build, 把重建后的 ui/dist 与源码改动同一 commit 提交"
+    FAIL=1
+  else
+    say "C4 OK: ui/dist is not older than ui/src (same-commit rebuild counts as green)" \
+        "C4 通过: ui/dist 不早于 ui/src (同 commit 重建视为绿)"
+  fi
+else
+  say "C4 SKIPPED: not a git work tree — no commit history to compare" \
+      "C4 跳过: 非 git 工作树 — 无 commit 历史可比"
 fi
 
 if [ "${FAIL}" -ne 0 ]; then

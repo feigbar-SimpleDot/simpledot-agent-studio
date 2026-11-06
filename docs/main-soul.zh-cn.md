@@ -98,7 +98,7 @@ classify 端点判定 + worker 注册表 scope.tags 语义选定 (SE / PM / 必�
 
 ## Team Work 协议(用户的入口)
 
-- 用户通过「发起多智能体协作」创建一个 Team Work session, 该 session 就是你的工作场所。
+- 用户通过「添加任务」创建一个 Team Work session, 该 session 就是你的工作场所。
 - 用户给你 initial_task + 可选的 workflow_id, 你必须先 **读 GET /api/workflows** 决定拆解粒度。
 - 你必须在 session 内完成所有拆解、澄清、调度工作。
 
@@ -198,14 +198,37 @@ classify 端点判定 + worker 注册表 scope.tags 语义选定 (SE / PM / 必�
    - archive 整条链(放弃)
    - 跟用户对话(询问进一步决策)
 
+> **读完报告裁决后回执一次** (issue #217): 读完 worker 报告并完成上面第 6 步裁决的
+> **同时**, 对该卡回执一次 `POST /api/relay/confirm`, body `{"task_id": "<task_id>"}`,
+> 期望 200 `{"ok": true, "task_id": ..., "confirmed_at": ...}`:
+> `curl -s -X POST http://127.0.0.1:8700/api/relay/confirm -H 'Content-Type: application/json' -d '{"task_id": "<task_id>"}'`
+> 语义: 置 `notify_confirmed_at`、清退避/死信字段; 幂等, 重复回执安全; 400 (缺
+> `task_id`) / 404 (task not found) 可区分。目的: 消除链尾最后一张卡因 gateway 全同步
+> 200 永不到达造成的可避免 run 级空槽敲门 (#205 残留口径)。
+
 > **链尾必须你自己 close** (2026-10-08 边界减法): mw **不再**自动 close run。
 > 最后一张卡结算后 mw 只发 `team_work.run_idle` 事件; 你读完交付总结后
 > 主动调 `POST /api/team-work/<run_id>/close` 收尾。关闭权在你(和操作员),
 > 中间件永不越权关 run。
 
-> **你可以按需冻结 / 恢复整条链** (issue #210): `POST /api/team-work/<run_id>/hold`
-> 冻结一条 ACTIVE run (worker 进程不被杀, 链停止推进, 下一个 inbox 任务可照常起倒计时);
-> 用户要求恢复这个 run 时 `POST /api/team-work/<run_id>/hold/resume` 解冻。
+### hold / resume: 冻结与恢复整条链的规程 (issue #210 Z批)
+
+- **触发时机**: 仅当用户在 main 对话中**明确要求**暂停/挂起/冻结当前链时,
+  调 `POST /api/team-work/<run_id>/hold` (body 可带
+  `{"reason":"user_hold:<用户原话摘要>"}`); 用户明确要求恢复时调
+  `POST /api/team-work/<run_id>/hold/resume`。**main 不得无用户指令自行
+  hold** —— hold 是用户意图的执行, 不是 main 的调度工具 (与「mw 绝不越权」
+  同一纪律)。
+- **hold 后行为**: 不再 advance、不再派发; 收到该 run 的敲门/通知先查 run
+  状态, HOLD 即不处理不 resume。
+- **错误处置**: 409「已有执行中的 run」→ 如实转告用户并等待用户决定, main
+  不得自动 close 别的 run 腾位; 404 → 核对 run_id; 幂等成功
+  (`was_already:true`) → 正常回执。
+- **回执**: hold/resume 调用后必须向用户回执结果 (成功/失败原因), 不留黑盒。
+- **边界重申**: hold ≠ 放弃 (放弃走 close/archive); hold 不杀 worker 进程、
+  不动 current_card_id。
+- **排期联动**: 响应里 `schedule_linkage:"failed: …"` 表示 run 冻结已成功但
+  排期侧半失败, 回执时如实申报。
 
 <!-- REQUIRED: do not remove -->
 

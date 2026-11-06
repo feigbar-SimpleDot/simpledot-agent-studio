@@ -557,8 +557,136 @@ def test_reopen_persists_schema():
 
 
 # ============================================================
+# T1.8: #214-1 ARCHIVED 迁移修复 (显式列拷贝 + fail-loud + 幂等)
+# ============================================================
+
+# 旧 schema 快照 (迁移前世界): CHECK 无 HOLD、无 hold_* 三列, 列集与
+# 当前 SCHEMA 不同 —— 旧式 `INSERT SELECT *` 在此列集差上必炸 (#214-1)。
+_OLD_TW_RUNS_PRE_HOLD = """
+CREATE TABLE team_work_runs (
+    run_id              TEXT PRIMARY KEY,
+    initiator_session   TEXT NOT NULL,
+    initial_task        TEXT NOT NULL,
+    project_workspace   TEXT,
+    current_card_id     TEXT,
+    status              TEXT NOT NULL DEFAULT 'ACTIVE'
+        CHECK(status IN ('ACTIVE','CLOSED','ABORTED')),
+    card_count          INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    closed_at           REAL,
+    closed_reason       TEXT
+);
+CREATE UNIQUE INDEX idx_team_work_one_active
+    ON team_work_runs(status) WHERE status='ACTIVE';
+"""
+
+
+def _make_old_schema_db(db):
+    """手工造旧 schema 库: 旧式 team_work_runs 表 + 2 行数据, user_version=5。"""
+    c = sqlite3.connect(db)
+    c.executescript(_OLD_TW_RUNS_PRE_HOLD)
+    c.execute(
+        "INSERT INTO team_work_runs VALUES "
+        "('r_a','s1','需求A',NULL,NULL,'ACTIVE',1,100.0,NULL,NULL)")
+    c.execute(
+        "INSERT INTO team_work_runs VALUES "
+        "('r_b','s2','需求B',NULL,NULL,'CLOSED',2,200.0,300.0,'done')")
+    c.execute("PRAGMA user_version=5")
+    c.commit()
+    c.close()
+
+
+def test_archived_migration_explicit_columns(tmp_path):
+    """旧库 (CHECK 无 HOLD/ARCHIVED、无 hold_* 列) → Ledger() 迁移收敛:
+    数据完好、DDL 含 ARCHIVED+HOLD、hold_* 列在位、user_version==6。"""
+    db = str(tmp_path / "ledger.db")
+    _make_old_schema_db(db)
+
+    led = Ledger(db)
+    try:
+        ddl = led.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='team_work_runs'").fetchone()[0]
+        assert "ARCHIVED" in ddl, "迁移后 DDL 应含 ARCHIVED"
+        assert "'HOLD'" in ddl, "迁移后 DDL 应含 HOLD CHECK"
+        cols = {r["name"] for r in led.conn.execute(
+            "PRAGMA table_info(team_work_runs)")}
+        assert {"hold_reason", "hold_actor", "hold_at"} <= cols, \
+            "hold_* 三列应在位"
+        # 2 行数据完好
+        assert led.conn.execute(
+            "SELECT COUNT(*) FROM team_work_runs").fetchone()[0] == 2
+        ra = led.get_team_work("r_a")
+        assert ra is not None and ra["status"] == "ACTIVE"
+        rb = led.get_team_work("r_b")
+        assert rb is not None and rb["status"] == "CLOSED"
+        # user_version 回写 6
+        assert led.conn.execute(
+            "PRAGMA user_version").fetchone()[0] == 6
+        # 无 __old 残留
+        assert led.conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%__old'"
+        ).fetchone()[0] == 0
+    finally:
+        led.close()
+
+
+def test_archived_migration_idempotent_rerun(tmp_path):
+    """上库再开一次 Ledger: 内容门控幂等, 无异常且行数不变。"""
+    db = str(tmp_path / "ledger.db")
+    _make_old_schema_db(db)
+
+    led = Ledger(db)
+    led.close()
+    led2 = Ledger(db)
+    try:
+        assert led2.conn.execute(
+            "SELECT COUNT(*) FROM team_work_runs").fetchone()[0] == 2
+        assert led2.get_team_work("r_a") is not None
+        assert led2.conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%__old'"
+        ).fetchone()[0] == 0
+    finally:
+        led2.close()
+
+
+# ============================================================
+# T1.9: #214-3 list_team_works 白名单含 HOLD
+# ============================================================
+
+def test_list_team_works_includes_hold(tmp_path):
+    """HOLD run 随 include_closed 可见 (D-8); 默认 ACTIVE-only 不含。"""
+    db = str(tmp_path / "ledger.db")
+    led = Ledger(db)
+    try:
+        led.create_team_work_run("r1", "s1", "需求1")
+        led.hold_team_work("r1", reason="测试冻结", actor="tester")
+        with_closed = led.list_team_works(include_closed=True)
+        assert any(r["run_id"] == "r1" and r["status"] == "HOLD"
+                   for r in with_closed), \
+            "include_closed=True 应含 HOLD run 且 status=='HOLD'"
+        with_archived = led.list_team_works(include_archived=True)
+        assert any(r["run_id"] == "r1" for r in with_archived), \
+            "include_archived=True 也应含 HOLD run"
+        default = led.list_team_works()
+        assert all(r["run_id"] != "r1" for r in default), \
+            "默认 ACTIVE-only 分支不应含 HOLD run"
+    finally:
+        led.close()
+
+
+# ============================================================
 # 主入口
 # ============================================================
+
+def _with_tmp_path(fn):
+    """手动运行器适配: 用 tempfile 目录模拟 pytest 的 tmp_path fixture。"""
+    def wrapper():
+        with tempfile.TemporaryDirectory() as td:
+            fn(Path(td))
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
 
 def main():
     tests = [
@@ -580,6 +708,9 @@ def main():
         test_reopen_persists_schema,
         test_auto_close_runs_last_card_complete,
         test_auto_close_skipped_when_residual_pending,
+        _with_tmp_path(test_archived_migration_explicit_columns),
+        _with_tmp_path(test_archived_migration_idempotent_rerun),
+        _with_tmp_path(test_list_team_works_includes_hold),
     ]
     for t in tests:
         check(t.__name__, t)

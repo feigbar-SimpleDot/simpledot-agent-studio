@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { api } from './api.js'
 import ChatView from './views/ChatView.jsx'
 import ScheduleView from './views/ScheduleView.jsx'
+import DashboardView from './views/DashboardView.jsx'
 import TasksBoardView from './views/TasksBoardView.jsx'
 import WorkersView from './views/WorkersView.jsx'
 import WorkflowsView from './views/WorkflowsView.jsx'
@@ -23,8 +24,12 @@ import { BRAND_EN, BRAND_ZH } from './brand.js'
 //        按 pixelStatus.enabled 条件显示(交互设计 §3.1)。2026-10-15 按 R3.1
 //        调整顺序 — 任务看板(多智能体协作成果主视图)置顶,对话次位,尾部不变。
 const NAV = [
-  // issue #164: 收件箱 TAB (原任务排期) 置顶 (AC-1.1 —— 菜单第一位); 日历+时钟图标 (heroicons
-  // outline calendar-clock)。[en] Task schedule takes the lead slot.
+  // CC轮 §4.3 (用户点名 dashboard 置顶): 总览 TAB 移到菜单第一位 (原 issue #164
+  // 「收件箱置顶」口径更新)。X批 dashboard (REQ-X-DASHBOARD): 五卡只读汇总
+  // (heroicons outline chart-bar)。
+  { id: 'dashboard',   icon: 'M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z' },
+  // issue #164: 收件箱 TAB (原任务排期) (日历+时钟图标, heroicons outline
+  // calendar-clock)。现居第 2 位。[en] Task schedule, 2nd slot since CC轮.
   { id: 'schedule',    icon: 'M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2zm5-6h.01M12 15l2 2 3-3' },
   // 2026-10-06 改版:合并原「任务看板」(扁平 task 列表) +「Team Works」
   // 为新版「任务看板」(run→task 树状结构)。Team Works 概念不再单独 tab 暴露。
@@ -46,6 +51,7 @@ const NAV = [
 // Sorted by NAV order so adding a tab only touches this table + NAV list.
 const NAV_LABEL_KEYS = {
   'schedule':    'nav.schedule',
+  'dashboard':   'nav.dashboard',
   'tasks-board': 'nav.tasks_board',
   'chat':        'nav.chat',
   'workers':     'nav.workers',
@@ -104,10 +110,13 @@ export default function App() {
   // 语言运行时切换(zh↔en)走 i18next.changeLanguage → React 组件重渲,无需额外 effect。
   const { t, i18n } = useTranslation()
   const isZh = (i18n.language || '').startsWith('zh')
-  // issue #202 R1 (硬约束 1, OQ-A 裁决=固定 inbox): 首屏落地 = 收件箱
-  // (schedule, NAV 首位)。不引入视图记忆 —— 刷新/新加载恒回收件箱;
-  // 会话内手动切 tab 行为不变 (AC-R1-1~3)。
-  const [view, setView] = useState('schedule')
+  // issue #202 R1 (硬约束 1, OQ-A 裁决=固定 inbox): 不引入视图记忆 ——
+  // 刷新/新加载恒固定落地, 会话内手动切 tab 行为不变 (AC-R1-1~3)。
+  // dashboard-cockpit-20261105 OQ-2 裁决 (main): 固定落地页 schedule →
+  // dashboard —— AC 不变式是「恒固定、零视图记忆」, 落点值随 OQ 裁决更新;
+  // 驾驶舱 Z0/Z2 本就聚合收件箱队列 (C3 环图+徽章行), 信息不丢 (R-1)。
+  // 守护同步: test_issue202_ui_pkg.mjs:38 / test_dashboard_view.mjs T1。
+  const [view, setView] = useState('dashboard')
   const [collapsed, setCollapsed] = useState(false)
   const [reaper, setReaper] = useState(null)
   const [counts, setCounts] = useState({ attention: 0, running: 0, finished: 0, total: 0 })
@@ -334,6 +343,8 @@ export default function App() {
             {view !== 'chat' && (
               <>
                 {view === 'schedule' && <ScheduleView onNavigate={setView} />}
+                {view === 'dashboard' && <DashboardView onNavigate={setView}
+                  onWorkerChat={openWorkerChat} />}
                 {view === 'tasks-board' && <TasksBoardView onChanged={pollStatus} />}
                 {view === 'workers' && <WorkersView onChanged={pollStatus} onChat={openWorkerChat} />}
                 {view === 'workflows' && <WorkflowsView onChanged={pollStatus} />}
@@ -448,32 +459,11 @@ export default function App() {
 
       {/* ── 主区 ── */}
       <main className="flex-1 min-w-0 flex flex-col">
-        <header className="h-16 shrink-0 border-b border-line bg-panel/60 backdrop-blur
-                          flex items-center justify-between px-6">
-          <div>
-            <h1 className="text-[15px] font-bold leading-tight">
-              {view === 'chat' && activeChat !== 'main'
-                ? t('app.chat_h1_worker', { name: activeChat })
-                : (
-                    (() => {
-                      const navKey = NAV_LABEL_KEYS[view]
-                      return navKey ? t(navKey) : ''
-                    })()
-                  )
-              }
-            </h1>
-            <p className="text-[11.5px] text-dim leading-tight mt-0.5">
-              {view === 'chat' && activeChat === 'main' && t('app.subtitle_chat_main')}
-              {view === 'chat' && activeChat !== 'main' && t('app.subtitle_chat_worker', { name: activeChat })}
-              {view === 'schedule' && t('app.subtitle_schedule')}
-              {view === 'tasks-board' && t('app.subtitle_tasks_board', { total: counts.total, attention: counts.attention, running: counts.running, finished: counts.finished })}
-              {view === 'workers' && t('app.subtitle_workers')}
-              {view === 'workflows' && t('app.subtitle_workflows')}
-              {view === 'cron' && t('app.subtitle_cron')}
-              {view === 'pixel-office' && t('app.subtitle_pixel_office')}
-              {view === 'settings' && t('app.subtitle_settings')}
-            </p>
-          </div>
+        {/* dashboard-fix-20261105 R-A (main 裁决 OQ-4): 左右结构恢复时**不**恢复
+            原 h-16 视图标题+副标题区 (最小改动面, 用户未提); header 仅保留
+            动作组右对齐 (核心功能/Webui/主题/刷新 入口零丢失, AC-A4)。 */}
+        <header className="h-14 shrink-0 border-b border-line bg-panel/60 backdrop-blur
+                          flex items-center justify-end px-6">
           <div className="flex items-center gap-2">
             {/* R2.1: 桌面主 header 动作组最左新增「核心功能」按钮(btn-primary 高亮) */}
             <CoreFeaturesBtn onClick={openCoreFeatures} />
@@ -497,20 +487,22 @@ export default function App() {
           {/* chatTabs 里每个 tab 都 mount 自己的 ChatView 实例(独立 sessionId/输入框/附件),
               切走时 React 保留 state, 切回去原封不动. 仅激活的显示, 其余 display:none */}
           {chatTabs.map((tab, idx) => {
-                        const active = view === 'chat' && activeChat === tab
-                        const base = tab === 'main' ? '' : `/api/w/${tab}`
-                        const label = tab === 'main' ? t('app.main_agent') : t('app.worker_chat_title', { name: tab })
-                        return (
-                          <div key={tab} className={`flex-1 min-h-0 flex flex-col ${active ? '' : 'hidden'}`}>
-                            <ChatView ref={(el) => { chatViewRefs.current[idx] = el }} base={base} targetLabel={label}
-                              active={active}
-                              onClose={tab === 'main' ? null : () => closeWorkerChat(tab)} />
-                          </div>
-                        )
-                      })}
+            const active = view === 'chat' && activeChat === tab
+            const base = tab === 'main' ? '' : `/api/w/${tab}`
+            const label = tab === 'main' ? t('app.main_agent') : t('app.worker_chat_title', { name: tab })
+            return (
+              <div key={tab} className={`flex-1 min-h-0 flex flex-col ${active ? '' : 'hidden'}`}>
+                <ChatView ref={(el) => { chatViewRefs.current[idx] = el }} base={base} targetLabel={label}
+                  active={active}
+                  onClose={tab === 'main' ? null : () => closeWorkerChat(tab)} />
+              </div>
+            )
+          })}
           {view !== 'chat' && (
             <>
               {view === 'schedule' && <ScheduleView onNavigate={setView} />}
+              {view === 'dashboard' && <DashboardView onNavigate={setView}
+                onWorkerChat={openWorkerChat} />}
               {view === 'tasks-board' && <TasksBoardView onChanged={pollStatus} />}
               {view === 'workers' && <WorkersView onChanged={pollStatus} onChat={openWorkerChat} />}
               {view === 'workflows' && <WorkflowsView onChanged={pollStatus} />}

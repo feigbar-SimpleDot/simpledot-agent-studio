@@ -233,7 +233,7 @@ advance task_description —— 两处都写, 否则只有一方看得到 (口�
    `doc_audit` / `ux-designer` —— 是**连字符**而非下划线 (凭记忆写 `code-reviewer` /
    `system_engineer` 会被 422 拒收, 报错里带 `available_assignees` 可直接重映射)。
    注册表随时可能被外部进程整体替换 (名字/主机/key 全变), launch 前再读一次确认稳定。
-2. **launch**：`POST /api/team-work/launch`，带 workflow_id / session_id /
+2. **launch**：新建链的统一入口是 `POST /api/schedule/tasks` 收件箱入队（主线: inbox任务 -> 启动 -> 创建run -> 创建卡片）；本步 launch 是收件箱任务被触发后的执行机制，编排语义不变。`POST /api/team-work/launch`，带 initial_task / session_id /
    project_workspace / steps。平台自动注入 depends_on 链。**launch 只自动拉起第一张卡**，
    其余卡 claim 后必须手动 spawn（见步骤 8）。
    ★ 下发后必须逐张核对响应 `cards[].assignee` 与你的语义匹配意图：steps 里的

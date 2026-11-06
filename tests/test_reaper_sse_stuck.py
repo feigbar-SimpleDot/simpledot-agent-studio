@@ -289,7 +289,7 @@ def test_null_slot_undispatched_recent_run_no_knock():
 
 
 def test_null_slot_all_undispatched_old_run_says_wait_dispatch():
-    """全未派发 + run 行也陈旧 → 敲, 文案是「等待 main 派发」。"""
+    """全未派发 + run 行也陈旧 → 敲, 文案统一 run 级 (issue #205)。"""
     with tempfile.TemporaryDirectory() as td:
         led, db = _null_slot_setup(td, dispatched=False, run_age_s=3600)
         try:
@@ -302,15 +302,15 @@ def test_null_slot_all_undispatched_old_run_says_wait_dispatch():
                     led, led.get_active_team_work(), [],
                     registry={}, stuck_after_min=5, base=td)
             assert len(sent) == 1, f"run 闲置 1h 应敲, got {sent}"
-            assert "等待 main 派发" in sent[0][1], sent[0][1]
-            assert "worker 活跃可忽略" not in sent[0][1]
+            assert "槽位已空" in sent[0][1], sent[0][1]
+            assert "advance" in sent[0][1], sent[0][1]
         finally:
             led.close()
             os.unlink(db)
 
 
-def test_null_slot_dispatched_live_worker_suppressed():
-    """已派发卡 + console 报活 → SUPPRESSED_ALIVE, 不敲。"""
+def test_null_slot_dispatched_live_worker_knocks():
+    """issue #205 语义反转: worker 活体抑制层已删, 槽空超窗 ⇒ 照敲。"""
     with tempfile.TemporaryDirectory() as td:
         led, db = _null_slot_setup(td, dispatched=True, run_age_s=3600)
         try:
@@ -326,10 +326,9 @@ def test_null_slot_dispatched_live_worker_suppressed():
                 reaper_mod._notify_null_slot(
                     led, led.get_active_team_work(), results,
                     registry={}, stuck_after_min=5, base=td)
-            assert len(sent) == 0, f"worker 活着不该敲, got {sent}"
-            sup = [r for r in results
-                   if r.get("verdict") == "SUPPRESSED_ALIVE"]
-            assert len(sup) == 1, f"应记 SUPPRESSED_ALIVE, got {results}"
+            assert len(sent) == 1, f"槽空超窗应敲, got {sent}"
+            assert any(r.get("verdict") == "NOTIFIED" for r in results), \
+                f"应记 NOTIFIED, got {results}"
         finally:
             led.close()
             os.unlink(db)
@@ -353,6 +352,7 @@ def test_null_slot_dispatched_dead_worker_knocks():
                     registry={}, stuck_after_min=5, base=td)
             assert len(sent) == 1, f"worker 挂死应敲, got {sent}"
             assert "兜底敲门" in sent[0][1]
+            assert "槽位已空" in sent[0][1]
         finally:
             led.close()
             os.unlink(db)

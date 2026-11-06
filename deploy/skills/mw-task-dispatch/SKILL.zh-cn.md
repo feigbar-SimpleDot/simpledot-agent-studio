@@ -12,7 +12,9 @@ metadata:
 
 本环境是多容器 Agent 矩阵。**1A 边界：卡的生命周期归你（main），mw 只起 worker。**
 
-⚠️ **下发必须走 `POST /api/team-work/launch`，不要用 `mw.cli dispatch`。**
+⚠️ **新建 team work 任务的唯一调用口 = `POST /api/schedule/tasks` 收件箱入队（与 web 控制台『添加任务』按钮同一入口）；主线 = inbox任务 -> 启动 -> 创建run -> 创建卡片。** 被触发后的下发执行必须走 `POST /api/team-work/launch`，不要用 `mw.cli dispatch`。
+
+launch 是收件箱任务被触发后（或 main 现场编排链时）的**执行机制**，不是新建入口。
 
 launch 是 ledger 里 `team_work_runs` 的**唯一触发点**：你建好卡的那一刻，
 launch 同步把 run 写进账本（`run_id` + 每张卡的 `team_work_run_id` + 发起
@@ -26,6 +28,10 @@ Team Works 面板看不到、reaper 直接 SKIP 不结算（孤儿卡，链是�
 - 用户要求"让 worker / coder / 某个 agent 做 X"
 - 任务需要隔离执行、可审计的结算
 - 用户提到：派发、分发、委派、多智能体、任务矩阵、worker、Team Work
+
+## 新建入口（统一调用口）
+
+新建 team work 任务先 `POST /api/schedule/tasks` 收件箱入队（与 web 控制台『添加任务』按钮同一入口）：`detail` 填需求原文，`workflow` / `workspace` 等字段与 `api_schedule_create` 一一对应。引擎 `evaluate_now()` 即时评估、到点以等价消息触发 main 建卡下发——主线 = inbox任务 -> 启动 -> 创建run -> 创建卡片。下方三步 = 被触发后的执行流程。
 
 ## 如何下发（三步，顺序固定）
 
@@ -70,7 +76,7 @@ launch 响应：
 填**你自己的 Hermes session_id**（reaper 靠它把 worker 报告送回你，
 `POST /api/sessions/<sid>/chat`）。
 
-- 从控制台「发起多智能体协作」按钮进来的：请求文本里已注入
+- 从控制台「添加任务」按钮进来的：请求文本里已注入
   `session_id: "<sid>"`，**直接用那个值**。
 - 不确定自己的 session_id：读你系统提示里的 session id（形如
   `api_<时间戳>_<8hex>`），或从控制台会话列表复制。
@@ -120,6 +126,28 @@ curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/cards \
 `current_card_id` 不动；本链的 inbox 任务同步置 `hold`，下一个 inbox
 任务照常起倒计时）。用户要求恢复时
 `POST /api/team-work/<run_id>/hold/resume` 解冻（已有另一条 ACTIVE run ⇒ 409）。
+
+```bash
+curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/hold \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"user_hold:用户要求暂停","operator":"main"}'
+
+curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/hold/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"main"}'
+```
+
+规程摘要（与 main-soul「hold / resume: 冻结与恢复整条链的规程」逐字口径一致）：
+
+- **触发时机**: 仅当用户在 main 对话中明确要求暂停/挂起/冻结当前链时 hold；
+  用户明确要求恢复时 resume。main 不得无用户指令自行 hold。
+- **hold 后行为**: 不再 advance、不再派发；敲门/通知先查 run 状态，HOLD 即不处理不 resume。
+- **错误处置**: 409「已有执行中的 run」→ 如实转告用户并等待用户决定，main
+  不得自动 close 别的 run 腾位；404 → 核对 run_id；幂等成功（`was_already:true`）→ 正常回执。
+- **回执**: hold/resume 调用后必须向用户回执结果（成功/失败原因），不留黑盒。
+- **边界重申**: hold ≠ 放弃（放弃走 close/archive）；hold 不杀 worker 进程、不动 current_card_id。
+- **排期联动**: 响应里 `schedule_linkage:"failed: …"` 表示 run 冻结已成功但
+  排期侧半失败, 回执时如实申报。
 
 ### 字段规则（违反会被 400/422 拒收）
 

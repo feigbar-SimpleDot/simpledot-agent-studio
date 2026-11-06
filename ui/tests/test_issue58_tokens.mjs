@@ -161,8 +161,36 @@ test('i18n: 顶层全量 flatten 键集合 en == zh (基线 639 → 643 → 644)
   // label / reasoning_suffix / tooltip —— 对话页 decode 速度显示的近似/精确
   // 文案、标签、reasoning 分桶后缀与口径 tooltip, 双语同 commit,
   // INV-09 先例口径 —— 键数锚随合法新增同步上调)。
-  assert(fe.size === 783 && fz.size === 783,
-    `期望 778+5=783 键, 实际 en=${fe.size} zh=${fz.size}`)
+  // 783 → 788: V批 #213/#214 新增 5 键 (schedule.detail.label /
+  // schedule.detail.empty / schedule.state.hold / schedule.group.hold /
+  // tboard.run_status_hold —— 收件箱详情折叠展开文案与 hold 分组/状态/HOLD
+  // 徽标, 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 788 → 820: X批 dashboard 新增 32 键 (nav.dashboard + app.subtitle_dashboard + dashboard.* 子树 30 键, 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调, main 裁决 A / t_d5fbed9b)。
+  // 820 → 837: Z批 #210 新增 17 键 (tboard hold/resume 按钮与确认弹窗/
+  // toast 文案 17 键, 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 837 → 845: dashboard-cockpit-20261105 驾驶舱改版新增 8 键
+  // (dashboard.z1_title / z1_empty / z1_inactive / enter_chat /
+  // z2_token_title / z2_inbox_title / chart_no_data / chart_total,
+  // 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 845 → 846: dashboard-fix-20261105 P-2 新增 1 键
+  // (dashboard.z0_runs_unit —— Z0 指挥条 run 计数单位词, en "run" /
+  // zh-cn "个 run", 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 846 → 858: dashboard-ui-20261105 impl-fe 新增 12 键 (dashboard.c2_todo_unavailable /
+  // c2_section_pending / c2_section_done / c2_section_dropped / c2_current_prefix /
+  // r5_next_task / r5_run_now / r5_run_now_ok / r5_run_now_off_auto / r5_run_now_off_idle /
+  // r4_idle / r4_token_24h —— 链卡片步骤区、Z0 立即开始/下一任务、worker 两态 token 行,
+  // 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 858 → 861: dashboard-fix-20261105 s2 净增 3 键 —— 新增 4 键
+  // (dashboard.z1_working_title / z1_idle_empty / r4_run_label /
+  // z2_worker_token_title —— worker 两区标题/空闲空态、当前 run 标签、
+  // worker 24h token 独立柱图标题) 删除 1 键 (dashboard.r4_token_24h ——
+  // worker 卡 token 数值行按 main 裁决 OQ-2 移除, 词条随动删除),
+  // 双语同 commit, INV-09 先例口径 —— 键数锚同步上调。
+  // 861 → 862: issue #228 新增 1 键 (workers.field.api_key_edit_hint ——
+  // 编辑弹窗 api_key「留空 = 不修改」提示, 双语同 commit, INV-09 先例口径
+  // —— 键数锚随合法新增同步上调)。
+  assert(fe.size === 862 && fz.size === 862,
+    `期望 820+17+8+1+12+3+1=862 键, 实际 en=${fe.size} zh=${fz.size}`)
 })
 
 test('i18n: tboard 子 dict 键集合差集为空 (124+5=129, +1=130)', () => {
@@ -178,8 +206,12 @@ test('i18n: tboard 子 dict 键集合差集为空 (124+5=129, +1=130)', () => {
   // (双语同 commit)。
   // 129 → 130: issue #178 新增 delivery_failed_badge (投递失败徽标文案,
   // 双语同 commit)。
-  assert(ke.size === 130 && kz.size === 130,
-    `期望 tboard 130 键, 实际 en=${ke.size} zh=${kz.size}`)
+  // 130 → 131: tboard.run_status_hold (HOLD 运行态徽标文案,
+  // 双语同 commit, INV-09 先例口径)。
+  // 131 → 148: Z批 #210 新增 17 键 (tboard hold/resume 按钮与确认弹窗/
+  // toast 文案, 双语同 commit, INV-09 先例口径)。
+  assert(ke.size === 148 && kz.size === 148,
+    `期望 tboard 148 键, 实际 en=${ke.size} zh=${kz.size}`)
 })
 
 test('i18n: 4 个 token 新键双边存在且在 tboard.* 下', () => {
@@ -382,10 +414,133 @@ test('issue #188: 键数注释链含 schedule.* 现值口径「现 44 键」', (
     '注释链缺少「现 44 键 —— btn 7 / form 5 / toast 8」现值括注 (issue #188)')
 })
 
+// ═════════ F. issue #226 守护 (s3 / 卡 t_b89eae7e) ═════════
+// #226: 完整对话收口后 decode 速度消失。根因两条静默失败面 (TRIAGE-AA §2 G-2):
+//   ① 基线竞态 —— run.completed 先于基线快照落位到达, baseTokens 仍 null 即跳过;
+//   ② token 差值未落账 —— gateway token 计数经后台 writer 异步刷库
+//      (hermes_state_usage.queue_token_counts), run.completed 首查常是回合前值 Δ=0。
+// 修复: 基线 await Promise + 尾快照有界重试 (4×700ms); 校准失败时渲染层
+//   approxFallback 用实时近似兜底。以下 vm 直测 buildTurnStreamHandler 钉三件事。
+const chatSrc = readFileSync(new URL('../src/views/ChatView.jsx', import.meta.url), 'utf8')
+const turnHandlerSrc = extractFn(chatSrc, 'function buildTurnStreamHandler')
+
+function mkDecodeHarness({ tokenSeq, fetchTokensOverride, initialMessages = [] } = {}) {
+  const clock = { now: 1000 }
+  const rates = []
+  const queue = [...(tokenSeq || [])]
+  let msgs = [...initialMessages]
+  const seenIds = new Set()
+  const ctx = {
+    Date: { now: () => clock.now },
+    setInterval: () => 1, clearInterval: () => {},
+    setTimeout: (fn) => { fn(); return 0 },   // 重试等待即时触发 (测试不真等 700ms)
+    Set, Map, Promise, Math, Array, JSON,
+    pushToolCall: () => {}, closeTurnToolGroups: () => {},
+    sealTurnThinking: () => {}, backfillToolResults: () => {},
+    extractReasoningSegments: () => [], authoritativeReasoning: () => '',
+  }
+  vm.createContext(ctx)
+  vm.runInContext(`__mk = (${turnHandlerSrc.replace(/^function buildTurnStreamHandler/, 'function')})`, ctx)
+  const handler = ctx.__mk({
+    setMessages: (fn) => { msgs = typeof fn === 'function' ? fn(msgs) : fn },
+    setRunInfo: () => {}, setPhase: () => {},
+    turnDedupRef: { current: { thinking: new Set(), msgIds: new Set() } },
+    reasoningSeenRef: { current: new Map() },
+    reasoningTimerRef: { current: null }, runIdRef: { current: null },
+    fetchMessages: async () => [],
+    setDecodeRate: (v) => rates.push(v),
+    fetchSessionTokens: fetchTokensOverride || (async () => (queue.length ? queue.shift() : null)),
+    seenIdsRef: { current: seenIds },
+  })
+  return { clock, rates, seenIds, send: (ev, d = {}) => handler(ev, d),
+           get msgs() { return msgs } }
+}
+const flushMicro = () => new Promise((r) => setImmediate(r))
+const lastAsst = (h) => h.msgs.filter((m) => m.role === 'assistant').at(-1)
+
+test('#226-G1 尾快照首查未落账 (Δ=0) → 重试等到落账后精确值仍落消息', async () => {
+  const h = mkDecodeHarness({ tokenSeq: [
+    { output_tokens: 100, reasoning_tokens: 0 },   // run.started 基线
+    { output_tokens: 100, reasoning_tokens: 0 },   // 收口首查: 后台 writer 未刷入 → Δ=0
+    { output_tokens: 600, reasoning_tokens: 0 },   // 重试第 2 查: 已落账 → Δ=500
+  ] })
+  h.send('run.started', { run_id: 'r1' })
+  await flushMicro(); await flushMicro()
+  h.clock.now = 2000
+  h.send('assistant.delta', { delta: 'x'.repeat(40) })   // firstDeltaAt=2000
+  h.clock.now = 12000
+  h.send('run.completed', { messages: [] })              // genSec=10
+  await flushMicro(); await flushMicro(); await flushMicro()
+  const a = lastAsst(h)
+  assert(a && a.decodeStats, '差值落账后 decodeStats 必须落消息 (旧代码 Δ=0 即静默丢)')
+  eq(a.decodeStats.exactTps, 500 / 10, 'exactTps = Δoutput(500)/10s')
+})
+
+test('#226-G2 基线竞态 (基线晚于 run.completed 落位) → await 基线后校准仍成功', async () => {
+  let resolveBase
+  const basePromise = new Promise((r) => { resolveBase = r })
+  let calls = 0
+  const h = mkDecodeHarness({ fetchTokensOverride: () => {
+    calls += 1
+    return calls === 1 ? basePromise
+      : Promise.resolve({ output_tokens: 600, reasoning_tokens: 0 })
+  } })
+  h.send('run.started', { run_id: 'r1' })          // 基线在途, 未落位
+  h.send('assistant.delta', { delta: 'x'.repeat(40) })
+  h.clock.now = 6000
+  h.send('run.completed', { messages: [] })        // 基线竞态: 此刻 baseTokens 仍 null
+  await flushMicro()
+  resolveBase({ output_tokens: 100, reasoning_tokens: 0 })
+  await flushMicro(); await flushMicro(); await flushMicro()
+  const a = lastAsst(h)
+  assert(a && a.decodeStats, '基线竞态不得整回合静默跳过校准 (旧代码 baseTokens=null 即 return)')
+  assert(a.decodeStats.exactTps > 0, '精确值应基于 await 到的基线计算')
+})
+
+test('#226-G3 差值始终为 0 (重试耗尽) → 不落 decodeStats (精确值宁缺勿假不变)', async () => {
+  const h = mkDecodeHarness({ tokenSeq: [
+    { output_tokens: 100, reasoning_tokens: 0 },
+    { output_tokens: 100, reasoning_tokens: 0 },
+    { output_tokens: 100, reasoning_tokens: 0 },
+    { output_tokens: 100, reasoning_tokens: 0 },
+    { output_tokens: 100, reasoning_tokens: 0 },
+  ] })
+  h.send('run.started', {})
+  await flushMicro(); await flushMicro()
+  h.send('assistant.delta', { delta: 'abc' })
+  h.clock.now = 5000
+  h.send('run.completed', { messages: [] })
+  await flushMicro(); await flushMicro(); await flushMicro()
+  assert(!h.msgs.some((m) => m.decodeStats), '重试耗尽仍无差值 → 不得造假精确值')
+})
+
+test('#226-G4 收口行渲染回退在位 (approxFallback 条件 + 近似兜底文案)', () => {
+  assert(/const approxFallback =/.test(chatSrc),
+    '#226: 渲染层 approxFallback 回退变量缺失')
+  assert(/\(m\.decodeStats \|\| approxFallback\) &&/.test(chatSrc),
+    '#226: 收口行渲染条件未接入 approxFallback')
+  // 回退条件必须要求: 非流式、回合已收口 (!busy)、有真实近似值、且是本回合最后一条 assistant
+  assert(/!m\.decodeStats && !m\.streaming/.test(chatSrc), '#226: 回退条件缺 streaming/decodeStats 守卫')
+  assert(/!busy && decodeRate != null && decodeRate\.tps > 0/.test(chatSrc),
+    '#226: 回退条件缺 !busy + decodeRate>0 守卫')
+  assert(/messages\.slice\(i \+ 1\)\.some\(\(x\) => x\.role === 'assistant'\)/.test(chatSrc),
+    '#226: 回退未限定「最后一条 assistant」')
+  // 兜底文案必须经 t(decode_speed.approx) 标近似, 不得冒充精确值
+  assert(/`:\s*\$\{t\('chat\.decode_speed\.approx', \{ n: Math\.round\(decodeRate\.tps\) \}\)\}`/.test(chatSrc),
+    '#226: 回退行近似文案未经 t(chat.decode_speed.approx)')
+})
+
+test('#226-G5 #216 去重登记不回退 (assistant.completed → seenIdsRef)', () => {
+  const h = mkDecodeHarness()
+  h.send('assistant.completed', { message_id: 'msg-216', content: 'x' })
+  assert(h.seenIds.has('msg-216'),
+    '#216 回归: assistant.completed 的 message_id 必须登记进 seenIdsRef')
+})
+
 // ── runner ──────────────────────────────────────────────────────────
 let pass = 0, fail = 0
 for (const { name, fn } of tests) {
-  try { fn(); pass++; console.log(`  ✓ ${name}`) }
+  try { await fn(); pass++; console.log(`  ✓ ${name}`) }
   catch (e) { fail++; console.error(`  ✗ ${name}\n    ${e.message}`) }
 }
 console.log(`\n${pass} passed, ${fail} failed`)

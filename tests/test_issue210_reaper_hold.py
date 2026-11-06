@@ -129,7 +129,7 @@ def test_r4b_reaper_source_active_gate_text_guard():
         "relay/补结算扫描的 ACTIVE 门被改宽, HOLD/终态 run 的卡会被误扫")
 
 
-# ── R5/R6: 敲门形状以 ACTIVE 为门 ──────────────────────────────────
+# ── R5: 敲门形状以 ACTIVE 为门 (R6 补档已随 #205 删除) ──────────────
 def test_r5_null_slot_knock_not_for_hold(led):
     from mw import reaper
     _hold_run(led)
@@ -138,18 +138,6 @@ def test_r5_null_slot_knock_not_for_hold(led):
     results: list = []
     reaper._notify_null_slot(led, led.get_active_team_work(), results)
     assert "team_work.null_slot_knock" not in _event_types(led)
-
-
-def test_r6_undelivered_knock_not_for_hold(led):
-    from mw import reaper
-    _hold_run(led)
-    led.clear_team_work_current_card("r_hold")
-    led.set_harvest("t_card", "HARVESTED", exit_code=0)
-    led.set_worker_report("t_card", {"summary": "done"})
-    results: list = []
-    reaper._notify_undelivered_harvest(led, led.get_active_team_work(),
-                                       results)
-    assert "team_work.undelivered_knock" not in _event_types(led)
 
 
 # ── R7: 迟到补结算面不触碰 HOLD run ────────────────────────────────

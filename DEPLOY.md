@@ -461,7 +461,9 @@ What happens automatically after enabling:
 - Console same-origin proxies `/pixel/` to embed pixel-agents (browser
   only sees the console's one port)
 - The "Settings" page -> "pixel-agents" checkbox is a second-level switch;
-  the "pixel-agents" sidebar tab toggles when saved
+  the "pixel-agents" nav entry toggles when saved (the entry sits in the
+  console's left sidebar navigation — the dashboard-fix-20261105 batch
+  restored the sidebar shell on desktop)
 - `verify.sh` check items: sidecar process online + console same-origin
   proxy `/pixel/` returns 200
 
@@ -525,7 +527,7 @@ an upgrade).
 | `verify.sh` shows a red item | the corresponding service didn't start | follow the prompt and check `docker logs`, fix and re-run `verify.sh` |
 | Console reports `gateway unreachable` on macOS/colima | a socket inode on the virtiofs-shared data dir became unreachable in the guest (`Errno 95`); image `>= 0.22.x` (measured: v0.22.4) turns it into a startup abort | see §4.5 — the deploy path now keeps `/opt/data` on a named volume; for an old topology, clear the stale socket on the host and re-run `./deploy/install.sh` |
 | Most workers show as *offline* in the console but their containers are up | the registered `api_url` points at a published host port, so calls go through `docker-proxy` inside the VM, which drops them under load; also check the VM memory (§4.7) | see §4.6 — register `http://hermes_<name>:8642` (container-internal address) |
-| The hold endpoint returns 409 "state changed concurrently" or never takes effect | the issue #210 CHECK migration did not run — a sqlite-level error inside the store init path is swallowed (`except sqlite3.Error: pass`), so the console starts normally but the old schema (no `HOLD` / `hold`) stays in place | check the live DDL: `sqlite3 /mw_data/ledger.db "SELECT sql FROM sqlite_master WHERE name='team_work_runs'"` — it must contain `'HOLD'`; if it does not, restore the pre-migration backup `ledger.db.pre-hold-migration` (see §5.4) and restart |
+| The hold endpoint returns 409 "state changed concurrently" or never takes effect, or console endpoints answer `500 internal_error` after an upgrade | the issue #210 CHECK migration did not complete — since issue #214 a sqlite-level error inside the store init path is **not** swallowed: the migration raises `RuntimeError`, `Ledger()` construction fails, and the transaction rolls back (no half-migrated schema is left in place); the console process itself keeps running and the affected endpoints answer `500 internal_error` with the failure logged | check the live DDL: `sqlite3 /mw_data/ledger.db "SELECT sql FROM sqlite_master WHERE name='team_work_runs'"` — it must contain `'HOLD'`; if it does not, restore the pre-migration backup `ledger.db.pre-hold-migration` (see §5.4) and restart |
 | `${MW_HOME}` gained a `ledger.db.pre-hold-migration` file after an upgrade | automatic pre-migration backup taken before the issue #210 `team_work_runs` table rebuild (§5.4) | it is a pre-migration snapshot; once the new database is confirmed healthy it may be deleted |
 
 ## 4.5 macOS/colima: the control socket on a virtiofs-shared data dir (issue #82)
@@ -819,6 +821,7 @@ other.
 git pull                              # pull updates (middleware mounts code directly, restart takes effect)
 docker restart hermes_main
 ./deploy/verify.sh
+# if the pull changed the tracked frontend (ui/dist or ui/src), re-run ./deploy/install.sh instead — see below
 ```
 
 Restart is only enough for pure code changes. If the pull touched
@@ -836,19 +839,37 @@ regenerates from them on every run. A pull plus a restart leaves the
 previous text in place, so the installer has to run for the new text to
 reach the container.
 
+The same applies when the pull changes the **tracked frontend artifact**
+(`ui/dist/index.html`, or `ui/src` rebuilt into it): the console serves
+`mw/ui_dist`, the deploy-time copy `install.sh` makes from `ui/dist`
+(issue #125, route A), and `git pull` + restart does NOT refresh that copy.
+Re-run `./deploy/install.sh` after such a pull, or the browser keeps
+loading the previous bundle.
+
 ```bash
 git pull
 ./deploy/install.sh    # stop+rm existing container, then docker compose up -d
 ./deploy/verify.sh
 ```
 
-**Console frontend/backend upgrade is atomic.** `mw/` is a single
-directory bind mount, so `git pull` + restart always applies the Python
-proxy and `ui/dist` together — there is no "backend first" intermediate
-state to schedule around. The only mixed-version combination users can
-hit is **stale browser cache**: a browser holding an older `ui/dist`
-bundle against the current backend. Clear the cache (hard reload) when
-the chat page still polls `/messages` with a full-transcript payload.
+**Console backend and frontend deploy through different paths**
+(issue #125, route A). `mw/` is a single directory bind mount, so
+`git pull` + restart applies the Python proxy immediately. Note that a
+`git pull` alone does NOT hot-apply `mw/` Python changes to a running
+console: the process keeps the already-imported modules in memory, so
+whenever the pull leaves a diff under `mw/`, kill the console process
+(`docker exec hermes_main sh -c "pkill -f mw.console || true"`) to trigger
+the watchdog restart that picks the new code up — otherwise new routes
+answer `500 internal_error` against the stale process. The frontend
+bundle is not served from the repo path: `install.sh` copies the tracked
+`ui/dist` build into `mw/ui_dist/` as a deploy-time copy, so new UI only
+takes effect after `./deploy/install.sh` has rebuilt that `mw/ui_dist`
+copy — running the upgrade steps above in order leaves no "backend first"
+intermediate state to schedule around. The other mixed-version
+combination users can hit is **stale browser cache**: a browser holding
+an older bundle against the current backend. Clear the cache (hard
+reload) when the chat page still polls `/messages` with a
+full-transcript payload.
 
 **Only `ui/dist` is tracked; `mw/ui_dist` is a deploy-time copy**
 (issue #125, route A). The repo contains exactly one frontend build
@@ -873,8 +894,11 @@ and `data/share_workspace/ui_dist/` on every run and rewrites their
 
 - `deploy/check_dist_sync.sh` is the local gate for this (wired into
   `deploy/verify.sh`): it fails if `mw/ui_dist` is tracked again, if the
-  local runtime copy drifts from `ui/dist` in either direction, or if
-  `ui/dist/index.html` went missing.
+  local runtime copy drifts from `ui/dist` in either direction, if
+  `ui/dist/index.html` went missing, or if `ui/src`'s last commit is newer
+  than `ui/dist`'s without being rebuilt in the same commit (source drift —
+  a source change whose tracked artifact was not rebuilt; a same-commit
+  rebuild stays green).
 
 When in doubt, `./deploy/install.sh` is always safe (idempotent).
 
@@ -947,12 +971,15 @@ database is confirmed healthy (the file grows with the ledger). The
 `schedule_tasks` rebuild follows the same discipline without a backup
 step.
 
-Failure posture: the migration block sits inside the store init path,
-where a sqlite-level error is swallowed (`except sqlite3.Error: pass`)
-— a failed migration does **not** stop the console; it leaves the old
-schema in place and the hold feature silently inert. If hold/resume
-ever answers 409 or does nothing after an upgrade, check the live DDL
-per the §4 troubleshooting rows.
+Failure posture: the migration block sits inside the store init path;
+since issue #214 a sqlite-level error there is **not** swallowed — the
+migration raises `RuntimeError` and the `Ledger()` construction fails,
+the transaction rolls back and no half-migrated schema is left behind.
+The console process does not crash: the affected endpoints answer
+`500 internal_error` (the failure is logged) until the schema is
+repaired. If hold/resume ever answers 409 or does nothing after an
+upgrade, or an endpoint answers `500 internal_error`, check the live
+DDL per the §4 troubleshooting rows.
 
 ---
 

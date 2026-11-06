@@ -22,6 +22,11 @@ import { fmtDateTime } from '../i18n/fmt.ts'
 // ════════════════════════════════════════════════════════════════════
 
 // ── 小工具 ──────────────────────────────────────────────────────────
+// issue #227: 挂起/恢复按钮图标 (heroicons-outline 系, 与 icons.jsx 同
+// 1.8w 圆头描边)。路径常量就近定义在本文件, 不扩共享图标表 (白名单约束);
+// Icon 组件默认 aria-hidden, 动作含义由按钮文字承载。
+const HOLD_GLYPH = 'M9 5v14M15 5v14' // pause 双竖条
+const RESUME_GLYPH = 'M8 5.14v13.72a1 1 0 001.5.86l11-6.86a1 1 0 000-1.72l-11-6.86a1 1 0 00-1.5.86z' // play 三角
 // [en] ts(x) — short-format timestamp, MM-DD HH:mm 24h in both locales
 //      (interaction-design §8.2). Kills the hardcoded 'zh-CN' that used
 //      to live here.
@@ -356,7 +361,24 @@ function runStatus(s, t) {
   if (s === 'ABORTED') return { label: t('tboard.run_status_aborted'), cls: 'badge-red' }
   if (s === 'ARCHIVED') return { label: t('tboard.run_status_archived'), cls: 'badge-slate opacity-60' }
   if (s === 'CLOSED') return { label: t('tboard.run_status_closed'), cls: 'badge-green' }
+  // #214-3 (UX-V §3.1 / OQ-V-3): HOLD run 可见性 —— badge-yellow「已挂起」,
+  // 无 pulse (冻结态不闪烁)。列表归属不动: historyRuns 按 status!=='ACTIVE'
+  // 自然收纳 HOLD。resume 操作入口已由 Z 批 (#210) 补入 (走既有
+  // hold/resume 端点, 未发明新端点) —— 本行旧口径「不加 resume 操作入口」作废。
+  if (s === 'HOLD') return { label: t('tboard.run_status_hold'), cls: 'badge-yellow' }
   return { label: t('tboard.run_status_unknown'), cls: 'badge-slate' }
+}
+
+// [en] holdResultToast — classify a hold/resume success payload into a toast:
+//      idempotent (was_already) / schedule half-failure (warn) / plain success.
+// [zh-cn] holdResultToast — hold/resume 成功响应三分类: 幂等如实申报 /
+//      排期联动半失败 (warn, 不伪装全成功) / 常规成功。
+function holdResultToast(r, kind, t) {
+  if (r?.schedule_linkage && String(r.schedule_linkage).startsWith('failed'))
+    return { msg: t('tboard.hold_linkage_warn'), type: 'warn' }
+  if (r?.was_already)
+    return { msg: t(kind === 'hold' ? 'tboard.hold_already' : 'tboard.resume_already'), type: 'ok' }
+  return { msg: t(kind === 'hold' ? 'tboard.hold_success' : 'tboard.resume_success'), type: 'ok' }
 }
 
 // [en] classify(t) — single-source derivation (issue #5) of step state.
@@ -598,6 +620,7 @@ function StepTimeline({ detail, currentId, busy, onReply, onCancel, onArchive, t
 // ── 历史任务卡片 (DESIGN §3.4) ──────────────────────────────────────
 function TaskCard({ run, detail, isOpen, loading, err, busy,
                    onToggle, onRetryDetail, onEndRun, onArchiveRun,
+                   holding, onResumeRun,
                    onReply, onCancel, onArchive, onShowTodo, t }) {
   const st = runStatus(run.status, t)
   const cards = (detail?.cards || []).filter((c) => !c.orphan)
@@ -608,7 +631,9 @@ function TaskCard({ run, detail, isOpen, loading, err, busy,
   const timeLabel = run.closed_at
     ? t('tboard.ended_at', { time: ts(mainTime) })
     : t('tboard.created_at', { time: ts(mainTime) })
-  const initialTitle = run.initial_task || t('tboard.empty_initial_task')
+  // dashboard-ui-20261105 R3 口径: 展示位换读 display_title 兜底 initial_task
+  // (impl-be 625df18 只增键; 弹窗标题位保留 #79 折叠抽屉看全文去处不变)
+  const initialTitle = run.display_title || run.initial_task || t('tboard.empty_initial_task')
   return (
     <div className="card overflow-hidden">
       {/* 卡片头: 单行网格 箭头|标题|状态|token|进度|时间|操作 (§3.2, #58 加 token 列);
@@ -649,6 +674,15 @@ function TaskCard({ run, detail, isOpen, loading, err, busy,
             </button>
             {run.status === 'ACTIVE' ? (
               <button onClick={onEndRun} className="btn-danger btn-sm">{t('tboard.finish_task')}</button>
+            ) : run.status === 'HOLD' ? (
+              <>
+                <button onClick={onResumeRun} disabled={holding}
+                        className="btn-accent btn-sm">
+                  <Icon d={RESUME_GLYPH} className="w-3.5 h-3.5" strokeWidth={2} />
+                  {holding ? t('tboard.resume_btn_busy') : t('tboard.resume_btn')}
+                </button>
+                <button onClick={onArchiveRun} className="btn-secondary btn-sm">{t('tboard.confirm_archive_ok')}</button>
+              </>
             ) : run.status !== 'ARCHIVED' ? (
               <button onClick={onArchiveRun} className="btn-secondary btn-sm">{t('tboard.confirm_archive_ok')}</button>
             ) : (
@@ -686,7 +720,8 @@ function TaskCard({ run, detail, isOpen, loading, err, busy,
 // ── 当前任务卡 (DESIGN §3.3) ────────────────────────────────────────
 function CurrentTaskCard({ active, detail, detailErr, closing,
                           onEnd, onReplyCard, onCopy, onRetryDetail,
-                          busy, onCancel, onArchive, onShowTodo, t }) {
+                          busy, onCancel, onArchive, onShowTodo,
+                          holding, onHold, t }) {
   // 全链路预览区折叠位: 默认展开 (需求原话是"看不到", 默认收起等于没修, §2.2)
   const [chainOpen, setChainOpen] = useState(true)
   const cards = (detail?.cards || []).filter((c) => !c.orphan)
@@ -705,7 +740,8 @@ function CurrentTaskCard({ active, detail, detailErr, closing,
   const isHandoff = runState === 'HANDOFF' || cardState === 'HANDOFF'
   const isWaiting = runState === 'WAITING_ACTIVE' || cardState === 'WAITING'
   const canReply = !!cur?.session_id
-  const activeTitle = active.initial_task || t('tboard.empty_initial_task')
+  // dashboard-ui-20261105 R3 口径: display_title 兜底 initial_task (同 run 树标题位)
+  const activeTitle = active.display_title || active.initial_task || t('tboard.empty_initial_task')
   const runLabel = runStatus(active.status, t).label
   const curTitle = active.current_card_title || '—'
   const assignee = active.current_card_assignee || t('tboard.unassigned')
@@ -769,6 +805,11 @@ function CurrentTaskCard({ active, detail, detailErr, closing,
                   className="btn-secondary btn-sm whitespace-nowrap"
                   title={t('tboard.plan_btn_title')}>
             {t('tboard.view_plan_btn')}
+          </button>
+          <button onClick={onHold} disabled={holding}
+                  className="btn-accent btn-sm whitespace-nowrap">
+            <Icon d={HOLD_GLYPH} className="w-3.5 h-3.5" strokeWidth={2} />
+            {holding ? t('tboard.hold_btn_busy') : t('tboard.hold_btn')}
           </button>
           <button onClick={onEnd} disabled={closing}
                   className="btn-danger btn-sm whitespace-nowrap">
@@ -1431,6 +1472,7 @@ export default function TasksBoardView({ onChanged }) {
   const [showArchived, setShowArchived] = useState(false)
   const [closing, setClosing] = useState(false)
   const [archivingRun, setArchivingRun] = useState('')
+  const [holdingRun, setHoldingRun] = useState('')   // #210 Z批: 正在 hold/resume 的 run_id (防连点)
   const [busy, setBusy] = useState({})               // {task_id: 'cancel'|'archive'}
   const [dlg, setDlg] = useState(null)               // 回复弹窗 {task, answer, picked, error}
   const [toast, setToast] = useState(null)           // {msg, type}
@@ -1579,6 +1621,44 @@ export default function TasksBoardView({ onChanged }) {
     },
   })
 
+  // ── 操作: 挂起整条链 (issue #210 Z批, REQ §4.2/§4.3) ──────────────
+  const askHoldRun = (run) => setConfirm({
+    title: t('tboard.confirm_hold_title'),
+    text: t('tboard.confirm_hold_text'),
+    okText: t('tboard.confirm_hold_ok'),
+    action: async () => {
+      setHoldingRun(run.run_id)
+      try {
+        const r = await api.teamWorkHold(run.run_id, { operator: 'console-ui' })
+        setToast(holdResultToast(r, 'hold', t))
+        await Promise.all([loadActive(), loadRuns()])
+        onChanged?.()
+      } catch (e) {
+        // 409 业务文案透传: ApiError.message 即服务端 error 字段 (j() 注入)，
+        // 不走 fmtApiError —— 后者 4xx 走 err.client 模板会吞业务文案 (REQ §4.3)。
+        setToast({ msg: t('tboard.hold_failed', { err: e?.message || fmtApiError(e) }), type: 'bad' })
+      } finally { setHoldingRun('') }
+    },
+  })
+
+  // ── 操作: 恢复挂起的链 ────────────────────────────────────────────
+  const askResumeRun = (run) => setConfirm({
+    title: t('tboard.confirm_resume_title'),
+    text: t('tboard.confirm_resume_text'),
+    okText: t('tboard.confirm_resume_ok'),
+    action: async () => {
+      setHoldingRun(run.run_id)
+      try {
+        const r = await api.teamWorkResume(run.run_id, { operator: 'console-ui' })
+        setToast(holdResultToast(r, 'resume', t))
+        await Promise.all([loadActive(), loadRuns()])
+        onChanged?.()
+      } catch (e) {
+        setToast({ msg: t('tboard.resume_failed', { err: e?.message || fmtApiError(e) }), type: 'bad' })
+      } finally { setHoldingRun('') }
+    },
+  })
+
   // ── 操作: 终止步骤 ────────────────────────────────────────────────
   const askCancel = (step) => setConfirm({
     title: t('tboard.confirm_cancel_title'),
@@ -1698,6 +1778,8 @@ export default function TasksBoardView({ onChanged }) {
           onReplyCard={openReply} onCopy={onCopy}
           onRetryDetail={loadActive}
           busy={busy} onCancel={askCancel} onArchive={askArchive}
+          holding={holdingRun === active.run_id}
+          onHold={() => askHoldRun({ run_id: active.run_id })}
           onShowTodo={() => openTodo(active)} t={t} />
       )}
 
@@ -1734,6 +1816,8 @@ export default function TasksBoardView({ onChanged }) {
                 onRetryDetail={() => loadRunDetail(r.run_id)}
                 onEndRun={() => askEndRun(r)}
                 onArchiveRun={() => askArchiveRun(r)}
+                holding={holdingRun === r.run_id}
+                onResumeRun={() => askResumeRun(r)}
                 onReply={openReply} onCancel={askCancel} onArchive={askArchive}
                 onShowTodo={() => openTodo(r)} t={t} />
             ))

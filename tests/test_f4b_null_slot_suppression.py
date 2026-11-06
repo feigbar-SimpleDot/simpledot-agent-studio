@@ -1,21 +1,19 @@
 """F4b (2026-10-09): null_slot 兜底敲门误报修复的永久回归测试。
 
 移植自 .tasks/t_dc277ea3/testrun/test_f4b_full.py (testing 步独立夹具),
-按 DESIGN §5/§6 承诺入库, 覆盖 T1-T8 + relay env 补充共 12 条语义。
+按 DESIGN §5/§6 承诺入库; issue #205 后 relay 抑制层退役, T4 组与 relay env 补充已删。
 
 覆盖 (对应 docs/DESIGN.md §6 / docs/REQ.md 验收标准):
   T1  current_card_cleared_at 迁移幂等, 旧行 NULL (AC-1)。
   T2  ledger 维护点: clear 落戳 / set 不重置 cleared_at (AC-2, B-2 不变式)。
   T3  核心回归: 清槽 6s 前的原误报场景必须零敲 (AC-3)。
-  T4a relay confirmed 在窗内 → SUPPRESSED_RELAY + trigger/note (AC-4/AC-9)。
-  T4b 在途 claim (COALESCE last_notified_at) 同样抑制。
-  T4c relay 超窗 → 不抑制, 继续走层3 照敲。
+  (T4a/T4b/T4c relay 送达抑制已随 issue #205 修复删除 —— relay 抑制层退役)
   T5a initiator 刚活跃 → SUPPRESSED_INITIATOR (AC-5)。
   T5b MW_REAPER_INITIATOR_LIVENESS=0 → 层3 跳过 → 敲。
-  T6  真死 main 仍敲, 文案「等待 main 派发」且 mins≈60, 去重戳落库 (AC-4/G4)。
+  T6  真死 main 仍敲, 文案 run 级「槽位已空…advance/close」且 mins≈60,
+      去重戳落库 (AC-4/G4)。
   T7  已派发卡 + console 报死 → 照敲, 不扰动 dispatched 路径 (AC-7)。
   T8  initiator 查询抛异常 → fail-open 照敲 (AC-8)。
-  补充 MW_REAPER_RELAY_SUPPRESS_WINDOW_S env 收紧窗口生效性 (DESIGN §4)。
 
 夹具: 全部 tmp_path scratch db, 严禁写 /mw_data。
 跑法: pytest tests/test_f4b_null_slot_suppression.py
@@ -194,47 +192,6 @@ def test_T3_core_regression_zero_knock(tmp_path):
         h.close()
 
 
-# ── T4a relay confirmed 在窗内 → SUPPRESSED_RELAY (AC-4) ──────
-def test_T4a_relay_confirmed_suppressed(tmp_path):
-    h = Harness(tmp_path)
-    try:
-        h.new_run("run_t4a", run_age_s=5700, cleared_at=h.now - 600)
-        h.seed_card("run_t4a", "t_ns", relay=(30, 40))
-        msgs, results = h.knock("run_t4a")
-        assert len(msgs) == 0
-        assert "SUPPRESSED_RELAY" in verdict_of(results)
-        r = [r for r in results if r.get("verdict") == "SUPPRESSED_RELAY"][0]
-        assert r["trigger"] == "null_slot_knock" and r.get("note")  # AC-9
-    finally:
-        h.close()
-
-
-# ── T4b 在途 claim (COALESCE last_notified_at) ────────────────
-def test_T4b_relay_inflight_suppressed(tmp_path):
-    h = Harness(tmp_path)
-    try:
-        h.new_run("run_t4b", run_age_s=5700, cleared_at=h.now - 600)
-        h.seed_card("run_t4b", "t_ns", relay=(None, 30))  # confirmed NULL
-        msgs, results = h.knock("run_t4b")
-        assert len(msgs) == 0
-        assert "SUPPRESSED_RELAY" in verdict_of(results)
-    finally:
-        h.close()
-
-
-# ── T4c relay 超窗 → 不抑制, 继续走层3 ───────────────────────
-def test_T4c_relay_out_of_window_not_suppressed(tmp_path):
-    h = Harness(tmp_path)
-    try:
-        h.new_run("run_t4c", run_age_s=5700, cleared_at=h.now - 600)
-        h.seed_card("run_t4c", "t_ns", relay=(700, 700))  # >300s 窗口
-        msgs, results = h.knock("run_t4c")  # initiator 静默
-        assert "SUPPRESSED_RELAY" not in verdict_of(results)
-        assert "NOTIFIED" in verdict_of(results) and len(msgs) == 1
-    finally:
-        h.close()
-
-
 # ── T5a initiator 刚活跃 → SUPPRESSED_INITIATOR (AC-5) ───────
 def test_T5a_initiator_liveness_suppressed(tmp_path):
     h = Harness(tmp_path)
@@ -272,9 +229,9 @@ def test_T6_truly_dead_main_still_knocks(tmp_path):
         h.seed_card("run_t6", "t_ns")
         msgs, results = h.knock("run_t6", initiator_la=h.now - 7200)
         assert len(msgs) == 1 and "NOTIFIED" in verdict_of(results)
-        assert "等待 main 派发" in msgs[0]
+        assert "槽位已空" in msgs[0] and "advance" in msgs[0]
         import re
-        m = re.search(r"已 ([\d.]+) 分钟", msgs[0])
+        m = re.search(r"已空 ([\d.]+) 分钟", msgs[0])
         assert m and abs(float(m.group(1)) - 60.0) < 0.2, f"mins 应≈60: {msgs[0]}"
         # 敲门去重时刻已落库
         kk = h.led.get_team_work("run_t6")["last_null_slot_knock_at"]
@@ -306,23 +263,5 @@ def test_T8_initiator_query_raises_fail_open(tmp_path):
         h.seed_card("run_t8", "t_ns")  # relay 列 NULL, 查询正常无 relay
         msgs, results = h.knock("run_t8", initiator_raises=True)
         assert len(msgs) == 1 and "NOTIFIED" in verdict_of(results)
-    finally:
-        h.close()
-
-
-# ── 补充: relay 抑制窗口 env 生效性 (DESIGN §4) ───────────────
-def test_extra_relay_window_env_override(tmp_path):
-    h = Harness(tmp_path)
-    try:
-        h.new_run("run_x", run_age_s=5700, cleared_at=h.now - 600)
-        h.seed_card("run_x", "t_ns", relay=(100, 100))
-        # 默认窗口=threshold=300 → 100s 前 relay 抑制
-        msgs, results = h.knock("run_x")
-        assert "SUPPRESSED_RELAY" in verdict_of(results)
-        # env 收紧到 50s → 100s 前不抑制 → 敲
-        msgs2, results2 = h.knock("run_x",
-                                 env={"MW_REAPER_RELAY_SUPPRESS_WINDOW_S": "50"})
-        assert "SUPPRESSED_RELAY" not in verdict_of(results2)
-        assert "NOTIFIED" in verdict_of(results2) and len(msgs2) == 1
     finally:
         h.close()

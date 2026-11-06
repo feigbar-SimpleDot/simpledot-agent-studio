@@ -413,8 +413,14 @@ side sees it.
    by external processes at any time (names/hosts/keys
    all change); re-read once before launch to confirm it
    is stable.
-2. **launch**: `POST /api/team-work/launch`, with
-   workflow_id / session_id / project_workspace /
+2. **launch**: the unified entry for a new chain is
+   enqueueing into the inbox via
+   `POST /api/schedule/tasks` (mainline: inbox task ->
+   start -> create run -> create cards); this launch
+   step is the execution mechanism after the inbox task
+   is triggered, orchestration semantics unchanged.
+   `POST /api/team-work/launch`, with
+   initial_task / session_id / project_workspace /
    steps. Platform auto-injects depends_on chain.
    **launch only auto-dispatches the first card**;
    subsequent cards after claim must be manually

@@ -71,8 +71,11 @@ test('S2-b TasksBoardView 残留恰为 2 (B 批裁决保留的 fail-soft: [1410,
 test('S2-c 调用点合计 >= 13 (issue #87 原文阈值)', () => {
   assert(TOTAL >= 13, `期望 >=13, 实际 ${TOTAL} (WorkersView ${W} + TasksBoardView ${B})`)
 })
-test('S2-d 调用点精确锚 16 —— 覆盖度不得被悄悄削掉 (少一处即红)', () => {
-  assert(TOTAL === 16, `期望 16, 实际 ${TOTAL} (WorkersView ${W} + TasksBoardView ${B})`)
+test('S2-d 调用点精确锚 18 —— 覆盖度不得被悄悄削掉 (少一处即红)', () => {
+  // 16 → 18: Z批 #210 askHoldRun/askResumeRun catch 各新增 1 处
+  // `e?.message || fmtApiError(e)` 兜底调用 (409 业务文案透传主通道为
+  // e?.message, fmtApiError 仅非 ApiError 兜底), 双语同 commit 口径同步上调。
+  assert(TOTAL === 18, `期望 18, 实际 ${TOTAL} (WorkersView ${W} + TasksBoardView ${B})`)
 })
 test('S2-e 两文件都仍在 import fmtApiError (口径前提: 调用点存在)', () => {
   for (const [n, s] of [['WorkersView', workers], ['TasksBoardView', board]])

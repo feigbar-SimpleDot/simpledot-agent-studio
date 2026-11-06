@@ -7,8 +7,8 @@ import { Toast, Modal, Confirm } from '../components/ui.jsx'
 // ScheduleView — 收件箱 TAB (原任务排期) 视图 (issue #164, ARCH-164 §3.2)
 //
 // 结构: 顶栏自动执行开关 + busy 提示 / 倒计时条(进度条 + 立即执行) /
-//       修改弹窗(仅 paused) / 四分组列表 (执行中 / 未执行+定时预览 /
-//       已暂停 / 已完成取消)。
+//       修改弹窗(仅 paused) / 五分组列表 (执行中 / 已挂起 / 未执行+定时
+//       预览 / 已暂停 / 已完成取消)。
 //
 // issue #164 追加 (ENTRY-164B): 排期页不再有「新建任务」入口 —— 排期是任务
 // 唯一入口, 新建统一走「发起多智能体协作」弹窗入队 (ChatView.submitTeamWork);
@@ -28,6 +28,10 @@ import { Toast, Modal, Confirm } from '../components/ui.jsx'
 
 // 操作可见性纯函数: pending→[暂停,取消]; paused→[恢复,取消,修改];
 // running→[](停止通道是看板 close); done→[]; cancelled→[删除]。
+//
+// #214: hold 行无操作按钮 —— 恢复走 run 级 resume (api_team_work_hold_resume),
+// 收件箱不提供任务级解冻入口 (AC-V-4 判据 5 红线: 不得让 hold 进入任何
+// 处理队列或推进路径)。默认分支返回 [] 已满足, 此处仅固化注释。
 export function schedActions(status) {
   if (status === 'pending') return ['pause', 'cancel']
   if (status === 'paused') return ['resume', 'cancel', 'edit']
@@ -35,10 +39,13 @@ export function schedActions(status) {
   return []
 }
 
-// 状态徽标 (5 态机器值 → 颜色类; 未知值降级 slate, #142 原型链防御同法)
+// 状态徽标 (机器值 → 颜色类; 未知值降级 slate, #142 原型链防御同法)
+// #214: hold 用 badge-yellow (warn) —— paused 已占 slate (灰=用户主动暂停),
+// hold 是 run 冻结联动、需要「被冻住待处理」的警示感 (UX-V §2.4 / main 裁决 R-5)。
 const STATE_BADGE = {
   pending: 'badge-blue',
   paused: 'badge-slate',
+  hold: 'badge-yellow',
   running: 'badge-green',
   done: 'badge-purple',
   cancelled: 'badge-red',
@@ -76,15 +83,20 @@ export function fmtCountdown(sec) {
   return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`
 }
 
-// 四分组切分 (纯函数, 供单测): 组0 running / 组1 pending / 组2 paused /
-// 组3 done+cancelled。服务端已按 (组序, 组内序) 预排, 这里只切不重排。
+// 五分组切分 (纯函数, 供单测): 组0 running / 组1 hold / 组2 pending /
+// 组3 paused / 组4 done+cancelled。服务端已按 (组序, 组内序) 预排, 这里只切不重排。
 //
 // issue #197: paused 从「未执行」组独立出来 (OQ-1 裁决) —— 暂停任务必须
 // 排除出待执行列表 (AC-Q197-6), 但要保留可见入口以便恢复。
+// issue #214 (UX-V §2.2 / OQ-V-2 定稿): hold 独立分组 —— hold 任务不进
+// 处理队列, 不能落 done, 也不能并入 pending (pending 组 = 执行队列可视化,
+// 并入即视觉宣称它是下一个执行的); 显式分支置于 running 之后, 渲染时
+// 置顶于「未执行」组正上方 (物理「落在待处理任务的顶部」, 语义不入队)。
 export function schedGroups(tasks) {
-  const g = { running: [], pending: [], paused: [], done: [] }
+  const g = { running: [], hold: [], pending: [], paused: [], done: [] }
   for (const t of (Array.isArray(tasks) ? tasks : [])) {
     if (t.status === 'running') g.running.push(t)
+    else if (t.status === 'hold') g.hold.push(t)
     else if (t.status === 'pending') g.pending.push(t)
     else if (t.status === 'paused') g.paused.push(t)
     else g.done.push(t)
@@ -112,6 +124,18 @@ export function mergePendingWithCron(pendingTasks, cronJobs) {
 
 const COUNTDOWN_TOTAL = 300   // 5 分钟 (与后端 COUNTDOWN_S 同值)
 
+// 折叠箭头 (#213: 照 TasksBoardView 行 462-470 同款 16px SVG; 该组件未
+// 导出, 此处复制简化版, 不新引依赖)。展开态旋转 90°, 纯装饰 aria-hidden。
+function Chevron({ open }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+         className={`w-4 h-4 text-dim transition-transform shrink-0 ${open ? 'rotate-90' : ''}`}>
+      <path d="M9 6l6 6-6 6" />
+    </svg>
+  )
+}
+
 export default function ScheduleView({ onNavigate }) {
   const { t } = useTranslation()
   const [tasks, setTasks] = useState([])
@@ -130,6 +154,17 @@ export default function ScheduleView({ onNavigate }) {
   const [formSaving, setFormSaving] = useState(false)
   // 立即执行二次确认
   const [confirmRun, setConfirmRun] = useState(false)
+  // #213: 展开详情的任务 id 集合 (Set<task.id> 跨 5s 轮询稳定, id 不变;
+  // 多行可同时展开, 不做手风琴互斥; 任务消失后残留 id 无害, 不清理)
+  const [openDetail, setOpenDetail] = useState(() => new Set())
+  const toggleDetail = useCallback((id) => {
+    setOpenDetail((s) => {
+      const next = new Set(s)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
   const tickRef = useRef(null)
 
   const refreshState = useCallback(() => {
@@ -220,12 +255,19 @@ export default function ScheduleView({ onNavigate }) {
   const busyReason = state?.busy_reason
 
   // 行渲染 (task 与 cron 预览共用行壳, cron 背景色区分 + 无操作按钮)
+  // #213: 内容区点击折叠展开任务详情 (UX-V §1 定稿); 操作按钮容器
+  // stopPropagation 防误触 —— 点按钮只触发各自动作, 点行只 toggle。
   const renderTaskRow = (task) => {
     const acts = schedActions(task.status)
+    const open = openDetail.has(task.id)
     return (
       <div key={task.id} className="card px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-2">
-        <div className="flex-1 min-w-0">
+        <div className="flex-1 min-w-0 cursor-pointer select-none"
+             role="button" tabIndex={0} aria-expanded={open}
+             onClick={() => toggleDetail(task.id)}
+             onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleDetail(task.id) } }}>
           <div className="flex items-center gap-2 flex-wrap">
+            <Chevron open={open} />
             <span className="text-sm text-ink truncate max-w-[360px]" title={task.title}>{task.title}</span>
             <span className={schedPrioBadge(task.priority)}>{t(`schedule.prio.${task.priority}`, { defaultValue: task.priority })}</span>
             <span className={schedStateBadge(task.status)}>{t(`schedule.state.${schedStateKey(task.status)}`)}</span>
@@ -240,8 +282,18 @@ export default function ScheduleView({ onNavigate }) {
             {' · '}<span className={task.workflow && task.workflow !== 'auto' ? undefined : 'opacity-60'}>{t('schedule.meta_workflow')}: {task.workflow || 'auto'}</span>
             {task.last_error ? <span className="text-bad"> · {task.last_error}</span> : null}
           </div>
+          {/* #213 展开区 (UX-V §1.2 逐字): detail 全文 whitespace-pre-wrap 保留
+              换行不截断; max-h-[240px] 内部滚动兜超长 detail; 空 detail 显式空态 */}
+          {openDetail.has(task.id) && (
+            <div className="mt-2 rounded-lg bg-panel2/60 border border-line px-3.5 py-3 max-h-[240px] overflow-y-auto">
+              <div className="text-[11px] font-semibold text-dim mb-1">{t('schedule.detail.label')}</div>
+              {task.detail
+                ? <div className="text-[13px] text-ink whitespace-pre-wrap break-words">{task.detail}</div>
+                : <div className="text-[13px] text-dim italic">{t('schedule.detail.empty')}</div>}
+            </div>
+          )}
         </div>
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
           {task.status === 'running' && onNavigate && (
             <button className="btn-ghost btn-sm" onClick={() => onNavigate('tasks-board')}>
               {t('schedule.btn.view_board')}
@@ -293,8 +345,8 @@ export default function ScheduleView({ onNavigate }) {
     </div>
   )
 
-  const empty = groups.running.length === 0 && merged.length === 0 &&
-    groups.paused.length === 0 && groups.done.length === 0
+  const empty = groups.running.length === 0 && groups.hold.length === 0 &&
+    merged.length === 0 && groups.paused.length === 0 && groups.done.length === 0
 
   return (
     <div className="max-w-4xl mx-auto space-y-3">
@@ -350,7 +402,15 @@ export default function ScheduleView({ onNavigate }) {
         <div className="space-y-2">{groups.running.map(renderTaskRow)}</div>
       </>}
 
-      {/* 分组2 未执行 (pending + cron 预览按时间同轴混排, 升序 = 早的在上) */}
+      {/* 分组2 已挂起 (#214 / UX-V §2.3: 独立 hold 组, 渲染在「未执行」组
+          正上方 —— 物理「落在待处理任务的顶部」, 语义不进执行队列;
+          opacity-90 与 paused 组同级弱化) */}
+      {groups.hold.length > 0 && <>
+        {sectionTitle('schedule.group.hold', groups.hold.length)}
+        <div className="space-y-2 opacity-90">{groups.hold.map(renderTaskRow)}</div>
+      </>}
+
+      {/* 分组3 未执行 (pending + cron 预览按时间同轴混排, 升序 = 早的在上) */}
       {merged.length > 0 && <>
         {sectionTitle('schedule.group.pending', groups.pending.length)}
         <div className="space-y-2">
@@ -360,14 +420,14 @@ export default function ScheduleView({ onNavigate }) {
         </div>
       </>}
 
-      {/* 分组3 已暂停 (issue #197 / OQ-1: 暂停任务排除出待执行列表, 但保留
+      {/* 分组4 已暂停 (issue #197 / OQ-1: 暂停任务排除出待执行列表, 但保留
           可见入口以便恢复; 操作集复用 schedActions('paused')) */}
       {groups.paused.length > 0 && <>
         {sectionTitle('schedule.group.paused', groups.paused.length)}
         <div className="space-y-2 opacity-90">{groups.paused.map(renderTaskRow)}</div>
       </>}
 
-      {/* 分组4 已完成/取消 (底部, 前端截 50) */}
+      {/* 分组5 已完成/取消 (底部, 前端截 50) */}
       {groups.done.length > 0 && <>
         {sectionTitle('schedule.group.done', groups.done.length)}
         <div className="space-y-2 opacity-80">{groups.done.map(renderTaskRow)}</div>

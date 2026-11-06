@@ -32,7 +32,8 @@
     "worker_chat_title": "Worker · {name}",
     "workers_subtitle": "注册路由 / 生成 compose / 查看运行元数据",
     "workflows_subtitle": "工作流模板 · 决定协作任务拆解粒度",
-    "subtitle_schedule": "收件箱 · 任务队列自动衔接执行"
+    "subtitle_schedule": "收件箱 · 任务队列自动衔接执行",
+    "subtitle_dashboard": "总览 · 一眼看清系统状态"
   },
   "chat": {
     "commands": {
@@ -117,7 +118,7 @@
       "connected_session": "已连接会话",
       "current_badge": "当前",
       "empty_hint": "直接输入消息开始对话",
-      "empty_hint_intro": "直接输入需求开始对话;需要多个执行者分工的大任务,点上方「多智能体协作」一键发起。",
+      "empty_hint_intro": "直接输入需求开始对话;需要多个执行者分工的大任务,点上方「添加任务」一键发起。",
       "history_empty": "暂无历史会话",
       "load_more": "更多历史对话",
       "history_loading": "加载历史中…",
@@ -128,7 +129,7 @@
       "no_history": "暂无历史",
       "session_history_title": "历史会话",
       "session_toast_new": "✓ 已开启新会话",
-      "start_teamwork_btn": "发起多智能体协作"
+      "start_teamwork_btn": "添加任务"
     },
     "team_work_modal": {
       "attach_label": "附件",
@@ -148,7 +149,7 @@
       "task_placeholder": "例:给后台加上用户登录功能...",
       "task_requirement": "任务需求",
       "task_requirement_hint": "描述清楚要做什么。选 workflow 后,系统会按 workflow 的标准步骤拆解。",
-      "title": "发起多智能体协作任务",
+      "title": "添加任务",
       "workflows_count": "共 {n} 个 workflow 可选",
       "workflows_unreachable": "后端 workflow 列表暂不可达,只显示 Auto-select",
       "workspace_hint": "本任务所有执行者在此目录产出文件。留空则继承当前对话的工作目录;需要新目录可在顶栏「工作目录」处创建。",
@@ -230,7 +231,8 @@
     "tasks_board": "任务看板",
     "workers": "Worker 管理",
     "workflows": "Workflow 管理",
-    "schedule": "收件箱"
+    "schedule": "收件箱",
+    "dashboard": "总览"
   },
   "cron": {
     "action": {
@@ -390,6 +392,12 @@
     "confirm_finish_ok": "确定结束",
     "confirm_finish_text": "结束后，这个任务将停止运行，未完成的部分会被清理。历史记录会保留。停止后无法恢复，确定吗？",
     "confirm_finish_title": "结束任务？",
+    "confirm_hold_ok": "挂起",
+    "confirm_hold_text": "挂起后这条链停止推进：正在跑的 worker 进程不会被杀，名下排期任务同步挂起，随时可恢复。",
+    "confirm_hold_title": "挂起这条任务链？",
+    "confirm_resume_ok": "恢复",
+    "confirm_resume_text": "恢复后链继续推进，挂起的排期任务回到待执行队列顶部；若已有另一条执行中的链将被拒绝。",
+    "confirm_resume_title": "恢复这条任务链？",
     "created_at": "创建于 {time}",
     "current_step_block_label": "当前步骤",
     "current_step_pending": "步骤切换中，等待平台调度",
@@ -407,6 +415,12 @@
     "handoff_hint": "平台正在切换下一张卡，几秒钟后由 main 接管",
     "handoff_state_short": "交接中",
     "history_title": "历史任务 ({n})",
+    "hold_already": "该链已是挂起状态",
+    "hold_btn": "挂起",
+    "hold_btn_busy": "挂起中…",
+    "hold_failed": "挂起失败: {err}",
+    "hold_linkage_warn": "已冻结，但排期联动失败，请检查排期页",
+    "hold_success": "已挂起",
     "loading_error_detail": "步骤详情加载失败：{err}",
     "loading_error_runs": "任务列表 {err}",
     "loading_error_tasks": "任务状态 {err}",
@@ -424,11 +438,17 @@
     "reply_submit": "提交并继续",
     "reply_submit_busy": "发送中…",
     "reply_conflict": "已提交，但 ⚠ {conflict}",
+    "resume_already": "该链已是执行中状态",
+    "resume_btn": "恢复",
+    "resume_btn_busy": "恢复中…",
+    "resume_failed": "恢复失败: {err}",
+    "resume_success": "已恢复",
     "retry": "重试",
     "run_status_aborted": "已中止",
     "run_status_active": "进行中",
     "run_status_archived": "已归档",
     "run_status_closed": "已结束",
+    "run_status_hold": "已挂起",
     "run_status_unknown": "未知",
     "show_archived": "显示已归档",
     "state_attention": "等你回复",
@@ -546,6 +566,7 @@
     "field": {
       "api_key": "API 密钥",
       "api_key_hint": "上游服务提供方密钥, 只持久化在控制台主机, 不会发送到浏览器。",
+      "api_key_edit_hint": "留空 = 不修改已保存的密钥; 输入新值 (≥16 位) 则覆盖。",
       "api_url": "API URL",
       "api_url_hint": "OpenAI 兼容 / anthropic 兼容上游端点, 例如 https://api.example.com/v1。",
       "compose_dir": "Worker compose 存放目录 [宿主机]",
@@ -810,6 +831,7 @@
   "schedule": {
     "group": {
       "running": "执行中",
+      "hold": "已挂起",
       "pending": "未执行",
       "paused": "已暂停",
       "done": "已完成 / 取消"
@@ -817,6 +839,7 @@
     "state": {
       "pending": "待执行",
       "paused": "暂停",
+      "hold": "挂起",
       "running": "执行中",
       "done": "已完成",
       "cancelled": "取消",
@@ -848,9 +871,13 @@
     "meta_workspace": "工作区",
     "meta_workspace_default": "默认",
     "meta_workflow": "流程",
+    "detail": {
+      "label": "任务详情",
+      "empty": "该任务没有详情内容"
+    },
     "empty": {
       "title": "收件箱还是空的",
-      "hint": "点击顶栏「发起多智能体协作」, 任务会加入收件箱队列"
+      "hint": "点击顶栏「添加任务」, 任务会加入收件箱队列"
     },
     "form": {
       "edit_title": "修改收件箱任务",
@@ -873,5 +900,61 @@
       "auto_off": "自动执行已关闭",
       "run_started": "已发起执行"
     }
+  },
+  "dashboard": {
+    "c1_title": "系统健康",
+    "c1_reaper_alive": "Reaper 在线",
+    "c1_reaper_dead": "Reaper 离线",
+    "c1_reaper_unknown": "状态未知",
+    "c1_auto_on": "自动执行 开",
+    "c1_auto_off": "自动执行 关",
+    "c1_countdown": "倒计时 {n}s",
+    "c1_countdown_idle": "倒计时未启动",
+    "c2_title": "进行中的链",
+    "c2_empty": "暂无进行中的链",
+    "c2_current_card": "当前卡: {assignee} · {status}",
+    "c2_cards": "{n} 卡",
+    "c2_tokens": "{n} tokens",
+    "c3_title": "收件箱队列",
+    "c3_pending": "待执行",
+    "c3_running": "执行中",
+    "c3_paused": "已暂停",
+    "c3_hold": "已挂起",
+    "c3_done_24h": "24h 完成",
+    "c3_hold_warn": "有挂起任务待处理",
+    "c4_title": "Worker 活体",
+    "c4_empty": "暂无活体 worker",
+    "c4_count": "{n} 个在线",
+    "z0_runs_unit": "个 run",
+    "z1_title": "活跃 Worker",
+    "z1_empty": "当前无活跃 worker",
+    "z1_inactive": "不活跃",
+    "enter_chat": "进入对话",
+    "z2_token_title": "Token 消耗 · 最近 10 个任务",
+    "z2_inbox_title": "收件箱分布",
+    "chart_no_data": "无 token 数据",
+    "chart_total": "任务",
+    "c5_title": "最近收口",
+    "c5_empty": "暂无收口记录",
+    "c5_closed": "已收口",
+    "c5_aborted": "已中止",
+    "error": "加载失败",
+    "retry": "重试",
+    "loading": "加载中…",
+    "c2_todo_unavailable": "步骤暂不可用",
+    "c2_section_pending": "待执行",
+    "c2_section_done": "已完成",
+    "c2_section_dropped": "已放弃",
+    "c2_current_prefix": "当前:",
+    "r5_next_task": "下一任务",
+    "r5_run_now": "立即开始",
+    "r5_run_now_ok": "已触发立即开始",
+    "r5_run_now_off_auto": "自动执行已关闭",
+    "r5_run_now_off_idle": "当前无倒计时",
+    "r4_idle": "空闲",
+    "z1_working_title": "工作中",
+    "z1_idle_empty": "暂无空闲 worker",
+    "r4_run_label": "当前 run",
+    "z2_worker_token_title": "Worker Token 消耗 · 近 24h"
   }
 }

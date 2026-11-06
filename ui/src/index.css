@@ -36,6 +36,23 @@
     @apply btn bg-accent text-white hover:brightness-110 active:brightness-95
            shadow-[0_1px_0_0_rgb(255_255_255/0.1)_inset];
   }
+  /* issue #227: .btn-secondary 此前被 6 处调用点引用却从未定义 ⇒
+     挂起/恢复/归档/查看排期按钮渲染成无样式文本, 「不像可操作按钮」。
+     补中性次级按钮实体 (panel2 底 + 描边), 与 ghost 同层级但语义独立。 */
+  .btn-secondary {
+    @apply btn bg-panel2 text-ink border border-line hover:border-accent/60 hover:text-accent;
+  }
+  /* issue #227: 强调色变体 —— 挂起/恢复这类低频但关键的动作需要介于
+     primary(实心) 与 secondary(中性) 之间的视觉层级: accent 淡底 + 描边。
+     s6b (test-report §5 观察1, P2): text-accent 在 accent/15 合成表面上
+     对比度不足 (亮色 4.01:1 / 暗色 HOLD 行 4.02:1 < WCAG 1.4.3 的 4.5:1),
+     label 改用 text-ink, 强调仅靠 accent 淡底 + accent 描边表达。
+     实测 (WCAG 相对亮度公式): 亮色 label(15,23,42)/表面(216,227,249)
+     = 13.84:1; 暗色 label(226,232,240)/HOLD 表面(22,39,73) = 11.99:1。 */
+  .btn-accent {
+    @apply btn bg-accent/15 text-ink border border-accent/40
+           hover:bg-accent/30 hover:border-accent;
+  }
   .btn-ghost {
     @apply btn bg-panel2 text-ink border border-line hover:border-accent/60 hover:text-accent;
   }
@@ -343,6 +360,30 @@
 .anim-stopped .wcard-gfx-working::after { animation-play-state: paused; }
 .anim-stopped .wcard-spin { animation-play-state: paused; }
 
+/* ── dashboard-fix-20261105 R-B: 工作中 worker 大卡动效边框 (红线 L3) ──
+   呼吸式边框: accent 描边透明度 + 外辉光 2.4s 往复 (纯 CSS, 复用 --c-accent
+   token, 无新色值); 与 wcard-pulse 同族节奏纪律。prefers-reduced-motion 与
+   .anim-stopped 双通道降级 (同下方全局块显式停死清单)。 */
+@keyframes wcard-live-border {
+  0%, 100% {
+    border-color: rgb(var(--c-accent) / 0.35);
+    box-shadow: 0 0 0 0 rgb(var(--c-accent) / 0);
+  }
+  50% {
+    border-color: rgb(var(--c-accent) / 0.85);
+    box-shadow: 0 0 12px 1px rgb(var(--c-accent) / 0.25);
+  }
+}
+.wcard-live { animation: wcard-live-border 2.4s ease-in-out infinite; }
+.anim-stopped .wcard-live { animation-play-state: paused; }
+
+/* ── dashboard 驾驶舱 (dashboard-cockpit-20261105, DESIGN-UX §2.2) ── */
+/* F6 不活跃 worker 置灰: 灰度滤镜只压头像 img, 不压文字 —— 整卡 filter 会
+   把文字对比度一起拉低破 A6-2; 文字用 --c-dim (对 panel 底暗色 6.96:1 /
+   亮色 4.76:1, WCAG 实算均 ≥4.5)。状态切换过渡仅 filter/opacity 300ms。 */
+.worker-dim { filter: grayscale(1); opacity: .55; transition: filter 300ms, opacity 300ms; }
+.worker-dim-name { color: rgb(var(--c-dim)); }
+
 /* 移动触控目标 (DESIGN §1.3) */
 @media (max-width: 767px) {
   .wcard-touch button { min-height: 40px; }
@@ -479,6 +520,7 @@
      全局 spinner / Tailwind animate-pulse|spin */
   .sas-status-bar, .sas-status-bar .spin, .sas-typing-dot,
   .wcard-gfx-working::after, .wcard-spin, .spin,
+  .wcard-live,
   .animate-pulse, .animate-spin {
     animation: none !important;
   }

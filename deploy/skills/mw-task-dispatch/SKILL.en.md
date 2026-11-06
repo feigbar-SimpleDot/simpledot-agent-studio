@@ -13,7 +13,9 @@ metadata:
 This environment is a multi-container Agent matrix. **1A boundary: card lifecycle belongs to you (main); the worker is
 only spawned by mw.** mw never builds a kanban card — you do.
 
-⚠️ **Dispatch MUST go through `POST /api/team-work/launch`, never use `mw.cli dispatch`.**
+⚠️ **The only call point for creating a new Team Work task is enqueueing into the inbox via `POST /api/schedule/tasks` (the same entry as the web console's "Add Task" button); the mainline = inbox task -> start -> create run -> create cards.** Execution after the trigger MUST go through `POST /api/team-work/launch`, never use `mw.cli dispatch`.
+
+`launch` is the **execution mechanism** after an inbox task is triggered (or when main orchestrates a chain on the fly), not the new-task entry.
 
 `launch` is the **only trigger** that creates a `team_work_runs` row in the ledger: the instant you create your cards,
 launch synchronously writes the run into the ledger (`run_id` + each card's `team_work_run_id` + initiating session +
@@ -27,6 +29,10 @@ and reaper SKIPs it (orphan card, the chain is dead).
 - The user asks "let worker / coder / some agent do X"
 - The task needs isolated execution and auditable settlement
 - The user mentions: dispatch, distribute, hand off, multi-agent, task matrix, worker, Team Work (`派发/分发/委派/多智能体/任务矩阵`)
+
+## New-Task Entry (unified call point)
+
+Creating a new Team Work task starts with enqueueing into the inbox via `POST /api/schedule/tasks` (the same entry as the web console's "Add Task" button): put the original request in `detail`; the `workflow` / `workspace` fields map one-to-one to `api_schedule_create`. The engine evaluates immediately via `evaluate_now()` and, when due, triggers main with an equivalent message to create cards and dispatch — mainline = inbox task -> start -> create run -> create cards. The three steps below = the execution flow after the trigger.
 
 ## How to Dispatch (three steps, fixed order)
 
@@ -71,7 +77,7 @@ launch response:
 Fill **your own** Hermes `session_id` (reaper uses it to deliver worker reports back to you,
 `POST /api/sessions/<sid>/chat`).
 
-- From the "Start multi-agent collaboration" button in the console: the request text already has `session_id: "<sid>"` injected, **use
+- From the "Add Task" button in the console: the request text already has `session_id: "<sid>"` injected, **use
   it directly**.
 - If unsure of your `session_id`: read it from your system prompt (format `api_<timestamp>_<8hex>`), or copy it from the
   console session list.
@@ -123,6 +129,36 @@ When a card cannot continue and you need to yield to the next inbox task,
 `hold` and the next inbox task starts its countdown normally). When the user
 asks to resume this run, `POST /api/team-work/<run_id>/hold/resume` thaws it
 (a second ACTIVE run ⇒ 409).
+
+```bash
+curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/hold \
+  -H 'Content-Type: application/json' \
+  -d '{"reason":"user_hold:用户要求暂停","operator":"main"}'
+
+curl -s -X POST http://127.0.0.1:8700/api/team-work/<run_id>/hold/resume \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"main"}'
+```
+
+Protocol summary (verbatim in sync with main-soul's "hold / resume: protocol
+for freezing and thawing a chain" section):
+
+- **Trigger**: hold only when the user explicitly asks in the main conversation
+  to pause/hold/freeze the current chain; resume only when the user explicitly
+  asks. main must never hold on its own without a user instruction.
+- **After hold**: do not advance, do not dispatch; on a knock/notification check
+  the run status first — if HOLD, do not process and do not resume.
+- **Error handling**: 409 "another run is already running" → report faithfully
+  to the user and wait for their decision; main must never auto-close another
+  run to free the slot; 404 → verify the run_id; idempotent success
+  (`was_already:true`) → acknowledge normally.
+- **Acknowledgement**: after every hold/resume call report the result (success
+  or failure reason) back to the user — no black boxes.
+- **Boundary restated**: hold ≠ abandon (abandon goes through close/archive);
+  hold does not kill worker processes and does not touch current_card_id.
+- **Schedule linkage**: `schedule_linkage:"failed: …"` in the response means
+  the run freeze succeeded but the schedule side half-failed; declare it
+  faithfully in the acknowledgement.
 
 ### Field rules (violating → 400/422 rejection)
 

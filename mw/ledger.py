@@ -449,14 +449,33 @@ class Ledger:
                     self.conn.execute("PRAGMA foreign_keys=ON")
             # 2026-10-06 Team Work 归档 (run 列表收缩):CHECK constraint
             # 加 ARCHIVED 值。SQLite 的 ALTER TABLE 不能改 CHECK,只能
-            # rebuild 表:drop → 重建(保留所有数据)。降级路径:db_version
-            # 改 ≥6 才执行(其他版本 LIKE 重建不波及)。
+            # rebuild 表:drop → 重建(保留所有数据)。
+            # 2026-11-04 issue #214-1 修复 (照上方 HOLD 块先例):
+            #   - 门控改内容判据 (建表 SQL 是否已含 'ARCHIVED') 而非
+            #     db_version —— 纯版本号门控在「SCHEMA 已含 ARCHIVED+HOLD
+            #     但 user_version 仍为 0 的库」(新建库/历史静默失败库,
+            #     现网常态) 上会把已是新 schema 的表重建回旧 schema,
+            #     静默丢 hold_* 列与 HOLD CHECK。内容门控天然幂等。
+            #   - 旧式 `INSERT SELECT *` 在新旧列集不同时必炸
+            #     (OperationalError) 且被外层吞掉 —— 改显式列交集拷贝 +
+            #     行数校验, 拒绝半迁移。
+            #   - 重建 DDL 升级为当前全量 schema (与 HOLD 块建表语句一致),
+            #     迁移终态 == SCHEMA, 不再触发 HOLD 块二次重建。
+            # 执行顺序上 HOLD 块在前 (行 368 注释已固化): HOLD 块重建后的
+            # DDL 已含 ARCHIVED ⇒ 本块自然跳过, 两迁移收敛到同一终态。
+            tw_ddl2 = self.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name='team_work_runs'").fetchone()
             db_version = self.conn.execute(
                 "PRAGMA user_version").fetchone()[0]
-            if db_version < 6:
+            if tw_ddl2 and tw_ddl2[0] and "ARCHIVED" not in tw_ddl2[0]:
                 self.conn.execute("PRAGMA foreign_keys=OFF")
                 self.conn.execute("BEGIN")
                 try:
+                    n_before = self.conn.execute(
+                        "SELECT COUNT(*) FROM team_work_runs").fetchone()[0]
+                    old_cols = [r["name"] for r in self.conn.execute(
+                        "PRAGMA table_info(team_work_runs)").fetchall()]
                     # 重建 team_work_runs
                     self.conn.execute(
                         "ALTER TABLE team_work_runs "
@@ -469,20 +488,36 @@ class Ledger:
                         "    project_workspace   TEXT,"
                         "    current_card_id     TEXT,"
                         "    status              TEXT NOT NULL DEFAULT 'ACTIVE'"
-                        "        CHECK(status IN ('ACTIVE','CLOSED',"
+                        "        CHECK(status IN ('ACTIVE','HOLD','CLOSED',"
                         "                          'ABORTED','ARCHIVED')),"
                         "    card_count          INTEGER NOT NULL DEFAULT 0,"
                         "    created_at          REAL NOT NULL,"
                         "    closed_at           REAL,"
                         "    closed_reason       TEXT,"
                         "    last_null_slot_knock_at REAL,"
-                        # F4b (2026-10-09): 与 A-1 迁移列同步, 防
-                        # INSERT SELECT * 列数不匹配
-                        "    current_card_cleared_at REAL"
+                        "    current_card_cleared_at REAL,"
+                        "    current_card_handoff_at REAL,"
+                        "    last_waiting_at     REAL,"
+                        "    hold_reason         TEXT,"
+                        "    hold_actor          TEXT,"
+                        "    hold_at             REAL"
                         ")")
+                    # 显式列交集拷贝 (不用 INSERT SELECT * —— 新旧列集
+                    # 可能不同, 显式列免疫列数不匹配, #214-1 的教训)
+                    new_cols = [r["name"] for r in self.conn.execute(
+                        "PRAGMA table_info(team_work_runs)").fetchall()]
+                    copy_cols = [c for c in new_cols if c in old_cols]
+                    col_sql = ", ".join(copy_cols)
                     self.conn.execute(
-                        "INSERT INTO team_work_runs "
-                        "SELECT * FROM team_work_runs__old")
+                        f"INSERT INTO team_work_runs ({col_sql}) "
+                        f"SELECT {col_sql} FROM team_work_runs__old")
+                    n_after = self.conn.execute(
+                        "SELECT COUNT(*) FROM team_work_runs").fetchone()[0]
+                    if n_after != n_before:
+                        raise RuntimeError(
+                            f"#214 ARCHIVED 迁移行数校验失败: 迁移前 "
+                            f"{n_before} 行, 迁移后 {n_after} 行 — "
+                            "回滚, 拒绝半迁移")
                     self.conn.execute(
                         "DROP TABLE team_work_runs__old")
                     self.conn.execute(
@@ -492,13 +527,14 @@ class Ledger:
                     self.conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_team_work_status "
                         "ON team_work_runs(status, created_at DESC)")
-                    self.conn.execute("PRAGMA user_version = 6")
                     self.conn.execute("COMMIT")
                 except Exception:
                     self.conn.execute("ROLLBACK")
                     raise
                 finally:
                     self.conn.execute("PRAGMA foreign_keys=ON")
+            if db_version < 6:
+                self.conn.execute("PRAGMA user_version = 6")
             # 索引 schema CREATE 在 SCHEMA 字符串里 CREATE TABLE IF NOT
             # EXISTS 已覆盖;但 SQLite 的 ALTER TABLE ADD COLUMN 没法自动加
             # 索引,这里补一个 idx_harvest_run 兜底(幂等)。
@@ -516,8 +552,14 @@ class Ledger:
                 "CREATE INDEX IF NOT EXISTS idx_team_work_initiator "
                 "ON team_work_runs(initiator_session)")
             self.conn.commit()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as e:
+            # 2026-11-04 issue #214-1 fail-loud: 外层 try 内全部语句均为
+            # schema 迁移, 各子块自带 PRAGMA 门控幂等 + 事务回滚, 无「可
+            # 安全忽略」的语句残留 —— 旧 `except: pass` 把半迁移炸点整体
+            # 吞掉, 带病运行无人知晓。迁移失败必须让 Ledger 构造 raise,
+            # 让调用方与操作员立刻看见 (AC-V-2 判据 2)。
+            raise RuntimeError(
+                f"ledger 迁移失败 (拒绝静默半迁移, #214): {e}") from e
         self.conn.commit()
 
     def close(self):
@@ -1200,6 +1242,8 @@ class Ledger:
         这正是 issue #103 的空窗 —— 卡已结算、槽位已清, 但报告一次都没
         送达 main; run 的计时锚点把这种形状判成「不需敲」, main 侧
         23+ 分钟零信号。
+
+        issue #205: reaper 补档敲门已删, 本方法仅作只读查询 API 保留。
         """
         return self.conn.execute(
             "SELECT task_id, harvest_status, worker_report, "
@@ -2254,13 +2298,16 @@ class Ledger:
         include_archived=True → 还含 ARCHIVED(归档管理面板)
         2026-10-06 新增: ARCHIVED 状态(操作员手动归档, vs ABORTED 异常关闭,
         CLOSED 自然结束)。默认全部排除,避免列表过长。
+        2026-11-04 issue #214-3: HOLD 随 include_closed 可见 —— 看板以
+        include_closed=True 拉取, HOLD run 需进入历史列表出口 (D-8);
+        默认 ACTIVE-only 分支不加 HOLD (默认语义「当前唯一 ACTIVE run」不动)。
         返回 list[dict],按 created_at DESC(最新在最前)。
         """
         # 显式列状态白名单,避免 WHERE 子句与 ARCHIVED 状态耦合搞错顺序
         if include_archived:
-            statuses = ("ACTIVE", "CLOSED", "ABORTED", "ARCHIVED")
+            statuses = ("ACTIVE", "HOLD", "CLOSED", "ABORTED", "ARCHIVED")
         elif include_closed:
-            statuses = ("ACTIVE", "CLOSED", "ABORTED")
+            statuses = ("ACTIVE", "HOLD", "CLOSED", "ABORTED")
         else:
             statuses = ("ACTIVE",)
         placeholders = ",".join("?" * len(statuses))

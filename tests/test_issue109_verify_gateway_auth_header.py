@@ -238,6 +238,11 @@ _STAR_ALLOWLIST: tuple[tuple[str, str], ...] = (
      "browser-smoke-verify.zh-cn.md",
      "怪 emoji 或 `***`"),
     ("tests/test_issue58_tokens.py", '"api_key": "***"'),
+    # e1b83e9 (#228 s2) 新增守护的 T7 回归红线: 断言 api_worker_detail 打码
+    # 行为不受 api_workers 剥离影响, '***' 是被断言的打码夹具而非残留。
+    ("tests/test_issue228_api_key_strip.py", "打码逻辑不受影响 (仍 '***')"),
+    # 同上文件 T7 断言行: 详情端点打码回归断言 (== "***"), 测试夹具正当用法。
+    ("tests/test_issue228_api_key_strip.py", 'get("api_key") == "***"'),
 )
 
 

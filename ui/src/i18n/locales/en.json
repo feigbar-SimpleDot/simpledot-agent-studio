@@ -32,7 +32,8 @@
     "worker_chat_title": "Worker · {name}",
     "workers_subtitle": "Register routes · generate compose · view runtime metadata",
     "workflows_subtitle": "Workflow templates · decide how collaborative tasks decompose",
-    "subtitle_schedule": "Inbox · task queue, auto-chained"
+    "subtitle_schedule": "Inbox · task queue, auto-chained",
+    "subtitle_dashboard": "Overview · system status at a glance"
   },
   "chat": {
     "commands": {
@@ -117,7 +118,7 @@
       "connected_session": "Connected session",
       "current_badge": "Current",
       "empty_hint": "Type a message to start the conversation",
-      "empty_hint_intro": "Type a request to start. For tasks that need multiple workers, click \"Multi-Agent Collaboration\" above.",
+      "empty_hint_intro": "Type a request to start. For tasks that need multiple workers, click \"Add Task\" above.",
       "history_empty": "No past sessions",
       "load_more": "Load earlier messages",
       "history_loading": "Loading past sessions…",
@@ -128,7 +129,7 @@
       "no_history": "No history",
       "session_history_title": "Past sessions",
       "session_toast_new": "✓ New session started",
-      "start_teamwork_btn": "Start multi-agent collaboration"
+      "start_teamwork_btn": "Add Task"
     },
     "team_work_modal": {
       "attach_label": "Attachments",
@@ -148,7 +149,7 @@
       "task_placeholder": "e.g. \"Add user login to the backend\".",
       "task_requirement": "Task requirement",
       "task_requirement_hint": "Describe what you need. After picking a workflow, the system decomposes the task into the workflow's standard steps.",
-      "title": "Start multi-agent collaboration",
+      "title": "Add Task",
       "workflows_count": "{n} workflows available",
       "workflows_unreachable": "Workflow list unreachable — only Auto-select is available",
       "workspace_hint": "All workers of this task produce files in this directory. Leave empty to inherit the current session's workspace; create a new one in the top bar Workspace picker.",
@@ -230,7 +231,8 @@
     "tasks_board": "Tasks",
     "workers": "Workers",
     "workflows": "Workflows",
-    "schedule": "Inbox"
+    "schedule": "Inbox",
+    "dashboard": "Dashboard"
   },
   "cron": {
     "action": {
@@ -390,6 +392,12 @@
     "confirm_finish_ok": "Finish",
     "confirm_finish_text": "After finishing, the task stops and incomplete parts are cleaned up. History is kept. Cannot be undone.",
     "confirm_finish_title": "Finish task?",
+    "confirm_hold_ok": "Hold",
+    "confirm_hold_text": "Holding pauses this chain: running workers are not killed, scheduled tasks are held too, and you can resume anytime.",
+    "confirm_hold_title": "Hold this task chain?",
+    "confirm_resume_ok": "Resume",
+    "confirm_resume_text": "Resuming continues the chain; held tasks return to the top of the pending queue. If another chain is already running, the resume will be rejected.",
+    "confirm_resume_title": "Resume this task chain?",
     "created_at": "Created at {time}",
     "current_step_block_label": "Current step",
     "current_step_pending": "Step switching — waiting for scheduler",
@@ -407,6 +415,12 @@
     "handoff_hint": "Platform is switching to the next card; main takes over in a few seconds",
     "handoff_state_short": "Handoff",
     "history_title": "History ({n})",
+    "hold_already": "This chain is already held",
+    "hold_btn": "Hold",
+    "hold_btn_busy": "Holding…",
+    "hold_failed": "Hold failed: {err}",
+    "hold_linkage_warn": "Frozen, but schedule linkage failed — check the schedule page",
+    "hold_success": "Chain held",
     "loading_error_detail": "Step detail load failed: {err}",
     "loading_error_runs": "Task list {err}",
     "loading_error_tasks": "Task state {err}",
@@ -423,12 +437,18 @@
     "reply_modal_title": "Reply and continue",
     "reply_submit": "Submit and continue",
     "reply_submit_busy": "Sending…",
-    "reply_conflict": "Reply accepted, but ⚠ {conflict}",
+    "reply_conflict": "Submitted, but ⚠ {conflict}",
+    "resume_already": "This chain is already running",
+    "resume_btn": "Resume",
+    "resume_btn_busy": "Resuming…",
+    "resume_failed": "Resume failed: {err}",
+    "resume_success": "Chain resumed",
     "retry": "Retry",
     "run_status_aborted": "Aborted",
     "run_status_active": "Active",
     "run_status_archived": "Archived",
     "run_status_closed": "Closed",
+    "run_status_hold": "On hold",
     "run_status_unknown": "Unknown",
     "show_archived": "Show archived",
     "state_attention": "Needs reply",
@@ -546,6 +566,7 @@
     "field": {
       "api_key": "API key",
       "api_key_hint": "Upstream provider key. Persisted only on the console host, never sent to the browser.",
+      "api_key_edit_hint": "Leave blank to keep the saved key; enter a new value (≥16 chars) to replace it.",
       "api_url": "API URL",
       "api_url_hint": "OpenAI-compatible /anthropic-compatible upstream endpoint, e.g. https://api.example.com/v1.",
       "compose_dir": "Worker compose output directory [host]",
@@ -810,6 +831,7 @@
   "schedule": {
     "group": {
       "running": "Running",
+      "hold": "On hold",
       "pending": "Not started",
       "paused": "Paused",
       "done": "Done / Cancelled"
@@ -817,6 +839,7 @@
     "state": {
       "pending": "Pending",
       "paused": "Paused",
+      "hold": "On hold",
       "running": "Running",
       "done": "Done",
       "cancelled": "Cancelled",
@@ -848,9 +871,13 @@
     "meta_workspace": "Workspace",
     "meta_workspace_default": "default",
     "meta_workflow": "Workflow",
+    "detail": {
+      "label": "Task detail",
+      "empty": "This task has no detail"
+    },
     "empty": {
       "title": "Inbox is empty",
-      "hint": "Click \"Start multi-agent collaboration\" in the top bar to join the inbox queue"
+      "hint": "Click \"Add Task\" in the top bar to join the inbox queue"
     },
     "form": {
       "edit_title": "Edit Inbox Task",
@@ -873,5 +900,61 @@
       "auto_off": "Auto-execute disabled",
       "run_started": "Execution started"
     }
+  },
+  "dashboard": {
+    "c1_title": "System Health",
+    "c1_reaper_alive": "Reaper online",
+    "c1_reaper_dead": "Reaper offline",
+    "c1_reaper_unknown": "Status unknown",
+    "c1_auto_on": "Auto-execute on",
+    "c1_auto_off": "Auto-execute off",
+    "c1_countdown": "Countdown {n}s",
+    "c1_countdown_idle": "Countdown idle",
+    "c2_title": "Active Chains",
+    "c2_empty": "No active chains",
+    "c2_current_card": "Current card: {assignee} · {status}",
+    "c2_cards": "{n} cards",
+    "c2_tokens": "{n} tokens",
+    "c3_title": "Inbox Queue",
+    "c3_pending": "Pending",
+    "c3_running": "Running",
+    "c3_paused": "Paused",
+    "c3_hold": "Hold",
+    "c3_done_24h": "Done 24h",
+    "c3_hold_warn": "Held tasks need attention",
+    "c4_title": "Live Workers",
+    "c4_empty": "No live workers",
+    "c4_count": "{n} online",
+    "z0_runs_unit": "run",
+    "z1_title": "Active Workers",
+    "z1_empty": "No active workers",
+    "z1_inactive": "Inactive",
+    "enter_chat": "Open Chat",
+    "z2_token_title": "Token Usage · Last 10 Tasks",
+    "z2_inbox_title": "Inbox Distribution",
+    "chart_no_data": "No token data",
+    "chart_total": "tasks",
+    "c5_title": "Recently Closed",
+    "c5_empty": "No closed runs",
+    "c5_closed": "Closed",
+    "c5_aborted": "Aborted",
+    "error": "Failed to load",
+    "retry": "Retry",
+    "loading": "Loading…",
+    "c2_todo_unavailable": "Steps unavailable",
+    "c2_section_pending": "Pending",
+    "c2_section_done": "Done",
+    "c2_section_dropped": "Dropped",
+    "c2_current_prefix": "Current:",
+    "r5_next_task": "Next task",
+    "r5_run_now": "Run now",
+    "r5_run_now_ok": "Triggered now",
+    "r5_run_now_off_auto": "Auto-execute is off",
+    "r5_run_now_off_idle": "No active countdown",
+    "r4_idle": "Idle",
+    "z1_working_title": "Working",
+    "z1_idle_empty": "No idle workers",
+    "r4_run_label": "Run",
+    "z2_worker_token_title": "Worker Tokens · Last 24h"
   }
 }

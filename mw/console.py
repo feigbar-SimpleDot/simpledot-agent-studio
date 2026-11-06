@@ -1094,7 +1094,9 @@ def api_team_work_launch(payload: dict) -> dict:
                     {"run_id": c["run_id"],
                      "status": c["status"],
                      "created_at": c["created_at"],
-                     "initial_task": (c["initial_task"] or "")[:80]}
+                     "initial_task": (c["initial_task"] or "")[:80],
+                     # dashboard-ui-20261105 R3: 只增派生键, 老键原样保留
+                     "display_title": derive_run_title(c["initial_task"])}
                     for c in conflicts[:5]
                 ],
                 "hint": ("UI 应当先 g.createSession() 拿到新 sid 再 launch;"
@@ -1190,6 +1192,8 @@ def api_team_work_launch(payload: dict) -> dict:
         "ok": True,
         "run_id": run_id,
         "initial_task": initial_task,
+        # dashboard-ui-20261105 R3: 读时派生短标题 (只增键, 不存库)
+        "display_title": derive_run_title(initial_task),
         "session_id": session_id,
         "cards": [{"task_id": s["task_id"], "step_id": s["step_id"],
                    "title": s["title"], "assignee": s["assignee"]}
@@ -1733,6 +1737,122 @@ def _parse_wr(blob) -> dict | None:
         return None
 
 
+# dashboard-ui-20261105 R3 (ANALYSIS 裁决 3): run 标题读时派生。
+# 纯函数, 不存库不回填 —— 存量/新 run 自动同口径 (AC-R3-7)。
+# 形态: 折叠换行为单行、剥行首 markdown 符 (#/-/*/+/> 等)、首尾 trim;
+# 长度: ≤40 显示字符 (CJK/半角均计 1, len() 口径), 目标 ≤24 (首行已≤阈值
+# 则原样); 截断以 … 结尾且计入长度, 按码点切片无代理对乱码 (AC-R3-5/6)。
+_RUN_TITLE_MD_PREFIX_RE = re.compile(r"^(?:#{1,6}\s*|[-*+]\s+|>\s*)+")
+
+
+def derive_run_title(initial_task, max_len: int = 40,
+                     target_len: int = 24) -> str:
+    """initial_task 原文 → 单行短标题 (display_title 派生口径唯一源)。
+
+    规则 (ANALYSIS 裁决 3 / REQ R3):
+      1. 剥每行行首 markdown 符, 折叠全部换行为单行 (空格连接), trim;
+      2. 首行 ≤ target_len(24): 原样返回, 不加省略号 (AC-R3-6);
+      3. 整行 ≤ max_len(40): 原样返回;
+      4. 否则截到 max_len, 以 … 结尾且 … 计入长度。
+    空/None 输入返回 "" (launch 必填 400 既有校验不动, 无新增空态)。
+    """
+    text = (initial_task or "").strip()
+    if not text:
+        return ""
+    lines = []
+    for ln in text.splitlines():
+        ln = _RUN_TITLE_MD_PREFIX_RE.sub("", ln.strip()).strip()
+        if ln:
+            lines.append(ln)
+    if not lines:
+        return ""
+    first = lines[0]
+    if len(first) <= target_len:
+        return first
+    joined = " ".join(lines)
+    if len(joined) <= max_len:
+        return joined
+    return joined[:max_len - 1] + "…"
+
+
+def api_workers_token_usage(payload: dict | None = None) -> dict:
+    """dashboard-ui-20261105 R4 (ANALYSIS 裁决 1): worker 近 24h token 聚合。
+
+    只读端点 GET /api/workers/token-usage (可选 ?window_s=86400)。
+    口径:
+      - join: harvest_contracts.task_id → task_sessions.profile (worker 身份);
+      - 窗口: tokens.captured_at (缺失回退 harvest_contracts.updated_at) 落在
+        [now - window_s, now] 的卡才计入 (24h 滚动, epoch 秒, 零时区换算);
+      - captured/missing 纪律照抄 _aggregate_run_tokens (console.py:1736):
+        只信 tokens.source=="api" 的快照, 逐桶求和防御脏 total 字段;
+        source=="unavailable"/无 tokens 键的卡 missing+1, 不贡献数值;
+      - per-profile source: captured==0 → "none" (前端显示占位符 —, 不得计 0,
+        AC-R4-6); captured==全部 → "api"; 混合 → "partial"。
+    返回 {workers: [{profile, total_tokens, captured, missing, source}],
+          window_s, generated_at}。profile 排序稳定 (字典序)。
+    """
+    window_s = 86400
+    if isinstance(payload, dict):
+        try:
+            w = int(payload.get("window_s") or 0)
+            if w > 0:
+                window_s = w
+        except (TypeError, ValueError):
+            pass
+    cutoff = time.time() - window_s
+    led = Ledger(LEDGER_DB)
+    try:
+        rows = led.conn.execute(
+            "SELECT ts.profile AS profile, hc.worker_report AS wr, "
+            "hc.updated_at AS updated_at "
+            "FROM harvest_contracts hc JOIN task_sessions ts "
+            "ON ts.task_id = hc.task_id"
+        ).fetchall()
+    finally:
+        led.close()
+    agg: dict = {}
+    for r in rows:
+        profile = r["profile"] or ""
+        if not profile:
+            continue
+        slot = agg.setdefault(profile, {"captured": 0, "missing": 0,
+                                        "total_tokens": 0})
+        wr = _parse_wr(r["wr"])
+        t = wr.get("tokens") if isinstance(wr, dict) else None
+        if isinstance(t, dict) and t.get("source") == "api":
+            # 窗口判定: captured_at 主口径, 缺失回退 updated_at
+            ts_c = t.get("captured_at")
+            if not isinstance(ts_c, (int, float)) or isinstance(ts_c, bool):
+                ts_c = r["updated_at"]
+            if not isinstance(ts_c, (int, float)) or ts_c < cutoff:
+                slot["missing"] += 1
+                continue
+            for k in ("input_tokens", "output_tokens", "cache_read_tokens",
+                      "cache_write_tokens", "reasoning_tokens"):
+                v = t.get(k)
+                slot["total_tokens"] += (
+                    v if isinstance(v, int) and not isinstance(v, bool) else 0)
+            slot["captured"] += 1
+        else:
+            slot["missing"] += 1
+    workers = []
+    for profile in sorted(agg):
+        s = agg[profile]
+        if s["captured"] == 0:
+            source = "none"
+        elif s["missing"] == 0:
+            source = "api"
+        else:
+            source = "partial"
+        workers.append({"profile": profile,
+                        "total_tokens": s["total_tokens"],
+                        "captured": s["captured"],
+                        "missing": s["missing"],
+                        "source": source})
+    return {"workers": workers, "window_s": window_s,
+            "generated_at": time.time()}
+
+
 def _aggregate_run_tokens(cards: list[dict]) -> dict:
     """issue #58 (D3): run 级 token 读取时聚合 — 两出口共用同一实现 (AC-A3)。
 
@@ -1819,6 +1939,8 @@ def api_team_works_list(payload: dict) -> dict:
             info["token_total"] = _aggregate_run_tokens([
                 {"worker_report": _parse_wr(w)} for w in
                 _wr_by_run.get(info.get("run_id"), [])])
+            # dashboard-ui-20261105 R3: 只增派生键, initial_task 原样保留
+            info["display_title"] = derive_run_title(info.get("initial_task"))
             out.append(info)
     finally:
         led.close()
@@ -2053,6 +2175,8 @@ def api_team_work_get(run_id: str) -> dict:
     # 与 /api/team-works 同一 helper (AC-A3 两出口同字段同语义);
     # 空 run 也总是写 (0 卡 → source=unavailable, UI 显示 "—")。
     run["token_total"] = _aggregate_run_tokens(cards)
+    # dashboard-ui-20261105 R3: 只增派生键, initial_task 原样保留
+    run["display_title"] = derive_run_title(run.get("initial_task"))
 
     return {"team_work": run, "cards": cards}
 
@@ -2748,6 +2872,8 @@ def _api_tasks_active() -> dict:
                 "run_id": active_run["run_id"],
                 "initiator_session": active_run["initiator_session"],
                 "initial_task": active_run["initial_task"],
+                # dashboard-ui-20261105 R3: 只增派生键 (两端点键集逐字一致)
+                "display_title": derive_run_title(active_run["initial_task"]),
                 "project_workspace": active_run["project_workspace"],
                 "current_card_id": active_run["current_card_id"],
                 "card_count": active_run["card_count"],
@@ -2926,6 +3052,8 @@ def api_tasks(fields: str = "") -> dict:
                 "run_id": active_run["run_id"],
                 "initiator_session": active_run["initiator_session"],
                 "initial_task": active_run["initial_task"],
+                # dashboard-ui-20261105 R3: 只增派生键 (两端点键集逐字一致)
+                "display_title": derive_run_title(active_run["initial_task"]),
                 "project_workspace": active_run["project_workspace"],
                 "current_card_id": active_run["current_card_id"],
                 "card_count": active_run["card_count"],
@@ -3269,9 +3397,15 @@ def api_workers() -> dict:
             # 未迁移的 data: base64 残留 (732KB 成因); 裸文件名保留, 前端
             # avatarSrc 据此判定有无, 图片字节走 /api/workers/<name>/avatar
             # (INV-03 头像不回归)。启动期 migrate_avatars() 兜底迁移。
+            # issue #228 (2026-11-05): api_key 一并剥离 —— 原先 api_key
+            # 原样透传 registry.json 全字段, worker 网关密钥对任何能打开
+            # 本页的浏览器/同源页面明文可见 (实测 4 worker 各回显 64 位)。
+            # 直接不出现该字段而非打码: 前端编辑弹窗不再回填明文,
+            # 「留空=不修改」+ api_registry_save 合并语义闭环保存回环。
             **{k: v for k, v in entry.items()
-               if not (k == "avatar" and isinstance(v, str)
-                       and v.startswith("data:image/"))},
+               if k != "api_key"
+               and not (k == "avatar" and isinstance(v, str)
+                        and v.startswith("data:image/"))},
             "online": online_map.get(name, False),
             "live": [
                 {"session_id": k[1], "thinking": v.get("thinking"),
@@ -3555,6 +3689,23 @@ def api_registry_save(workers: dict) -> dict:
         cur = {}
     if not isinstance(cur, dict):
         cur = {}
+    # issue #228 (2026-11-05): 保存回环合并语义 —— GET /api/workers 已不再
+    # 回传 api_key, 编辑弹窗原样回传的条目必然缺失/为空 api_key。若不在此
+    # 合并, PUT 全量覆盖会把现存条目的网关密钥洗掉、断 relay 认证 (本修复
+    # 最大风险点)。规则: 新条目 api_key 缺失/空白 且现存条目已有非空值
+    # ⇒ 视同「未改」保留旧值; 显式新值 ⇒ 正常覆盖; 新 worker 无旧值 ⇒
+    # 不凭空造 (注册路径前端仍强制 16 位必填)。
+    merged: dict = {}
+    for name, entry in workers.items():
+        old = cur.get(name) if isinstance(cur.get(name), dict) else None
+        if isinstance(entry, dict) and old is not None:
+            new_key = entry.get("api_key")
+            new_key = new_key.strip() if isinstance(new_key, str) else ""
+            old_key = old.get("api_key")
+            if not new_key and isinstance(old_key, str) and old_key.strip():
+                entry = {**entry, "api_key": old_key}
+        merged[name] = entry
+    workers = merged
     for name, entry in workers.items():
         # Issue #51 R-1 (2026-10-17): worker key 白名单校验。单点真源 ——
         # 前端 WorkersView.jsx L395 + api_compose_generate 已有相同纪律, 此处
@@ -5168,6 +5319,13 @@ class Handler(BaseHTTPRequestHandler):
             # 否则 "live" 会被当成 worker 名误路由到 api_worker_detail。
             if p == "/api/workers/live":
                 return self._send(200, api_workers_live())
+            # dashboard-ui-20261105 R4: worker 近 24h token 聚合 (只读)。
+            # 与 /api/workers/live 同纪律: 必须先于 /api/workers/ 前缀兜底,
+            # 否则 "token-usage" 会被当成 worker 名误路由到 api_worker_detail。
+            if p == "/api/workers/token-usage":
+                _tq = parse_qs(urlparse(self.path).query)
+                return self._send(200, api_workers_token_usage(
+                    {"window_s": (_tq.get("window_s") or [None])[0]}))
             # Issue #51 (2026-10-17): GET /api/workers/<name>/avatar 必须
             # 先于 /api/workers/ 前缀兜底, 否则 "<name>/avatar" 会被当成
             # worker 名 "<name>/avatar" 误路由到 api_worker_detail (与

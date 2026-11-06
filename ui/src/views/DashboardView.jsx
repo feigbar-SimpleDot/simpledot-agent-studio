@@ -426,13 +426,14 @@ function WorkerRunCard({ name, avatar, cardCount, runTitle, onChat, t }) {
   )
 }
 
-// ── dashboard-fix-20261105 R-B: 空闲 worker 单行 (REQ R-B 区2, 红线 L4) ──
-// 每 worker 严格一行: 小头像 (24px, 明显小于工作卡 64px) + 名字 + **仅一个
-// 对话按钮** (AC-B3 DOM 逐行按钮数=1); 无 token 行、无状态徽章、无卡片边框
-// (AC-B4)。模块级定义, 同上纪律。
-function IdleWorkerRow({ name, avatar, onChat, t }) {
+// ── issue #229: 空闲 worker 紧凑小卡 (原 dashboard-fix-20261105 R-B 单行
+// 空闲条目缩成小卡片, 与工作中大卡同流并排) ──
+// 内容 = 头像(24, 明显小于工作卡 64px) + 名字(truncate) + **仅一个对话按钮**
+// (信息精简口径沿用 AC-B3); h-10 rounded-xl 紧凑卡, 无动效边框、无 run 标签,
+// 与工作中大卡视觉主次分明。两态判定口径不变 (main 裁决 4 红线)。模块级定义。
+function IdleWorkerCard({ name, avatar, onChat, t }) {
   return (
-    <div className="flex items-center gap-2.5 h-9 min-w-0">
+    <div className="flex items-center gap-2 h-10 rounded-xl border border-line bg-panel px-3 min-w-0 max-w-[240px] shrink-0">
       <WorkerAvatar name={name} avatar={avatar} size={24} />
       <span className="text-[13px] text-ink truncate flex-1 min-w-0" title={name}>{name}</span>
       <button onClick={() => onChat && onChat(name)}
@@ -1029,11 +1030,12 @@ export default function DashboardView({ onNavigate, onWorkerChat }) {
         <Toast msg={toast?.msg} type={toast?.type || 'ok'} onDone={() => setToast(null)} />
       </section>
 
-      {/* ══ Z1 worker 两区 (dashboard-fix-20261105 R-B, 红线 L3/L4):
-          工作中 = 大卡片 + 动效边框 + 当前 run 标签; 空闲 = 单行列表
-          (小头像 + 名字 + 仅对话按钮)。两态判定口径不回退 (main 裁决 4):
-          live[]/team_work_active 命中 = 工作中; registry online 且不在上
-          集合 = 空闲; 离线不显示 (AC-B5)。各区独立空态占位, 区不塌陷。 ══ */}
+      {/* ══ Z1 worker 单一卡片流 (issue #229: 原两区合并):
+          工作中大卡片在前、空闲小卡片在后, 同一 flex-wrap 容器并排, 不再
+          独占整行; 容器 max-h + overflow-auto (高度不够上下滚动)。
+          两态判定口径不回退 (main 裁决 4): live[]/team_work_active 命中 =
+          工作中; registry online 且不在上集合 = 空闲; 离线不显示 (AC-B5)。
+          区标题 h3 随合并移除; 双区皆空保留空态占位 (z1_empty)。 ══ */}
       <section className="flex flex-col min-h-[180px]">
         <ZoneTitle>{t('dashboard.z1_title')}</ZoneTitle>
         {c4.loading && !c4.error ? (
@@ -1044,47 +1046,23 @@ export default function DashboardView({ onNavigate, onWorkerChat }) {
             <button onClick={refreshC4} className="btn-ghost btn-sm">{t('dashboard.retry')}</button>
           </div>
         ) : (
-          <div className="flex flex-col gap-4">
-            {/* ── 区1: 工作中 (大卡片网格, 动效边框) ── */}
-            <div className="flex flex-col gap-3">
-              <h3 className="text-xs font-semibold text-dim border-l-[3px] border-accent pl-2">
-                {t('dashboard.z1_working_title')}
-              </h3>
-              {workingWorkers.length === 0 ? (
-                <div className="flex items-center justify-center min-h-[72px] text-xs text-dim
-                                border border-dashed border-line rounded-xl">
-                  {t('dashboard.z1_empty')}
-                </div>
-              ) : (
-                <div className="flex flex-wrap gap-4">
-                  {workingWorkers.map((w) => (
-                    <WorkerRunCard key={w.name} t={t}
-                      name={w.name} avatar={avatarOf(w.name)}
-                      cardCount={w.viaRun ? w.cardCount : 0}
-                      runTitle={w.viaRun ? runTitleOf : null} onChat={onWorkerChat} />
-                  ))}
-                </div>
-              )}
-            </div>
-            {/* ── 区2: 空闲 (单行列表; ≥8 worker 纵向滚动不溢出, AC-B6) ── */}
-            <div className="flex flex-col gap-1.5">
-              <h3 className="text-xs font-semibold text-dim border-l-[3px] border-line pl-2">
-                {t('dashboard.r4_idle')}
-              </h3>
-              {idleWorkers.length === 0 ? (
-                <div className="flex items-center justify-center min-h-[48px] text-xs text-dim
-                                border border-dashed border-line rounded-xl">
-                  {t('dashboard.z1_idle_empty')}
-                </div>
-              ) : (
-                <div className="flex flex-col gap-1 max-h-[320px] overflow-auto pr-1">
-                  {idleWorkers.map((w) => (
-                    <IdleWorkerRow key={w.name} t={t}
-                      name={w.name} avatar={w.avatar} onChat={onWorkerChat} />
-                  ))}
-                </div>
-              )}
-            </div>
+          <div className="flex flex-wrap gap-4 content-start max-h-[360px] overflow-auto pr-1">
+            {workingWorkers.map((w) => (
+              <WorkerRunCard key={w.name} t={t}
+                name={w.name} avatar={avatarOf(w.name)}
+                cardCount={w.viaRun ? w.cardCount : 0}
+                runTitle={w.viaRun ? runTitleOf : null} onChat={onWorkerChat} />
+            ))}
+            {idleWorkers.map((w) => (
+              <IdleWorkerCard key={w.name} t={t}
+                name={w.name} avatar={w.avatar} onChat={onWorkerChat} />
+            ))}
+            {workingWorkers.length === 0 && idleWorkers.length === 0 && (
+              <div className="w-full flex items-center justify-center min-h-[72px] text-xs text-dim
+                              border border-dashed border-line rounded-xl">
+                {t('dashboard.z1_empty')}
+              </div>
+            )}
           </div>
         )}
       </section>

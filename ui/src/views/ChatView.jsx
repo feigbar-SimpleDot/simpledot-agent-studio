@@ -1538,6 +1538,28 @@ const ChatView = React.forwardRef(function ChatView(
     }
   }
 
+  // issue #230: 聊天窗口粘贴附件入口 —— 剪贴板里的文件 (截图/复制的文件)
+  // 经既有 uploadFiles 管线上传 (图片走 /api/attachments/image 压缩, 非图片
+  // 走共享卷路径), 与回形针按钮同一链路, uploadFiles 零改动复用。
+  // 判定纪律: 仅当剪贴板**含文件**才 preventDefault 拦截; 纯文本粘贴一律
+  // 不拦截不吞事件, 走浏览器原生行为 (与现状逐字节一致)。
+  // clipboardData.files 为主源; 兜底 items 中 kind==='file' 条目
+  // (个别浏览器/场景 files 为空但 items 有文件)。
+  const onPasteFiles = (e) => {
+    const dt = e.clipboardData
+    if (!dt) return
+    let files = dt.files ? Array.from(dt.files) : []
+    if (files.length === 0 && dt.items) {
+      files = Array.from(dt.items)
+        .filter((it) => it.kind === 'file')
+        .map((it) => (typeof it.getAsFile === 'function' ? it.getAsFile() : null))
+        .filter(Boolean)
+    }
+    if (files.length === 0) return  // 无文件 ⇒ 不拦截, 文本粘贴走原生
+    e.preventDefault()
+    uploadFiles(files)
+  }
+
   // issue #63: 显式「停止」= 先经原生 POST /v1/runs/{run_id}/stop 真中断回合,
   // 再 abort 本地 fetch。代理保活落地后仅 abort 会被排空接管(回合继续跑完),
   // 用户主动停的语义会失效 —— run_id 已在 run.started 事件捕获(runIdRef)。
@@ -1644,15 +1666,22 @@ const ChatView = React.forwardRef(function ChatView(
         : f)))
     }
   }
-  // 选择文件: 超数/超大前端预检(不发请求), 通过者先挂 uploading 条目再异步上传。
+  // 选择文件: 汇入 addTwFiles 统一入口 (issue #231 抽出, 预检/上传管线原样)。
   const onTwFilesPicked = (e) => {
     const picked = Array.from(e.target.files || [])
     e.target.value = ''  // 允许重选同名文件
     if (!picked.length) return
+    addTwFiles(picked)
+  }
+  // issue #231: 文件数组统一入口 —— 回形针选择 (onTwFilesPicked) 与弹窗粘贴
+  // (onTwPasteFiles) 共用。超数/超大前端预检(不发请求), 通过者先挂 uploading
+  // 条目再异步上传。逻辑自 onTwFilesPicked 原样搬移, 管线零改动。
+  const addTwFiles = (files) => {
+    if (!files || !files.length) return
     const slots = TW_ATTACH_MAX_FILES - twFiles.length
     if (slots <= 0) { setTwError(t('chat.team_work_modal.attach_too_many')); return }
-    const accepted = picked.slice(0, slots)
-    if (picked.length > slots) setTwError(t('chat.team_work_modal.attach_too_many'))
+    const accepted = files.slice(0, slots)
+    if (files.length > slots) setTwError(t('chat.team_work_modal.attach_too_many'))
     const entries = accepted.map((f) => {
       const entry = {
         id: ++twFileSeqRef.current, name: f.name, bytes: f.size,
@@ -1669,6 +1698,25 @@ const ChatView = React.forwardRef(function ChatView(
     entries.forEach((entry, i) => {
       if (entry.uploading) void uploadTwFile(entry.id, accepted[i])
     })
+  }
+  // issue #231: 新建任务弹窗粘贴附件入口 —— 剪贴板判定纪律与 #230
+  // onPasteFiles 完全一致: clipboardData.files 主源; 兜底 items 中
+  // kind==='file' 条目 getAsFile; 无文件 ⇒ 早退不拦截, 纯文本粘贴走原生。
+  // 有文件 ⇒ preventDefault + addTwFiles 汇入弹窗既有 twFiles 管线
+  // (预检/上限/超限口径与回形针选择同一)。
+  const onTwPasteFiles = (e) => {
+    const dt = e.clipboardData
+    if (!dt) return
+    let files = dt.files ? Array.from(dt.files) : []
+    if (files.length === 0 && dt.items) {
+      files = Array.from(dt.items)
+        .filter((it) => it.kind === 'file')
+        .map((it) => (typeof it.getAsFile === 'function' ? it.getAsFile() : null))
+        .filter(Boolean)
+    }
+    if (files.length === 0) return  // 无文件 ⇒ 不拦截, 文本粘贴走原生
+    e.preventDefault()
+    addTwFiles(files)
   }
   const removeTwFile = (id) => setTwFiles((p) => p.filter((f) => f.id !== id))
 
@@ -2236,6 +2284,7 @@ const ChatView = React.forwardRef(function ChatView(
           <textarea
             value={input}
             onChange={(e) => { setInput(e.target.value); setSlashIdx(0) }}
+            onPaste={onPasteFiles}
             onKeyDown={(e) => {
               const matches = input.startsWith('/') && !input.includes(' ')
                 ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(input.toLowerCase()))
@@ -2304,6 +2353,7 @@ const ChatView = React.forwardRef(function ChatView(
               <textarea
                 value={twTask}
                 onChange={(e) => setTwTask(e.target.value)}
+                onPaste={onTwPasteFiles}
                 disabled={twLaunching}
                 rows={5}
                 autoFocus

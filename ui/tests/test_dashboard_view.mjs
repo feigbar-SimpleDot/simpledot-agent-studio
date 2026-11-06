@@ -270,6 +270,50 @@ test('T16 dashboard 无快速添加任务入口 (CC轮 §4.2: quickAddBtn/onQuic
   assert(app.includes('openCoreFeatures'), 'App.jsx openCoreFeatures 被误删 (header 核心功能按钮红线)')
 })
 
+// ── T17 issue #229 静态守护: 空闲 worker 缩成小卡与 working 同流并排 ──
+// 依据 ADJUDICATION §2.2: 合并单一 flex-wrap 卡片流 (working 大卡在前,
+// idle 小卡在后同容器); IdleWorkerRow→紧凑小卡; 容器 max-h+overflow-auto。
+// 硬约束: 两态判定口径 (workingWorkers/idleWorkers 派生) 一字不动 —— 本锚
+// 同时是口径不回退的反证锚 (T14 activeWorkers 锚独立在位, 不得改)。
+test('T17 #229 idle 小卡并入 working 同流布局 (静态守护)', () => {
+  // 1) IdleWorkerRow 已替换为紧凑小卡 IdleWorkerCard
+  assert(!dash.includes('IdleWorkerRow'), 'IdleWorkerRow 仍存在 (#229 要求替换为紧凑小卡)')
+  const cStart = dash.indexOf('function IdleWorkerCard')
+  assert(cStart >= 0, '缺 IdleWorkerCard 组件')
+  const card = dash.slice(cStart, dash.indexOf('\n}', cStart) + 2)
+  for (const cls of ['h-10', 'rounded-xl', 'border border-line', 'bg-panel', 'px-3']) {
+    assert(card.includes(cls), `IdleWorkerCard 缺紧凑卡类 '${cls}'`)
+  }
+  assert(/size=\{24\}/.test(card), 'IdleWorkerCard 头像必须 24px')
+  assert(card.includes('truncate'), 'IdleWorkerCard 名字必须 truncate')
+  assert(card.includes('dashboard.enter_chat'), 'IdleWorkerCard 对话按钮必须复用 dashboard.enter_chat (零新键)')
+  assert((card.match(/<button/g) || []).length === 1, 'IdleWorkerCard 应仅一个对话按钮')
+  // 2) Z1 区 = 单一 flex-wrap 容器, working 在前 idle 在后同流并排
+  const sStart = dash.indexOf('<section className="flex flex-col min-h-[180px]">')
+  assert(sStart >= 0, 'Z1 section 容器字面被改动 (min-h-[180px])')
+  const zone = dash.slice(sStart, dash.indexOf('</section>', sStart))
+  const wraps = zone.match(/flex flex-wrap gap-4/g) || []
+  assert(wraps.length === 1, `Z1 必须恰 1 个 flex-wrap gap-4 合并容器 (实测 ${wraps.length})`)
+  const wrapTag = zone.slice(zone.indexOf('flex flex-wrap gap-4'))
+  const wrapCls = wrapTag.slice(0, wrapTag.indexOf('"'))
+  assert(/max-h-\[/.test(wrapCls) && wrapCls.includes('overflow-auto'),
+    '合并容器必须 max-h + overflow-auto (高度不够上下滚动)')
+  const iWork = zone.indexOf('workingWorkers.map')
+  const iIdle = zone.indexOf('idleWorkers.map')
+  assert(iWork >= 0 && iIdle >= 0, '合并容器缺 workingWorkers/idleWorkers map')
+  assert(iWork < iIdle, 'working 大卡必须在前、idle 小卡在后')
+  // 3) 区标题 h3 随合并移除; 双区皆空保留空态占位 (z1_empty 复用)
+  assert(!zone.includes('z1_working_title') && !zone.includes('r4_idle'),
+    '区标题 h3 (工作中/空闲) 应随合并移除')
+  assert(zone.includes('workingWorkers.length === 0 && idleWorkers.length === 0')
+    && zone.includes('dashboard.z1_empty'), '双区皆空必须保留空态占位 (复用 z1_empty)')
+  // 4) 两态判定口径硬约束一字不动 (main 裁决 4 红线; 布局单不得触碰分类)
+  assert(dash.includes('const workingWorkers = [...actives].sort((a, b) => a.name.localeCompare(b.name))'),
+    'workingWorkers 派生口径被改动 (硬约束: 一字不动)')
+  assert(dash.includes('.filter((w) => w.online && !activeNames.has(w.name))'),
+    'idleWorkers 派生口径被改动 (硬约束: registry online 且不在活跃集)')
+})
+
 let failed = 0
 for (const { name, fn } of tests) {
   try { fn(); console.log(`PASS ${name}`) }

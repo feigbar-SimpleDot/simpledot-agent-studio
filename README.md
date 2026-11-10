@@ -2,8 +2,16 @@
 
 **English** | [`中文`](README.zh-cn.md)
 
-> A multi-agent long-running task management tool built on Hermes' native
-> Kanban system.
+> The open-source Grok Bot — a Hermes-based Deepseek Super-agent where
+> every agent is fully hand-built, 100% transparent, and shaped entirely
+> to your own intent: safer, and a better fit for how you actually work.
+
+## Transparent by design — every agent is hand-built
+
+Every agent here is fully hand-crafted: no black boxes, no hidden
+automation. You see every step and own every decision, and each agent is
+built 100% according to your own will. That transparency makes it safer
+— and a better fit for personal habits.
 
 ## What this is
 

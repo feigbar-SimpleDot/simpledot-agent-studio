@@ -377,6 +377,18 @@
 .wcard-live { animation: wcard-live-border 2.4s ease-in-out infinite; }
 .anim-stopped .wcard-live { animation-play-state: paused; }
 
+/* ── issue #229 GG轮: working 头像动效边框 (用户评论 2287: 「头像带有动态
+   效果的边框」) ──
+   复用上方 wcard-live-border 同款 keyframes (同族节奏纪律, 无新色值):
+   透明 2px 边框占位 (box-sizing: border-box 不撑布局), border-color 呼吸 +
+   外辉光落在头像圆周 (rounded-full)。prefers-reduced-motion 与 .anim-stopped
+   双通道降级 (同下方全局块显式停死清单)。 */
+.wcard-avatar-live {
+  border: 2px solid transparent;
+  animation: wcard-live-border 2.4s ease-in-out infinite;
+}
+.anim-stopped .wcard-avatar-live { animation-play-state: paused; }
+
 /* ── dashboard 驾驶舱 (dashboard-cockpit-20261105, DESIGN-UX §2.2) ── */
 /* F6 不活跃 worker 置灰: 灰度滤镜只压头像 img, 不压文字 —— 整卡 filter 会
    把文字对比度一起拉低破 A6-2; 文字用 --c-dim (对 panel 底暗色 6.96:1 /
@@ -520,7 +532,7 @@
      全局 spinner / Tailwind animate-pulse|spin */
   .sas-status-bar, .sas-status-bar .spin, .sas-typing-dot,
   .wcard-gfx-working::after, .wcard-spin, .spin,
-  .wcard-live,
+  .wcard-live, .wcard-avatar-live,
   .animate-pulse, .animate-spin {
     animation: none !important;
   }

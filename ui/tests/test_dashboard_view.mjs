@@ -270,44 +270,66 @@ test('T16 dashboard 无快速添加任务入口 (CC轮 §4.2: quickAddBtn/onQuic
   assert(app.includes('openCoreFeatures'), 'App.jsx openCoreFeatures 被误删 (header 核心功能按钮红线)')
 })
 
-// ── T17 issue #229 静态守护: 空闲 worker 缩成小卡与 working 同流并排 ──
-// 依据 ADJUDICATION §2.2: 合并单一 flex-wrap 卡片流 (working 大卡在前,
-// idle 小卡在后同容器); IdleWorkerRow→紧凑小卡; 容器 max-h+overflow-auto。
+// ── T17 issue #229 GG轮 静态守护: worker 行双栏两张并列大卡 (用户评论 2287) ──
+// 依据 ADJUDICATION-GG §3: PC 宽屏 worker 行 = 左右两张等宽高并列大卡撑满一行
+// (grid xl:grid-cols-2 + items-stretch); 左卡「工作中」(z1_working_title) 头像
+// 带动效边框 (.wcard-avatar-live); 右卡「空闲」(r4_idle) 列表卡内滚动
+// (max-h + overflow-auto)。旧 e03d36b 单一 flex-wrap 混排流必须移除。
 // 硬约束: 两态判定口径 (workingWorkers/idleWorkers 派生) 一字不动 —— 本锚
 // 同时是口径不回退的反证锚 (T14 activeWorkers 锚独立在位, 不得改)。
-test('T17 #229 idle 小卡并入 working 同流布局 (静态守护)', () => {
-  // 1) IdleWorkerRow 已替换为紧凑小卡 IdleWorkerCard
-  assert(!dash.includes('IdleWorkerRow'), 'IdleWorkerRow 仍存在 (#229 要求替换为紧凑小卡)')
+test('T17 #229 双栏两张并列大卡布局 (静态守护, 2287 新口径)', () => {
+  const css = read('../src/index.css')
+  // 1) IdleWorkerCard 紧凑条目行 (头像24 + truncate + 仅对话按钮, 零新键)
+  assert(!dash.includes('IdleWorkerRow'), 'IdleWorkerRow 仍存在 (#229 要求紧凑条目)')
   const cStart = dash.indexOf('function IdleWorkerCard')
   assert(cStart >= 0, '缺 IdleWorkerCard 组件')
   const card = dash.slice(cStart, dash.indexOf('\n}', cStart) + 2)
   for (const cls of ['h-10', 'rounded-xl', 'border border-line', 'bg-panel', 'px-3']) {
-    assert(card.includes(cls), `IdleWorkerCard 缺紧凑卡类 '${cls}'`)
+    assert(card.includes(cls), `IdleWorkerCard 缺紧凑条目类 '${cls}'`)
   }
   assert(/size=\{24\}/.test(card), 'IdleWorkerCard 头像必须 24px')
   assert(card.includes('truncate'), 'IdleWorkerCard 名字必须 truncate')
   assert(card.includes('dashboard.enter_chat'), 'IdleWorkerCard 对话按钮必须复用 dashboard.enter_chat (零新键)')
   assert((card.match(/<button/g) || []).length === 1, 'IdleWorkerCard 应仅一个对话按钮')
-  // 2) Z1 区 = 单一 flex-wrap 容器, working 在前 idle 在后同流并排
+  // 2) Z1 = 双栏 grid (等宽 xl:grid-cols-2 + 等高 items-stretch, 窄屏堆叠);
+  //    旧 flex-wrap 混排流 (被否决的 e03d36b) 必须移除
   const sStart = dash.indexOf('<section className="flex flex-col min-h-[180px]">')
   assert(sStart >= 0, 'Z1 section 容器字面被改动 (min-h-[180px])')
   const zone = dash.slice(sStart, dash.indexOf('</section>', sStart))
-  const wraps = zone.match(/flex flex-wrap gap-4/g) || []
-  assert(wraps.length === 1, `Z1 必须恰 1 个 flex-wrap gap-4 合并容器 (实测 ${wraps.length})`)
-  const wrapTag = zone.slice(zone.indexOf('flex flex-wrap gap-4'))
-  const wrapCls = wrapTag.slice(0, wrapTag.indexOf('"'))
-  assert(/max-h-\[/.test(wrapCls) && wrapCls.includes('overflow-auto'),
-    '合并容器必须 max-h + overflow-auto (高度不够上下滚动)')
+  assert(!zone.includes('flex flex-wrap gap-4'),
+    '旧单一 flex-wrap 混排容器未移除 (2287 已否决混排同流口径)')
+  assert(zone.includes('grid grid-cols-1 xl:grid-cols-2') && zone.includes('items-stretch'),
+    'Z1 必须为双栏 grid (grid-cols-1 xl:grid-cols-2 + items-stretch 等高撑满一行)')
+  // 3) 左卡「工作中」在前、右卡「空闲」在后; 标题复用孤儿键零新键
+  const iWorkTitle = zone.indexOf('dashboard.z1_working_title')
+  const iIdleTitle = zone.indexOf('dashboard.r4_idle')
+  assert(iWorkTitle >= 0 && iIdleTitle >= 0, '双栏标题缺 z1_working_title / r4_idle (复用现成键)')
+  assert(iWorkTitle < iIdleTitle, '左卡必须为工作中、右卡为空闲')
   const iWork = zone.indexOf('workingWorkers.map')
   const iIdle = zone.indexOf('idleWorkers.map')
-  assert(iWork >= 0 && iIdle >= 0, '合并容器缺 workingWorkers/idleWorkers map')
-  assert(iWork < iIdle, 'working 大卡必须在前、idle 小卡在后')
-  // 3) 区标题 h3 随合并移除; 双区皆空保留空态占位 (z1_empty 复用)
-  assert(!zone.includes('z1_working_title') && !zone.includes('r4_idle'),
-    '区标题 h3 (工作中/空闲) 应随合并移除')
+  assert(iWork >= 0 && iIdle >= 0, '双栏缺 workingWorkers/idleWorkers map')
+  assert(iWork < iIdle, 'working 列表必须在左卡 (源码序在前)')
+  // 4) 卡内滚动: 两栏内容区各自 max-h + overflow-auto (高度不够卡内上下滚动)
+  const scrolls = zone.match(/max-h-\[[^\]]+\][^"]*overflow-auto|overflow-auto[^"]*max-h-\[[^\]]+\]/g) || []
+  assert(scrolls.length >= 2, `双栏内容区必须各自 max-h + overflow-auto (实测 ${scrolls.length})`)
+  // 5) working 头像动效边框: WorkerAvatar live 变体 → .wcard-avatar-live
+  //    (复用 wcard-live-border 同款 keyframes); WorkerRunCard 挂 live;
+  //    双通道降级 (.anim-stopped + prefers-reduced-motion 停死清单)
+  assert(/function WorkerAvatar\(\{[^}]*live = false[^}]*\}\)/.test(dash),
+    'WorkerAvatar 缺 live 变体 prop')
+  assert(dash.includes("'wcard-avatar-live'"), 'WorkerAvatar live 分支缺 .wcard-avatar-live 类')
+  assert(/<WorkerAvatar name=\{name\} avatar=\{avatar\} size=\{64\} live\s*\/>/.test(dash),
+    'WorkerRunCard working 头像未挂 live (动效边框须落在头像)')
+  assert(!dash.includes('wcard-live w-[260px]'), '旧卡级动效 + 固定 260px 宽未移除 (双栏改造后条目应 w-full)')
+  assert(css.includes('.wcard-avatar-live') && css.includes('animation: wcard-live-border'),
+    'index.css 缺 .wcard-avatar-live 动效 (复用 wcard-live-border keyframes)')
+  assert(css.includes('.anim-stopped .wcard-avatar-live'), '.wcard-avatar-live 缺 .anim-stopped 降级')
+  assert(/prefers-reduced-motion[\s\S]*\.wcard-avatar-live/.test(css),
+    '.wcard-avatar-live 缺 prefers-reduced-motion 停死降级')
+  // 6) 空态: 双区皆空保留 z1_empty 占位 (零新键)
   assert(zone.includes('workingWorkers.length === 0 && idleWorkers.length === 0')
     && zone.includes('dashboard.z1_empty'), '双区皆空必须保留空态占位 (复用 z1_empty)')
-  // 4) 两态判定口径硬约束一字不动 (main 裁决 4 红线; 布局单不得触碰分类)
+  // 7) 两态判定口径硬约束一字不动 (main 裁决 4 红线; 布局单不得触碰分类)
   assert(dash.includes('const workingWorkers = [...actives].sort((a, b) => a.name.localeCompare(b.name))'),
     'workingWorkers 派生口径被改动 (硬约束: 一字不动)')
   assert(dash.includes('.filter((w) => w.online && !activeNames.has(w.name))'),

@@ -368,13 +368,13 @@ function SkeletonLines() {
 
 // worker 头像 (F7 / A7-1~3): 复用 .wcard-avatar-ph 占位样式 (WorkersView 同款
 // 口径的局部实现), 404/无 avatar → initials 占位, 无破图无 console error。
-function WorkerAvatar({ name, avatar, size = 64, ring = false }) {
+function WorkerAvatar({ name, avatar, size = 64, ring = false, live = false }) {
   const [broken, setBroken] = useState(false)
   useEffect(() => { setBroken(false) }, [avatar])
   const src = avatarSrc(name, avatar)
   return (
     <span
-      className={`inline-block rounded-full overflow-hidden shrink-0 ${ring ? 'ring-2 ring-ok/60' : ''}`}
+      className={`inline-block rounded-full overflow-hidden shrink-0 ${ring ? 'ring-2 ring-ok/60' : ''} ${live ? 'wcard-avatar-live' : ''}`}
       style={{ width: size, height: size }}
     >
       {src && !broken ? (
@@ -389,18 +389,21 @@ function WorkerAvatar({ name, avatar, size = 64, ring = false }) {
   )
 }
 
-// ── dashboard-fix-20261105 R-B: 工作中 worker 大卡 (REQ R-B 区1, 红线 L3) ──
-// 三要素: 较大卡片 (沿用 260px 量级) + 动效边框 (.wcard-live 呼吸, index.css,
-// prefers-reduced-motion 全局降级) + 当前 run 标签 (OQ-1 裁决: 经
-// team_work_active 命中显示当前 run display_title, 仅 SSE 活体无 run 不显示)。
+// ── dashboard-fix-20261105 R-B / issue #229 GG轮: 工作中 worker 条目卡 ──
+// 用户评论 2287 新口径: working 条目住在左栏「工作中」大卡内 ⇒ 条目卡改为
+// 撑满栏宽 (w-full, 原 w-[260px] 固定宽随双栏改造移除); 动效边框从卡级
+// (.wcard-live) 移到头像上 (用户点名「头像带有动态效果的边框」, WorkerAvatar
+// live 变体 = .wcard-avatar-live, index.css 复用 wcard-live-border 同款
+// keyframes, prefers-reduced-motion 降级)。当前 run 标签口径不变 (OQ-1 裁决:
+// 经 team_work_active 命中显示当前 run display_title, 仅 SSE 活体无 run 不显示)。
 // token 数值行已移除 (OQ-2 裁决 / AC-C3, token 展示统一由 24h 柱状图承担)。
 // 模块级定义 (issue #207 同款纪律: 5s 轮询重渲染不重挂组件身份)。
 function WorkerRunCard({ name, avatar, cardCount, runTitle, onChat, t }) {
   return (
-    <div className="wcard-live w-[260px] bg-panel border border-line rounded-2xl p-4
+    <div className="w-full bg-panel border border-line rounded-2xl p-4
                     flex flex-col gap-3">
       <div className="flex items-center gap-3 min-w-0">
-        <WorkerAvatar name={name} avatar={avatar} size={64} ring />
+        <WorkerAvatar name={name} avatar={avatar} size={64} live />
         <div className="min-w-0 flex-1">
           <div className="text-[15px] font-semibold text-ink truncate">{name}</div>
           <div className="flex items-center gap-1.5 mt-1 text-xs text-dim min-w-0">
@@ -426,14 +429,14 @@ function WorkerRunCard({ name, avatar, cardCount, runTitle, onChat, t }) {
   )
 }
 
-// ── issue #229: 空闲 worker 紧凑小卡 (原 dashboard-fix-20261105 R-B 单行
-// 空闲条目缩成小卡片, 与工作中大卡同流并排) ──
+// ── issue #229 GG轮: 空闲 worker 紧凑条目卡 (右栏「空闲」大卡内的列表行) ──
 // 内容 = 头像(24, 明显小于工作卡 64px) + 名字(truncate) + **仅一个对话按钮**
-// (信息精简口径沿用 AC-B3); h-10 rounded-xl 紧凑卡, 无动效边框、无 run 标签,
-// 与工作中大卡视觉主次分明。两态判定口径不变 (main 裁决 4 红线)。模块级定义。
+// (信息精简口径沿用 AC-B3); h-10 rounded-xl 紧凑行, 无动效边框、无 run 标签,
+// 与工作中条目视觉主次分明。双栏改造后条目撑满栏宽 (w-full, 原 max-w-[240px]
+// 随混排流移除)。两态判定口径不变 (main 裁决 4 红线)。模块级定义。
 function IdleWorkerCard({ name, avatar, onChat, t }) {
   return (
-    <div className="flex items-center gap-2 h-10 rounded-xl border border-line bg-panel px-3 min-w-0 max-w-[240px] shrink-0">
+    <div className="flex items-center gap-2 h-10 rounded-xl border border-line bg-panel px-3 min-w-0 w-full shrink-0">
       <WorkerAvatar name={name} avatar={avatar} size={24} />
       <span className="text-[13px] text-ink truncate flex-1 min-w-0" title={name}>{name}</span>
       <button onClick={() => onChat && onChat(name)}
@@ -1030,12 +1033,15 @@ export default function DashboardView({ onNavigate, onWorkerChat }) {
         <Toast msg={toast?.msg} type={toast?.type || 'ok'} onDone={() => setToast(null)} />
       </section>
 
-      {/* ══ Z1 worker 单一卡片流 (issue #229: 原两区合并):
-          工作中大卡片在前、空闲小卡片在后, 同一 flex-wrap 容器并排, 不再
-          独占整行; 容器 max-h + overflow-auto (高度不够上下滚动)。
+      {/* ══ Z1 worker 双栏大卡区 (issue #229 GG轮, 用户评论 2287 新口径):
+          PC 宽屏 (xl 起) worker 行 = 左右两张并列大卡, 等宽 (grid-cols-2)
+          等高 (items-stretch) 撑满一行; 窄屏自然降为上下堆叠。左卡「工作中」
+          (z1_working_title) = working 条目列表, 头像带动效边框
+          (.wcard-avatar-live); 右卡「空闲」(r4_idle) = 空闲条目列表, 内容区
+          max-h + overflow-auto 实现卡内上下滚动 (页面不撑破)。
           两态判定口径不回退 (main 裁决 4): live[]/team_work_active 命中 =
           工作中; registry online 且不在上集合 = 空闲; 离线不显示 (AC-B5)。
-          区标题 h3 随合并移除; 双区皆空保留空态占位 (z1_empty)。 ══ */}
+          双区皆空保留空态占位 (z1_empty)。 ══ */}
       <section className="flex flex-col min-h-[180px]">
         <ZoneTitle>{t('dashboard.z1_title')}</ZoneTitle>
         {c4.loading && !c4.error ? (
@@ -1045,24 +1051,41 @@ export default function DashboardView({ onNavigate, onWorkerChat }) {
             <p className="text-xs text-dim">{t('dashboard.error')}</p>
             <button onClick={refreshC4} className="btn-ghost btn-sm">{t('dashboard.retry')}</button>
           </div>
+        ) : workingWorkers.length === 0 && idleWorkers.length === 0 ? (
+          <div className="w-full flex items-center justify-center min-h-[72px] text-xs text-dim
+                          border border-dashed border-line rounded-xl">
+            {t('dashboard.z1_empty')}
+          </div>
         ) : (
-          <div className="flex flex-wrap gap-4 content-start max-h-[360px] overflow-auto pr-1">
-            {workingWorkers.map((w) => (
-              <WorkerRunCard key={w.name} t={t}
-                name={w.name} avatar={avatarOf(w.name)}
-                cardCount={w.viaRun ? w.cardCount : 0}
-                runTitle={w.viaRun ? runTitleOf : null} onChat={onWorkerChat} />
-            ))}
-            {idleWorkers.map((w) => (
-              <IdleWorkerCard key={w.name} t={t}
-                name={w.name} avatar={w.avatar} onChat={onWorkerChat} />
-            ))}
-            {workingWorkers.length === 0 && idleWorkers.length === 0 && (
-              <div className="w-full flex items-center justify-center min-h-[72px] text-xs text-dim
-                              border border-dashed border-line rounded-xl">
-                {t('dashboard.z1_empty')}
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 items-stretch">
+            {/* 左卡: 工作中 (头像动效边框) */}
+            <div className="bg-panel border border-line rounded-2xl p-4 flex flex-col min-w-0">
+              <h3 className="text-sm font-semibold text-ink mb-3">{t('dashboard.z1_working_title')}</h3>
+              <div className="flex flex-col gap-3 flex-1 min-h-0 max-h-[320px] overflow-auto pr-1">
+                {workingWorkers.map((w) => (
+                  <WorkerRunCard key={w.name} t={t}
+                    name={w.name} avatar={avatarOf(w.name)}
+                    cardCount={w.viaRun ? w.cardCount : 0}
+                    runTitle={w.viaRun ? runTitleOf : null} onChat={onWorkerChat} />
+                ))}
+                {workingWorkers.length === 0 && (
+                  <p className="text-xs text-dim text-center py-4">{t('dashboard.z1_empty')}</p>
+                )}
               </div>
-            )}
+            </div>
+            {/* 右卡: 空闲列表 (卡内滚动) */}
+            <div className="bg-panel border border-line rounded-2xl p-4 flex flex-col min-w-0">
+              <h3 className="text-sm font-semibold text-ink mb-3">{t('dashboard.r4_idle')}</h3>
+              <div className="flex flex-col gap-2 flex-1 min-h-0 max-h-[320px] overflow-auto pr-1">
+                {idleWorkers.map((w) => (
+                  <IdleWorkerCard key={w.name} t={t}
+                    name={w.name} avatar={w.avatar} onChat={onWorkerChat} />
+                ))}
+                {idleWorkers.length === 0 && (
+                  <p className="text-xs text-dim text-center py-4">{t('dashboard.z1_empty')}</p>
+                )}
+              </div>
+            </div>
           </div>
         )}
       </section>

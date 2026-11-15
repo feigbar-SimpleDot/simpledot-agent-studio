@@ -77,18 +77,55 @@ def test_running_transitions(store):
     head = store.take_head_pending()
     assert head["id"] == t["id"] and head["status"] == "running"
     assert head["executed_at"] is not None
-    # running 态: pause/cancel/update 全非法 (AC-3.8)
+    # running 态: pause/update 非法 (AC-3.8); cancel 自 issue #234 起放开
     assert store.pause(t["id"]) is False
-    assert store.cancel(t["id"]) is False
     assert store.update_paused(t["id"], detail="x") is False
+    assert store.cancel(t["id"]) is True          # #234: running→cancelled
+    got = store.get(t["id"])
+    assert got["status"] == "cancelled" and got["finished_at"] is not None
     # running→done 与 running→pending(失败回退)
-    assert store.mark_done(t["id"]) is True
-    assert store.mark_done(t["id"]) is False       # done 后再转非法
     t2 = _mk(store)
     store.take_head_pending()
-    assert store.mark_running_failed(t2["id"], "boom") is True
-    got = store.get(t2["id"])
+    assert store.mark_done(t2["id"]) is True
+    assert store.mark_done(t2["id"]) is False       # done 后再转非法
+    t3 = _mk(store)
+    store.take_head_pending()
+    assert store.mark_running_failed(t3["id"], "boom") is True
+    got = store.get(t3["id"])
     assert got["status"] == "pending" and got["last_error"] == "boom"
+
+
+def test_cancel_guard_migration_234(store):
+    """issue #234 守卫迁移守护: cancel 守卫 = pending/paused/running。
+
+    放开维度: running→cancelled 合法且写 finished_at (显式放弃语义,
+    解锁 inbox_running 门禁)。
+    未放开维度 (反向守护, 放开过头 ⇒ 本用例红):
+      - done / cancelled 终态不可再取消;
+      - hold 不可取消 (hold 出口是 run 级 resume, #214 AC-V-4 红线,
+        收件箱不提供任务级解冻/取消入口)。
+    """
+    # running→cancelled: 写 finished_at, 且不再出现在 running 组 (门禁解锁)
+    r = _mk(store, "卡死running")
+    store.take_head_pending()
+    assert store.cancel(r["id"]) is True
+    row = store.get(r["id"])
+    assert row["status"] == "cancelled" and row["finished_at"] is not None
+    assert r["id"] not in [x["id"] for x in store.list_by_status("running")]
+    # done 终态不可取消
+    d = _mk(store, "已完成")
+    store.take_head_pending()
+    assert store.mark_done(d["id"]) is True
+    assert store.cancel(d["id"]) is False
+    # cancelled 终态不可再取消
+    assert store.cancel(r["id"]) is False
+    # hold 不可取消 (出口 = run 级 resume_held_for_run)
+    h = _mk(store, "挂起")
+    store.take_head_pending()
+    store.backfill_run(h["id"], "run-h")
+    assert store.hold_running_for_run("run-h") == [h["id"]]
+    assert store.cancel(h["id"]) is False
+    assert store.get(h["id"])["status"] == "hold"
 
 
 # ── SM2: 仅取消态可删 ────────────────────────────────────────────────

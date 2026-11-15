@@ -113,6 +113,14 @@ SETTINGS_DEFAULTS = {
     # 保存都会把 False 钉进 settings.json, 永久压掉 webui_proxy 的自动探测兜底
     # (entry 起了 webui 则代理自动可用)。开关口径 = env WEBUI_PROXY_ENABLED
     # 显式覆盖 > /webui/start.sh 自动探测; settings.json 手工加键仍可作最终控制。
+    # issue ASR-SET: ASR 上游三键进设置页（用户拍板「进配置而非env」）。
+    # 默认值刻意留空串而非硬编码现值 —— api_settings_save 会把全部默认键
+    # 落盘 settings.json（webui_proxy_enabled 前车之鉴见上方 #131 注记），
+    # 空串 = 「未设置」哨兵，落盘无害、永久压不掉 env 兜底；真实默认值
+    # 仍由 mw/audio_proxy.py DEFAULT_ASR_* 单一持有（避免第二真源）。
+    "asr_base_url": "",   # ASR 上游基址(OpenAI 兼容), 留空=回退 env MW_ASR_BASE_URL/内置默认
+    "asr_model": "",      # ASR 模型名, 留空=回退 env MW_ASR_MODEL/内置默认
+    "asr_key": "",        # ASR API key(上游无真实鉴权), 留空=回退 env MW_ASR_KEY/"none"
 }
 
 from .ledger import Ledger
@@ -123,6 +131,7 @@ from . import todo as _todo
 # issue #164: 任务排期服务 (独立 schedule.db + ticker 引擎, ARCH-164 §2)。
 # 只 import 转发, 不触碰 run 执行主体逻辑 (红线 R2)。
 from . import schedule as _schedule
+from . import audio_proxy as _audio  # issue #232: 语音转写代理 + 能力探测
 
 
 def pixel_enabled() -> bool:
@@ -471,24 +480,67 @@ def _clean_webui_url(v) -> str:
     return v
 
 
+def _clean_asr_base(v) -> str:
+    """asr_base_url 只允许 http(s) 绝对地址(或空=回退), 防 javascript:/data: 注入。"""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    low = v.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        raise ValueError("asr_base_url 必须以 http:// 或 https:// 开头(留空=回退默认)")
+    return v
+
+
+# issue #237: settings.json 读-改-写临界区锁。服务模型 = ThreadingHTTPServer
+# (同进程多线程并发), 运行时 settings.json 唯一写方是 console 进程自身
+# (install.sh 只在服务启动前一次性直写, 无并发窗口) ⇒ 进程内锁即完备,
+# 无需 fcntl 跨进程锁 (TRIAGE §2.1 选型)。
+_SETTINGS_SAVE_LOCK = threading.Lock()
+
+
 def api_settings_save(payload: dict) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("settings 必须是对象")
     unknown = set(payload) - set(SETTINGS_DEFAULTS)
     if unknown:
         raise ValueError(f"未知配置项: {sorted(unknown)}")
-    cur = dict(SETTINGS_DEFAULTS)
-    try:
-        cur.update(json.loads(Path(SETTINGS).read_text()))
-    except (OSError, json.JSONDecodeError):
-        pass
-    if "hermes_webui_url" in payload:
-        payload = dict(payload)
-        payload["hermes_webui_url"] = _clean_webui_url(payload["hermes_webui_url"])
-    cur.update(payload)
-    tmp = Path(str(SETTINGS) + ".tmp")
-    tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=2))
-    os.replace(tmp, SETTINGS)
+    # issue #238: 统一类型闸 —— 默认值为 str 的键(全部 7 个字符串键)只收字符串,
+    # 非字符串在入口即 ValueError(走 do_PUT 既有 422 通道), 不再 500 也不再
+    # 原样落盘造成类型污染。_clean_* 内不重复 isinstance (避免双份逻辑漂移);
+    # int/bool 键不在本 issue 范围, 不扩面。
+    for k, v in payload.items():
+        if isinstance(SETTINGS_DEFAULTS[k], str) and not isinstance(v, str):
+            raise ValueError(f"{k} 必须是字符串")
+    with _SETTINGS_SAVE_LOCK:  # issue #237: 读→merge→写 tmp→replace 整段临界区
+        cur = dict(SETTINGS_DEFAULTS)
+        try:
+            cur.update(json.loads(Path(SETTINGS).read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+        if "hermes_webui_url" in payload:
+            payload = dict(payload)
+            payload["hermes_webui_url"] = _clean_webui_url(payload["hermes_webui_url"])
+        if "asr_base_url" in payload:
+            payload = dict(payload)
+            payload["asr_base_url"] = _clean_asr_base(payload["asr_base_url"])
+        cur.update(payload)
+        # issue #237: tmp 改 mkstemp 唯一名(同目录), 消除固定名互踩面;
+        # os.replace 发布原语保留 (本身原子)。
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=str(Path(SETTINGS).parent),
+                                   prefix="settings.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(cur, ensure_ascii=False, indent=2))
+            os.replace(tmp, SETTINGS)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp)
+            raise
+    # ASR-SET: ASR 三键变更 ⇒ 清 voice-status 探测缓存, 保存即热生效
+    # (transcribe 每次实时取值本就不受影响; 探测缓存不清则旧上游结果残留 ≤30s)。
+    if any(k in payload for k in ("asr_base_url", "asr_model", "asr_key")):
+        _audio._reset_status_cache()
     return {"ok": True, "settings": cur}
 
 
@@ -2838,6 +2890,22 @@ def api_task_detail(task_id: str) -> dict:
     return {"task": t}
 
 
+# s7b P1 修复 (#235 回归): active 段 current_card_result 服务端截断上限。
+# design.md §4.7 载荷纪律: 该段是 5s 轮询面, 响应体须保持 ~1KB 量级;
+# result 全文与卡输出线性相关 (审计实测 200,000 字符 ⇒ 200,643 B, 基线 583 B)。
+# 500 字符 + 省略号: 大于前端 truncateOutput 的 160 (前端兜底保持不动),
+# 截断后响应体回到 ~1KB 量级。两端点必须走同一函数 (键集+值逐字一致, #178)。
+ACTIVE_RESULT_MAX_CHARS = 500
+
+
+def _truncate_card_result(result):
+    """current_card_result 服务端截断: None 保持 None, 超长截到
+    ACTIVE_RESULT_MAX_CHARS 字符 + 省略号 (design.md §4.7 字段内容纪律)。"""
+    if not isinstance(result, str) or len(result) <= ACTIVE_RESULT_MAX_CHARS:
+        return result
+    return result[:ACTIVE_RESULT_MAX_CHARS] + "…"
+
+
 def _api_tasks_active() -> dict:
     """issue #75 s6 缺陷 2 (P1): 只回顶层 team_work_active 段 (轻量模式)。
 
@@ -2859,6 +2927,16 @@ def _api_tasks_active() -> dict:
     issue #141 (ADJUDICATION-O §s3): 补 state + holder_state 两个键 ——
     run 级派生态 (derive_run_overview)。**无条件赋值, 缺省 None**,
     派生异常 fail-open 置 None (不阻断摘要返回)。
+
+    issue #235: 补 current_card_started_at + current_card_result 两个键
+    (当前卡开工时刻 / 最近一次输出, 供 dashboard 工作中卡「持续时间/最近
+    输出」两行)。同一无条件缺省纪律 (缺省 None), 复用既有 kanban 查询
+    扩列取 started_at/result (零新增查询), 两端点键集逐字一致 (#178)。
+
+    s7b P1 (#235 回归修复): current_card_result 曾下发 result 全文, 使响应体
+    与卡输出线性膨胀 (实测 200,000 字符 ⇒ 200,643 B, 破坏本 docstring 的
+    ~1KB 契约)。现两端点统一走 _truncate_card_result 服务端截断
+    (500 字符 + 省略号, design.md §4.7), 缺省 None 与键集纪律不变。
     """
     led_obj = Ledger(LEDGER_DB)
     active_info = None
@@ -2907,12 +2985,23 @@ def _api_tasks_active() -> dict:
                 active_info["current_card_workspace"] = None
                 active_info["current_card_harvest_status"] = None
                 active_info["current_card_delivery_failed"] = False
+                # issue #235: 当前卡开工时刻 + 最近一次输出 (result 字段,
+                # 进行中常为空) —— dashboard 工作中卡「持续时间/最近输出」
+                # 两行的数据源。同一无条件缺省纪律 (缺省 None), 与全量端点
+                # (cur_t.get 缺省语义) 键集逐字一致 (#178 键集守护)。
+                active_info["current_card_started_at"] = None
+                active_info["current_card_result"] = None
                 for r in _ro_query(KANBAN_DB,
-                                   "SELECT title,status,assignee FROM tasks "
+                                   "SELECT title,status,assignee,started_at,"
+                                   "result FROM tasks "
                                    "WHERE id=?", (cur_id,)):
                     active_info["current_card_title"] = r.get("title")
                     active_info["current_card_status"] = r.get("status")
                     active_info["current_card_assignee"] = r.get("assignee")
+                    active_info["current_card_started_at"] = r.get("started_at")
+                    # s7b P1: 服务端截断 (design.md §4.7), 与全量端点同函数
+                    active_info["current_card_result"] = _truncate_card_result(
+                        r.get("result"))
                     break
                 for r in _ro_query(LEDGER_DB,
                                    "SELECT profile,session_id,workspace "
@@ -3084,6 +3173,14 @@ def api_tasks(fields: str = "") -> dict:
                 active_info["current_card_workspace"] = cur_sess.get("workspace")
                 active_info["current_card_title"] = cur_t.get("title")
                 active_info["current_card_status"] = cur_t.get("status")
+                # issue #235: 与 _api_tasks_active() 同名同义两键 (开工时刻 +
+                # 最近一次输出); cur_t 来自既有 tasks 列表查询 (已含
+                # started_at/result 列, 零新增查询), .get 缺省 None 语义与
+                # 轻量端点无条件缺省键逐字对齐 (#178 键集守护)。
+                active_info["current_card_started_at"] = cur_t.get("started_at")
+                # s7b P1: 服务端截断 (design.md §4.7), 与轻量端点同函数同值
+                active_info["current_card_result"] = _truncate_card_result(
+                    cur_t.get("result"))
                 cur_hc = led.get(active_run["current_card_id"], {})
                 active_info["current_card_harvest_status"] = cur_hc.get(
                     "harvest_status")
@@ -5405,6 +5502,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"lang": lang_val}).encode("utf-8"))
                 return
+            # issue #232: 语音能力探测 (PROPOSAL-V2 §3)。精确匹配, 前缀
+            # /api/audio/ 与既有全部路由零交集; ?force=1 绕缓存强探 (D7 重探)。
+            # 实现全部在 mw/audio_proxy.py (本分支只做路由薄壳)。
+            if p == "/api/audio/voice-status":
+                _fq = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+                _force = (_fq.get("force") or [""])[0] in ("1", "true", "yes")
+                return self._send(200, _audio.voice_status(force=_force))
             # issue #75 B1: /messages 带窗口参数(want/before) 时走过滤代理;
             # 不带参数 → 返回 False 落入下方旧透传分支 (§9 回退依赖此)。
             # 必须先于 /api/w/ 与 /api/sessions 两个透传分支。
@@ -5676,6 +5780,11 @@ class Handler(BaseHTTPRequestHandler):
             m = re.match(r"^/api/schedule/tasks/([A-Za-z0-9_-]{1,64})/update$", p)
             if m:
                 _code, _body = _schedule.api_schedule_update(m.group(1), payload)
+                return self._send(_code, _body)
+            # issue #232: 语音转写代理 (有 body ⇒ 在预读之后; PROPOSAL-V2 §1.1)。
+            # 64MB 全局 body 闸 (#166) 天然覆盖本端点; 实现见 mw/audio_proxy.py。
+            if p == "/api/audio/transcribe":
+                _code, _body = _audio.transcribe(payload)
                 return self._send(_code, _body)
             return self._send(404, {"error": "not found"})
         except ValueError as e:

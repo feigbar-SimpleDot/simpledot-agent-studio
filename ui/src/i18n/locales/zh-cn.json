@@ -132,6 +132,27 @@
       "start_teamwork_btn": "添加任务"
     },
     "team_work_modal": {
+      "voice": {
+      "mode_text": "文本",
+      "mode_voice": "语音",
+      "probe_ok": "语音可用",
+      "probe_checking": "检测中…",
+      "probe_off": "语音不可用",
+      "hold_hint": "按住 说话 · 松开结束 · 上移取消",
+      "rec_hint": "正在录音 · 松开结束",
+      "rec_limit": "即将到达 60 秒上限",
+      "rec_cancel": "松开取消",
+      "transcribing": "转写中…",
+      "filled_toast": "已转为文字，可提交",
+      "err_empty": "未识别到语音，请重试",
+      "err_down": "语音服务暂不可用，请改用文本输入",
+      "err_generic": "转写失败，请重试",
+      "err_insecure": "当前为 http://IP 访问, 浏览器禁止录音。请改用 http://localhost:8700 (或 SSH 隧道 ssh -L 8700:localhost:8700 / HTTPS) 访问",
+      "err_denied": "麦克风权限被拒绝, 请在浏览器站点设置中允许麦克风",
+      "err_nomic": "未检测到麦克风设备",
+      "use_text": "改用文本",
+      "unavailable_note": "语音功能未启用"
+      },
       "attach_label": "附件",
       "attach_btn": "添加附件",
       "attach_hint": "可选, 最多 5 个, 单个 ≤20MB; worker 可按路径直接读取",
@@ -333,10 +354,12 @@
     "enable_pixel_office": "开启像素办公室",
     "group": {
       "appearance": "外观与语言 / Appearance & Language",
+      "asr": "语音转写 (ASR)",
       "external": "外部入口与功能",
       "paths": "路径与镜像",
       "timeout": "结算与超时"
     },
+    "invalid_asr_url": "请输入 http:// 或 https:// 开头的地址，或留空",
     "invalid_input_one": "有 1 处输入不合法，请修正后再保存",
     "invalid_input_other": "有 {n} 处输入不合法，请修正后再保存",
     "invalid_seconds": "请输入 ≥1 的整数",
@@ -348,6 +371,12 @@
       "label": "Language"
     },
     "row": {
+      "asr_base_url_hint": "OpenAI 兼容上游（GET {base}/models + POST {base}/audio/transcriptions）。留空 = 回退环境变量 MW_ASR_BASE_URL，再回退内置默认 http://<your-lan-ip>:8731/v1。保存即生效，无需重启。",
+      "asr_base_url_label": "ASR 上游地址",
+      "asr_key_hint": "以 Authorization: Bearer <key> 发送。参考上游无真实鉴权，任意值即可。留空 = 回退环境变量 MW_ASR_KEY，再回退 \"none\"。",
+      "asr_key_label": "ASR API key",
+      "asr_model_hint": "发给上游的模型 id。留空 = 回退环境变量 MW_ASR_MODEL，再回退内置默认 qwen3-asr-1.7b。",
+      "asr_model_label": "ASR 模型名",
       "default_image_hint": "生成 compose 模版时的默认 image 字段",
       "default_image_label": "Worker 默认镜像",
       "default_timeout_seconds_hint": "挂死兜底（dead-man's switch）：超过此时长 worker 未收工才按超时结算，正常完成是事件驱动",
@@ -862,6 +891,7 @@
     },
     "auto_execute": "自动执行",
     "busy_hint": "当前有任务执行中, 收件箱排队中",
+    "busy_hint_gateway": "gateway 报忙（本地无执行中任务）；若持续，gateway 可能残留 run 状态未清，重启 gateway 可恢复",
     "countdown": {
       "next": "下一条任务自动执行倒计时"
     },
@@ -898,7 +928,8 @@
       "saved_paused": "已保存, 保持暂停",
       "auto_on": "自动执行已开启",
       "auto_off": "自动执行已关闭",
-      "run_started": "已发起执行"
+      "run_started": "已发起执行",
+      "cancel_blocked_run": "取消被拒：任务关联的运行仍在进行中（请先在看板结束或挂起该运行），或任务状态已变化"
     }
   },
   "dashboard": {
@@ -955,6 +986,9 @@
     "z1_working_title": "工作中",
     "z1_idle_empty": "暂无空闲 worker",
     "r4_run_label": "当前 run",
+    "r4_task_label": "当前任务",
+    "r4_duration_label": "持续",
+    "r4_output_label": "最近输出",
     "z2_worker_token_title": "Worker Token 消耗 · 近 24h"
   }
 }

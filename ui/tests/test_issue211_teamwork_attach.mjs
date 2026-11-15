@@ -224,7 +224,9 @@ test('T8 submitTeamWork 拒绝上传中提交', () => {
     'scheduleCreate 的 detail 须经 buildTeamWorkDetail 拼装')
 })
 test('T8 确定钮 disabled 含 uploading 分支', () => {
-  assert(/disabled=\{twLaunching \|\| !twTask\.trim\(\) \|\| twFiles\.some\(\(f\) => f\.uploading\)\}/.test(chat),
+  // issue #232 D6 同步: 语音转写中(twVoiceBusy)同样禁用提交, 该分支为可选段,
+  // uploading 分支锚原样保留 (INV-09 先例口径 —— 守护随合法新增同步)。
+  assert(/disabled=\{twLaunching \|\| (twVoiceBusy \|\| )?!twTask\.trim\(\) \|\| twFiles\.some\(\(f\) => f\.uploading\)\}/.test(chat),
     '「确定并启用」disabled 须含 twFiles.some((f) => f.uploading)')
 })
 

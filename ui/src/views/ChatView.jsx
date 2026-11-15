@@ -10,6 +10,7 @@ import { Modal } from '../components/ui.jsx'
 import { Icon, ICONS } from '../components/icons.jsx'
 import { FileDrawer } from '../components/filebrowser/FileDrawer.jsx'
 import { enhanceFileLinks } from '../components/filebrowser/chatLinks.js'
+import VoiceRecorder from '../components/VoiceRecorder.jsx'  // issue #232: 语音创建任务
 
 // ════════════════════════════════════════════════════════════════════
 // ChatView — i18n v1.0 conversion
@@ -859,6 +860,17 @@ const ChatView = React.forwardRef(function ChatView(
   const twFileSeqRef = useRef(0)                        // 条目 id 自增
   // issue #164: 弹窗提交改入队后的「已加入收件箱」提示条 (5s 自动消失)
   const [queueToast, setQueueToast] = useState('')
+  // ── issue #232: 语音创建任务 (UX-PROTOTYPE S0-S7) ──
+  const [twMode, setTwMode] = useState('text')             // S1 文本态 / S2 语音态
+  const [twVoice, setTwVoice] = useState(null)             // voice-status 探测结果 null=未探
+  const [twVoiceChecking, setTwVoiceChecking] = useState(false)
+  const [twVoiceBusy, setTwVoiceBusy] = useState(false)    // S4 转写中 ⇒ 提交禁用 (D6)
+  const [twVoiceToast, setTwVoiceToast] = useState('')     // S5 回填轻提示 2.6s (§3.6)
+  useEffect(() => {
+    if (!twVoiceToast) return
+    const timer = setTimeout(() => setTwVoiceToast(''), 2600)
+    return () => clearTimeout(timer)
+  }, [twVoiceToast])
   useEffect(() => {
     if (!queueToast) return
     const timer = setTimeout(() => setQueueToast(''), 5000)
@@ -1612,12 +1624,42 @@ const ChatView = React.forwardRef(function ChatView(
   }
 
   // ── Team Work 启动器 ──
+  // issue #232: 语音能力探测 (PROPOSAL-V2 §3.3)。弹窗打开拉一次 (mw 侧 30s
+  // 缓存); available:false ⇒ 不渲染任何语音入口 (S7 零打扰降级)。
+  // force=true 供状态点重探 (D7) 与转写 503 后强刷 (§3.3)。
+  const probeVoice = async (force = false) => {
+    setTwVoiceChecking(true)
+    try {
+      const res = await fetch('/api/audio/voice-status' + (force ? '?force=1' : ''))
+      const d = await res.json().catch(() => ({}))
+      setTwVoice(res.ok && d.ok
+        ? { available: !!d.available, reason: d.reason || '' }
+        : { available: false, reason: 'probe_failed' })
+    } catch (e) {
+      setTwVoice({ available: false, reason: 'probe_failed' })
+    } finally {
+      setTwVoiceChecking(false)
+    }
+  }
+  // S5: 转写成功 ⇒ text 追加进 twTask (§3.6 追加规则: 原值去尾空白 + \n + text;
+  // 空值直填, D3 不丢已敲内容), 自动切回文本态 (D2), toast 2.6s。
+  const onTwTranscribed = (text) => {
+    setTwTask((prev) => {
+      const base = prev.replace(/\s+$/, '')
+      return base ? `${base}\n${text}` : text
+    })
+    setTwMode('text')
+    setTwVoiceToast(t('chat.team_work_modal.voice.filled_toast'))
+  }
   const openTeamWork = async () => {
     setTwError('')
     setTwTask('')
     setTwWorkflow('auto')
     setTwWorkspace(workspace || '')  // 默认继承当前 session 的工作目录
     setTwFiles([])                   // issue #211: 每次打开弹窗附件清单归零
+    setTwMode('text')                // issue #232: 每次打开回文本态 (S1 默认)
+    setTwVoiceBusy(false)
+    void probeVoice()                // issue #232: 能力检测 (结果 mw 侧缓存, 不阻塞)
     setTwOpen(true)
     // 拉 workflow 列表(后端未就绪时 fallback 到 auto-only)
     try {
@@ -1633,6 +1675,8 @@ const ChatView = React.forwardRef(function ChatView(
     setTwOpen(false)
     setTwError('')
     setTwFiles([])                   // issue #211: 关闭/取消一并清附件清单
+    setTwMode('text')                // issue #232: 关闭复位到文本态 (S0)
+    setTwVoiceToast('')
   }
 
   // ── issue #211: 弹窗附件上传 (选择即上传, 复用聊天附件 /api/upload 模式) ──
@@ -2337,7 +2381,7 @@ const ChatView = React.forwardRef(function ChatView(
             <button onClick={closeTeamWork} disabled={twLaunching}
                     className="btn-ghost btn-sm">{t('common.cancel')}</button>
             <button onClick={submitTeamWork}
-                    disabled={twLaunching || !twTask.trim() || twFiles.some((f) => f.uploading)}
+                    disabled={twLaunching || twVoiceBusy || !twTask.trim() || twFiles.some((f) => f.uploading)}
                     className="btn-primary btn-sm">
               {twLaunching ? (<><span className="spin" />{t('chat.team_work_modal.start_busy_btn')}</>) : t('chat.team_work_modal.start_btn')}
             </button>
@@ -2348,8 +2392,55 @@ const ChatView = React.forwardRef(function ChatView(
             <div className="text-[11.5px] text-dim -mt-1">
               {t('chat.team_work_modal.subtitle')}
             </div>
+            {/* ── issue #232: [文本|语音] 分段切换 + 能力状态点 (UX-PROTOTYPE §3.1/§3.2)。
+                门控: 仅 voice-status available:true 时渲染 (§3.1); available:false ⇒
+                无切换无录音入口, 仅角落灰字「语音功能未启用」可点重探 (S7/D7)。 ── */}
+            {twVoice?.available ? (
+              <div className="flex items-center gap-3">
+                <div role="tablist" aria-label={t('chat.team_work_modal.task_requirement')}
+                     className="flex items-center h-7 rounded-lg bg-canvas border border-line p-0.5 gap-0.5">
+                  <button type="button" role="tab" aria-selected={twMode === 'text'}
+                          onClick={() => setTwMode('text')}
+                          className={`px-3 h-full rounded-md text-[12px] transition-colors
+                                     ${twMode === 'text' ? 'bg-panel2 text-ink font-semibold' : 'text-dim hover:text-ink'}`}>
+                    {t('chat.team_work_modal.voice.mode_text')}
+                  </button>
+                  <button type="button" role="tab" aria-selected={twMode === 'voice'}
+                          onClick={() => setTwMode('voice')}
+                          className={`px-3 h-full rounded-md text-[12px] transition-colors
+                                     ${twMode === 'voice' ? 'bg-panel2 text-ink font-semibold' : 'text-dim hover:text-ink'}`}>
+                    {t('chat.team_work_modal.voice.mode_voice')}
+                  </button>
+                </div>
+                {/* 能力状态点: 绿点可点重探 (D7); 探测中文案「检测中…」 */}
+                <button type="button" onClick={() => probeVoice(true)}
+                        className="flex items-center gap-1.5 text-[11.5px] text-dim hover:text-ink">
+                  {twVoiceChecking
+                    ? t('chat.team_work_modal.voice.probe_checking')
+                    : (<><span className="dot-ok" />{t('chat.team_work_modal.voice.probe_ok')}</>)}
+                </button>
+              </div>
+            ) : twVoice ? (
+              <button type="button" onClick={() => probeVoice(true)}
+                      title={t('chat.team_work_modal.voice.probe_off')}
+                      className="block text-[11.5px] text-dim hover:text-ink">
+                {twVoiceChecking ? t('chat.team_work_modal.voice.probe_checking')
+                  : t('chat.team_work_modal.voice.unavailable_note')}
+              </button>
+            ) : null}
             <div>
               <label className="label">{t('chat.team_work_modal.task_requirement')} <span className="text-bad">*</span></label>
+              {twMode === 'voice' && twVoice?.available ? (
+                /* S2-S4/S6: 语音态 = 任务文本区整体换成大长按录音按钮 (§3.3);
+                   textarea 隐藏但 twTask 内容保留不丢 (§2.1 S2) */
+                <VoiceRecorder
+                  onTranscribed={onTwTranscribed}
+                  onBusyChange={setTwVoiceBusy}
+                  onUseText={() => setTwMode('text')}
+                  onProbeRefresh={() => probeVoice(true)}
+                />
+              ) : (
+                <>
               <textarea
                 value={twTask}
                 onChange={(e) => setTwTask(e.target.value)}
@@ -2363,6 +2454,8 @@ const ChatView = React.forwardRef(function ChatView(
                            focus:border-accent focus:ring-2 focus:ring-accent/25"
               />
               <div className="hint">{t('chat.team_work_modal.task_requirement_hint')}</div>
+                </>
+              )}
             </div>
 
             <div>
@@ -2446,6 +2539,12 @@ const ChatView = React.forwardRef(function ChatView(
             {twError && (
               <div className="px-3 py-2 rounded-lg bg-bad/10 border border-bad/30 text-[12.5px] text-bad" title={twError}>
                 {twError}
+              </div>
+            )}
+            {/* issue #232 S5: 转写回填轻提示 (§3.6 底部居中绿点, 2.6s 自动消失, 不阻塞) */}
+            {twVoiceToast && (
+              <div className="flex items-center justify-center gap-2 text-[12px] text-ok">
+                <span className="dot-ok" />{twVoiceToast}
               </div>
             )}
           </div>

@@ -27,7 +27,12 @@ import { Toast, Modal, Confirm } from '../components/ui.jsx'
 // ════════════════════════════════════════════════════════════════════
 
 // 操作可见性纯函数: pending→[暂停,取消]; paused→[恢复,取消,修改];
-// running→[](停止通道是看板 close); done→[]; cancelled→[删除]。
+// running→[取消]; done→[]; cancelled→[删除]。
+//
+// issue #234: running 放开取消 —— main 中断于建 run 前时任务永久卡 running
+// 且 run_id=NULL, 无任何回收路径, 占住 inbox_running 门禁阻塞下一个任务。
+// running→cancelled = 操作者显式放弃; 关联 ACTIVE run 的取消由后端 409
+// 拦截 (run 出口仍是看板 close/hold, 联动 hold_running_for_run 处理任务)。
 //
 // #214: hold 行无操作按钮 —— 恢复走 run 级 resume (api_team_work_hold_resume),
 // 收件箱不提供任务级解冻入口 (AC-V-4 判据 5 红线: 不得让 hold 进入任何
@@ -35,6 +40,7 @@ import { Toast, Modal, Confirm } from '../components/ui.jsx'
 export function schedActions(status) {
   if (status === 'pending') return ['pause', 'cancel']
   if (status === 'paused') return ['resume', 'cancel', 'edit']
+  if (status === 'running') return ['cancel']
   if (status === 'cancelled') return ['delete']
   return []
 }
@@ -201,7 +207,14 @@ export default function ScheduleView({ onNavigate }) {
       await api.scheduleAction(id, action)
       afterWrite(okKey)
     } catch (e) {
-      setToast({ msg: fmtApiError(e, t), type: 'bad' })
+      // #234: 取消 running 任务被 409 拒 ⇒ 大概率关联 ACTIVE run (后端
+      // 拦截口径), 专用文案指路「先关 run」; 其余错误仍走三态归因。
+      // 竞态 409 (任务恰已完成) 同文案可接受 —— 下方 refreshTasks 立即
+      // 以服务端为准重拉, 行会消失/换态。
+      const msg = (action === 'cancel' && e?.status === 409)
+        ? t('schedule.toast.cancel_blocked_run')
+        : fmtApiError(e, t)
+      setToast({ msg, type: 'bad' })
       refreshTasks()   // 409 等: 服务端为准重拉
     } finally { setBusy('') }
   }
@@ -358,7 +371,10 @@ export default function ScheduleView({ onNavigate }) {
           <span className="text-sm text-ink">{t('schedule.auto_execute')}</span>
         </label>
         {busyReason && (
-          <span className="text-[11.5px] text-warn ml-auto">{t('schedule.busy_hint')}</span>
+          <span className="text-[11.5px] text-warn ml-auto">
+            {busyReason === 'gateway_busy' && !state?.running_task_id
+              ? t('schedule.busy_hint_gateway') : t('schedule.busy_hint')}
+          </span>
         )}
         {/* issue #164 追加: 「新建任务」入口移除 —— 排期是任务唯一入口,
             新建统一走「发起多智能体协作」弹窗 (submitTeamWork 入队本排期) */}

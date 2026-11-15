@@ -132,6 +132,27 @@
       "start_teamwork_btn": "Add Task"
     },
     "team_work_modal": {
+      "voice": {
+      "mode_text": "Text",
+      "mode_voice": "Voice",
+      "probe_ok": "Voice ready",
+      "probe_checking": "Checking…",
+      "probe_off": "Voice unavailable",
+      "hold_hint": "Hold to record · release to send · slide up to cancel",
+      "rec_hint": "Recording · release to finish",
+      "rec_limit": "Approaching 60s limit",
+      "rec_cancel": "Release to cancel",
+      "transcribing": "Transcribing…",
+      "filled_toast": "Transcript added — review and submit",
+      "err_empty": "No speech detected, try again",
+      "err_down": "Voice service unavailable, use text",
+      "err_generic": "Transcription failed, try again",
+      "err_insecure": "Recording is blocked over http://IP. Open via http://localhost:8700 (or SSH tunnel ssh -L 8700:localhost:8700 / HTTPS) instead",
+      "err_denied": "Microphone permission denied, allow the microphone in your browser site settings",
+      "err_nomic": "No microphone device detected",
+      "use_text": "Use text",
+      "unavailable_note": "Voice input is not available"
+      },
       "attach_label": "Attachments",
       "attach_btn": "Add attachments",
       "attach_hint": "optional, up to 5 files, ≤20MB each; workers can read them by path",
@@ -333,10 +354,12 @@
     "enable_pixel_office": "Enable Pixel Office",
     "group": {
       "appearance": "Appearance & Language / 外观与语言",
+      "asr": "Speech-to-text (ASR)",
       "external": "External Entries & Features",
       "paths": "Paths & Images",
       "timeout": "Settlement & Timeout"
     },
+    "invalid_asr_url": "Enter an address starting with http:// or https://, or leave it empty",
     "invalid_input_one": "1 invalid input — fix before saving",
     "invalid_input_other": "{n} invalid inputs — fix before saving",
     "invalid_seconds": "Enter an integer ≥ 1",
@@ -348,6 +371,12 @@
       "label": "Language"
     },
     "row": {
+      "asr_base_url_hint": "OpenAI-compatible upstream (GET {base}/models + POST {base}/audio/transcriptions). Leave empty to fall back to the MW_ASR_BASE_URL env var, then the built-in default http://<your-lan-ip>:8731/v1. Takes effect immediately, no restart.",
+      "asr_base_url_label": "ASR base URL",
+      "asr_key_hint": "Sent as Authorization: Bearer <key>. The reference upstream accepts any value (no real auth). Leave empty to fall back to MW_ASR_KEY, then \"none\".",
+      "asr_key_label": "ASR API key",
+      "asr_model_hint": "Model id sent to the upstream. Leave empty to fall back to MW_ASR_MODEL, then the built-in default qwen3-asr-1.7b.",
+      "asr_model_label": "ASR model",
       "default_image_hint": "Default image field for generated compose templates.",
       "default_image_label": "Worker default image",
       "default_timeout_seconds_hint": "Dead-man's switch: worker must finish within this duration or the run is settled as timed-out. Normal completion is event-driven.",
@@ -862,6 +891,7 @@
     },
     "auto_execute": "Auto-execute",
     "busy_hint": "A task is running; inbox is queued",
+    "busy_hint_gateway": "Gateway reports busy (no local running task); if it persists the gateway may hold a leaked run state — restarting it clears it",
     "countdown": {
       "next": "Countdown to next task"
     },
@@ -898,7 +928,8 @@
       "saved_paused": "Saved, still paused",
       "auto_on": "Auto-execute enabled",
       "auto_off": "Auto-execute disabled",
-      "run_started": "Execution started"
+      "run_started": "Execution started",
+      "cancel_blocked_run": "Cancel rejected: the linked run is still active (close or hold it on the board first), or the task state has changed"
     }
   },
   "dashboard": {
@@ -955,6 +986,9 @@
     "z1_working_title": "Working",
     "z1_idle_empty": "No idle workers",
     "r4_run_label": "Run",
+    "r4_task_label": "Task",
+    "r4_duration_label": "Duration",
+    "r4_output_label": "Output",
     "z2_worker_token_title": "Worker Tokens · Last 24h"
   }
 }

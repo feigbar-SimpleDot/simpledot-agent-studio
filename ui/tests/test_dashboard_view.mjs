@@ -336,6 +336,70 @@ test('T17 #229 双栏两张并列大卡布局 (静态守护, 2287 新口径)', (
     'idleWorkers 派生口径被改动 (硬约束: registry online 且不在活跃集)')
 })
 
+// ── T18 issue #235 静态守护: 工作中卡三行增信息 ──────────────────
+// 依据: ADJUDICATION-HH §2.2 默认口径 —— 当前 task 标题 / 持续时间 /
+// 最近一次输出(截断) 三行, 任一行数据缺失该行不渲染。
+test('T18 #235 WorkerRunCard 三行增信息 (静态守护)', () => {
+  // 1) 组件签名吃三新 prop
+  const sig = /function WorkerRunCard\(\{[^}]*taskTitle[^}]*taskStartedAt[^}]*taskResult[^}]*\}\)/
+  assert(sig.test(dash), 'WorkerRunCard 缺 taskTitle/taskStartedAt/taskResult props')
+  // 2) 三行条件渲染 + 双语新键引用 (空则不渲染 = `{x && (` 形态)
+  const cStart = dash.indexOf('function WorkerRunCard')
+  const card = dash.slice(cStart, dash.indexOf('\n}', cStart) + 2)
+  for (const [cond, key] of [
+    ['{taskTitle && (', 'dashboard.r4_task_label'],
+    ['{duration && (', 'dashboard.r4_duration_label'],
+    ['{output && (', 'dashboard.r4_output_label'],
+  ]) {
+    assert(card.includes(cond), `缺条件渲染 '${cond}' (数据缺失该行必须不渲染)`)
+    assert(card.includes(key), `缺 i18n 键引用 '${key}'`)
+  }
+  // 3) 持续时间/截断走导出纯函数 (vm 直测面) + 输出行 title 悬停全文
+  assert(dash.includes('formatCardDuration(taskStartedAt'), '持续时间未走 formatCardDuration 纯函数')
+  assert(dash.includes('truncateOutput(taskResult)'), '最近输出未走 truncateOutput 纯函数')
+  assert(/title=\{taskResult\}/.test(card), '输出行缺 title 悬停全文')
+  // 4) 调用点从 team_work_active 段喂三键 (仅 viaRun worker; SSE 活体无 run 不喂)
+  assert(dash.includes('twa.current_card_title') && dash.includes('twa.current_card_started_at')
+    && dash.includes('twa.current_card_result'), '调用点未从 twa 消费 current_card_title/started_at/result')
+  assert((dash.match(/w\.viaRun && twa/g) || []).length === 3,
+    '三 prop 必须全部经 w.viaRun && twa 门控 (仅 run 侧 worker 喂数)')
+  // 5) 双语新键在位 (T4 键集对等锚另护)
+  for (const k of ['r4_task_label', 'r4_duration_label', 'r4_output_label']) {
+    assert(typeof en.dashboard[k] === 'string' && en.dashboard[k] !== '', `en 缺 dashboard.${k}`)
+    assert(typeof zh.dashboard[k] === 'string' && zh.dashboard[k] !== '', `zh 缺 dashboard.${k}`)
+  }
+  // 6) dist 已随 src 重建 (新词条入包)
+  const dist = read('../dist/index.html')
+  assert(dist.includes('r4_output_label') && dist.includes('最近输出'),
+    'dist 构建产物不含新词条 — dist 未随 #235 改动重建')
+})
+
+// ── T19 issue #235 纯函数直测 (vm 抽取) ──────────────────────────
+test('T19 formatCardDuration/truncateOutput: 持续时间与输出截断口径', () => {
+  const src = extractFn(dash, 'export function formatCardDuration') + '\n'
+    + extractFn(dash, 'export function truncateOutput')
+  const ctx = vm.runInNewContext(`(() => { ${src.replace(/export function/g, 'function')}
+    ; return { formatCardDuration, truncateOutput } })()`)
+  const fd = ctx.formatCardDuration, to = ctx.truncateOutput
+  // 持续时间: 缺失/非法 ⇒ null (该行不渲染); 分档 s/m/h m
+  assert(fd(null, 1000) === null && fd(undefined, 1000) === null, '缺失 started_at 必须 null')
+  assert(fd(0, 1000) === null && fd('100', 1000) === null && fd(Infinity, 1000) === null,
+    '非法 started_at (0/字符串/Infinity) 必须 null')
+  assert(fd(1000, 1042) === '42s', `42s 档错: ${fd(1000, 1042)}`)
+  assert(fd(1000, 1060) === '1m', `60s 进 m 档错: ${fd(1000, 1060)}`)
+  assert(fd(1000, 1125) === '2m', `125s 应 2m: ${fd(1000, 1125)}`)
+  assert(fd(1000, 6000) === '1h 23m', `5000s 应 1h 23m: ${fd(1000, 6000)}`)
+  assert(fd(1000, 1000) === '0s' && fd(1000, 900) === '0s', '时钟回拨/相等必须钳 0 不为负')
+  // 输出截断: 空/全空白 ⇒ null; 折叠空白; 超长截断加省略号
+  assert(to(null) === null && to('') === null && to('   \n\t ') === null, '空/全空白必须 null')
+  assert(to('a\n\n  b') === 'a b', `空白折叠错: ${to('a\n\n  b')}`)
+  assert(to('short') === 'short', '短文本不得改动')
+  const long = 'x'.repeat(200)
+  const cut = to(long)
+  assert(cut.length === 161 && cut.endsWith('…'), `默认 160 截断错: len=${cut.length}`)
+  assert(to('abcdef', 3) === 'abc…', `自定义 n 截断错: ${to('abcdef', 3)}`)
+})
+
 let failed = 0
 for (const { name, fn } of tests) {
   try { fn(); console.log(`PASS ${name}`) }

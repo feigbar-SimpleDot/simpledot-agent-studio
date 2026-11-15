@@ -542,6 +542,14 @@ loses the race instead of corrupting the row — the API then answers
 - `pending -> paused` (pause)
 - `paused -> pending` (resume)
 - `pending|paused -> cancelled` (cancel)
+- `running -> cancelled` (cancel — issue #234; the store guard was widened to
+  `status IN ('pending','paused','running')`, so a `running` row with no
+  `run_id` (main was interrupted before the run row was created) finally
+  has an operator-driven recovery path; the cancelled row also gets
+  `finished_at` like every other terminal transition. The service layer
+  refuses this transition with a `409` when the row is linked to an
+  **ACTIVE** Team Work run — a run's lifecycle goes through the board's
+  close / hold channel, never through a task-side cancel bypass)
 - `cancelled ->` deleted (delete; only a cancelled row may be deleted)
 - `paused ->` paused (the update endpoint rewrites the fields and
   **keeps** the row paused)
@@ -584,7 +592,16 @@ the task into cards, or a process restart left the row behind), the row
 stays `running` and keeps the countdown blocked — the engine logs a
 warning once the row has been un-converged for 2x the stream hard cap
 (`_ZOMBIE_RUNNING_WARN_S`, `mw/schedule.py`) but does **not** auto-revert it
-to `pending`; automatic reversion is an open decision.
+to `pending`; automatic reversion is an open decision. **Issue #234 added
+an operator-driven exit for exactly this shape**: the `running` row can now
+be cancelled from the inbox (`POST /api/schedule/tasks/<id>/cancel`, §4.3),
+so a `running` row with **no** `run_id` — the "main was interrupted before
+the run row was created" deadlock — has a way out instead of blocking the
+`inbox_running` criterion forever. A `running` row that *is* linked to an
+ACTIVE run is refused with a `409`: that run's lifecycle belongs to the
+board's close / hold channel. The zombie warning now names the `run_id` in
+its text (`run_id=NULL` identifies the cancellable shape) and points at the
+inbox's cancel button.
 When the condition stops holding the countdown is
 cancelled (not paused); when it holds again a **new** countdown starts.
 The length is five minutes (`COUNTDOWN_S = 300`).
@@ -714,6 +731,38 @@ warned rather than dressed up as success / plain success), and a 409
 passes the server's business message through verbatim; ④ all copy goes
 through 17 new bilingual locale keys (`tboard.hold_*` /
 `tboard.resume_*` / `tboard.confirm_hold_*` / `tboard.confirm_resume_*`).
+
+### 4.7 The active-run summary is a bounded-payload surface (issue #235)
+
+`GET /api/tasks?fields=active` exists to keep the console's 5 s poll
+**light**: it returns the `team_work_active` segment only (issue #75 s6 —
+the full `/api/tasks` list was ~122 KB per poll, the lightweight segment
+was ~1 KB), and it is consumed by both the dashboard's Z1 zone and the
+board's active card. Two independent disciplines keep that surface small:
+
+- **Key-set discipline** — the lightweight and the full endpoint emit a
+  byte-identical `current_card_*` key set, with every key assigned
+  unconditionally and a `None` default, so a consumer never has to
+  distinguish "missing" from "null" (issues #178 / #190). Issue #235 added
+  two keys to that set, `current_card_started_at` and `current_card_result`.
+- **Field-content discipline** — a key may exist and still be unbounded.
+  `current_card_result` originally carried the current card's **full**
+  `result` text (the dashboard truncates it to 160 characters in the
+  frontend), so the response body scaled with the size of that card's
+  result rather than staying at the ~1 KB the endpoint was designed for.
+  A card whose result is a long report therefore inflated every 5 s poll
+  of every console client that has the dashboard open. The `result` text
+  was deliberately kept **out** of the list projection (reduced to a
+  `has_result` boolean, issue #75) precisely to avoid this class of
+  payload; adding it back under a different key reintroduced it on the
+  polling path. **Fixed (s7b):** both endpoints now pass
+  `current_card_result` through a server-side truncation —
+  `mw/console.py` `ACTIVE_RESULT_MAX_CHARS = 500`, values longer than
+  500 characters are cut to 500 characters plus a `…` ellipsis; `None`
+  defaults and the byte-identical key set are unchanged. The rule stands
+  for the future: any unbounded field on this segment must be truncated
+  or bounded **server side** — the frontend's 160-character truncation
+  only bounds what is rendered, not what is transferred.
 
 ---
 
@@ -1460,6 +1509,50 @@ already-uploaded files: orphans stay in the uploads directory (same
 posture as chat attachments — disk usage only grows; cleanup was
 deliberately not invented here).
 
+#### Team Work dialog voice input (issue #232)
+
+The same dialog carries a **voice input** mode alongside the text mode.
+It is an additive, capability-gated mode — the text path is unchanged and
+remains the default.
+
+- **The gate.** Opening the dialog probes `GET /api/audio/voice-status`
+  (§11.7). Only `available: true` renders the `[Text / Voice]` segmented
+  control and the record button; `available: false` renders **no** voice
+  entry point at all, only a dim "voice input is not enabled" line that
+  re-probes on click. The probe result is cached server-side for 30 s
+  (`?force=1` bypasses it), so opening the dialog repeatedly costs one
+  upstream probe, not one per open.
+- **The path.** The browser never talks to the ASR directly — it records
+  PCM through the Web Audio API, wraps it as a WAV in the browser
+  (`ui/src/components/VoiceRecorder.jsx`, 16 kHz mono, 60 s hard cap, 50 s
+  warning, a 40 px upward slide to cancel, a sub-0.5 s tap discarded as a
+  mis-touch) and posts the base64 WAV to `POST /api/audio/transcribe`
+  (§11.7); the console proxies it to the upstream ASR. This keeps the
+  browser free of CORS and of any ASR credential, and it means the ASR
+  only has to be reachable from the console's host — **no extra host port
+  is published for it** (the same deployment posture as the console's own
+  single `:8700` entry).
+- **The degradation.** A `503` / `asr_unreachable` answers "voice service
+  unavailable, use text" and forces a capability re-probe; a microphone
+  refusal (a non-secure context, or a denied permission) answers the
+  generic failure line; an empty transcript is a normal `200` with an empty
+  text and reads as "no speech detected". Every one of these paths leaves
+  the text mode fully usable — the voice mode is never the only way in.
+- **The fill-back.** A successful transcript is **appended** to the
+  requirement textarea (the existing text is preserved, the transcript
+  goes on a new line) and the dialog switches back to text mode, so the
+  operator can edit before submitting; the submit button stays disabled
+  while a transcription is in flight.
+- **The upstream is external and optional.** The ASR base URL, model id
+  and key resolve through a three-tier chain: the settings page `asr_*`
+  keys (`asr_base_url` / `asr_model` / `asr_key`, empty string = not set,
+  read live on every call so a save takes effect without a restart) win
+  over the deployment-time env vars (`MW_ASR_BASE_URL` / `MW_ASR_MODEL` /
+  `MW_ASR_KEY` — see DEPLOY.md §3), which in turn win over the built-in
+  defaults held solely by `mw/audio_proxy.py`. With no ASR reachable the
+  whole feature is inert and the console behaves exactly as it did before
+  issue #232.
+
 ### 11.3 `POST /api/team-work/launch` boundary (1A)
 
 Accepts: `initial_task`, `session_id`, optional `project_workspace`, and
@@ -1605,7 +1698,7 @@ force-skipped by main as an explicit product decision.
 | `/api/fs/file` | GET | stream a project file (mode=embed\|open\|download, read-only, symlinks blocked) | frontend |
 | `/api/fs/upload` | POST | upload one file into a project workspace (base64 JSON body, ≤20 MB, same-name is a 409 reject, `O_EXCL` atomic create; path anchored through the same `_fs_resolve` five-layer chain — see issue #158) | frontend |
 | `/api/fs/delete` | POST | permanently delete one file (not a directory) from a project workspace; requires `"confirm": true` (strict boolean) in the body; hard delete, not recoverable (issue #158) | frontend |
-| `/api/tasks` | GET | task status (kanban + ledger); the list is a whitelist projection (`result` reduced to a `has_result` boolean, `harvest_log` / `workspace` / `exit_code` / `question` / `options` stripped, `block_kind` kept); `?fields=active` returns the active-run summary only and carries the derived boolean `current_card_delivery_failed` (same criterion as the detail `delivery.delivery_failed`, issue #178); each entry additionally carries the two derived delivery booleans `delivery_failed` / `delivery_dead` (auxiliary surface only — issue #167); the active-run summary additionally carries the derived run-level keys `state` / `holder_state` (issue #141 — fail-open `null` when derivation fails, the key is always present) and the `current_card_*` keys are always present with defaults when the current card has no contract row (issue #190) | frontend |
+| `/api/tasks` | GET | task status (kanban + ledger); the list is a whitelist projection (`result` reduced to a `has_result` boolean, `harvest_log` / `workspace` / `exit_code` / `question` / `options` stripped, `block_kind` kept); `?fields=active` returns the active-run summary only and carries the derived boolean `current_card_delivery_failed` (same criterion as the detail `delivery.delivery_failed`, issue #178); each entry additionally carries the two derived delivery booleans `delivery_failed` / `delivery_dead` (auxiliary surface only — issue #167); the active-run summary additionally carries the derived run-level keys `state` / `holder_state` (issue #141 — fail-open `null` when derivation fails, the key is always present) and the `current_card_*` keys are always present with defaults when the current card has no contract row (issue #190). **Issue #235 added two more `current_card_*` keys**: `current_card_started_at` (the current card's `started_at`, epoch seconds — the dashboard's "Duration" line) and `current_card_result` (the current card's `result` text — the dashboard's "last output" line, truncated **server side** to 500 characters + ellipsis per §4.7, then to 160 characters in the frontend for rendering). Both are assigned unconditionally with a `None` default, so the two endpoints keep a byte-identical key set (#178) with and without a kanban row; the server-side truncation keeps the active segment inside its ~1 KB payload budget — see §4.7 | frontend |
 | `/api/tasks/<id>` | GET | single task detail with the full record (`result` / `harvest_log` / `workspace` / `exit_code`); plus the `delivery` dictionary (`notify_attempts` / `notify_confirmed_at` / `notify_last_failed_at` / `notify_last_error` / `notify_dead_until` / `last_notified_at` + the derived booleans `delivery_failed` / `delivery_dead`); 404 when the task does not exist. **The detail endpoint remains the full delivery-observability surface** (the 5s console polling goes through `?fields=active`, which since issue #178 carries only the derived `current_card_delivery_failed` boolean — the badge surface) — issue #167 | frontend |
 | `/api/heartbeat` | GET | reaper liveness heartbeat (`reaper_alive` + `reaper_heartbeat_age_s`); the liveness rule is identical to the one in `/api/workers` | frontend |
 | `/api/task/cancel` | POST | cancel one task: kills the mw-side `spawn-bg` process and marks the ledger row `CANCELLED` so the reaper stops settling and knocking; `task_id` is required (422 when missing); mw only stops its own driver — the kanban card lifecycle belongs to main (1A boundary) | frontend (TasksBoardView cancel) |
@@ -1621,6 +1714,8 @@ force-skipped by main as an explicit product decision.
 | `/api/attachments/image` | POST | server-side image compression for chat attachments (base64 in, compressed data URL + metadata out; long edge 2048 / JPEG q82 / ≤2 MB target, `413` when still too large — never falls back to the raw image; `503 pillow_unavailable` when Pillow is missing — issue #159) | frontend |
 | `/api/gwconfig` | GET | gateway config | frontend |
 | `/api/lang` | GET | deployment language (see §10) | frontend |
+| `/api/audio/voice-status` | GET | voice-input capability probe for the Team Work dialog: two-stage short-circuit check of the external ASR upstream (`GET {base}/models`, 2 s timeout) and whether the configured model is in the returned model list; the upstream base/model come from the three-tier chain — settings page `asr_base_url`/`asr_model` (live read, no cache) > env `MW_ASR_BASE_URL`/`MW_ASR_MODEL` > built-in default (issue ASR-SET); answers `{ok, available, reason, checked_at}` where `reason` is `ok` / `asr_unreachable` / `asr_model_missing`; the result is cached in-process for 30 s and `?force=1` bypasses the cache (the frontend re-probes on demand; saving an `asr_*` key on the settings page clears the cache so a new upstream shows up immediately); no real transcription is performed, so a wrong model id only surfaces later as a `503` on the transcribe endpoint — issue #232 | frontend (the Team Work dialog's [Text / Voice] gate) |
+| `/api/audio/transcribe` | POST | speech-to-text proxy: the browser never talks to the ASR directly, it posts a base64 WAV data URL (`{"data_url": "data:audio/wav;base64,…"}`) and the console forwards it to the upstream ASR as `multipart/form-data` (`file=audio.wav` + `model=<configured model>` — base/model/key resolved per call through the three-tier chain: settings page `asr_*` > env `MW_ASR_*` > built-in default, issue ASR-SET); only WAV (PCM RIFF/WAVE) is accepted (the local magic-number pre-check rejects anything else with `400 not_wav`), the decoded audio is capped at 8 MB and the request rides the global 64 MB body gate; answers `200 {ok, text}` on success, `200 {ok, text: ""}` for an empty transcript (silence is a normal answer, not an error), `400 bad_payload` / `400 not_wav` for an illegal body, `413 audio_too_large`, `503 asr_unreachable` when the upstream cannot be reached, `502 asr_error` on an upstream non-200 — issue #232 | frontend (the Team Work dialog's voice mode) |
 | `/api/w/<path>` | GET/PUT/POST | passthrough to worker gateway | frontend |
 | `/api/pixel/status` | GET | pixel-office availability (`enabled` from the settings/env switch, `running` from the proxy probe) — the frontend decides whether to show the pixel tab and whether the `/pixel` iframe proxy is usable | frontend |
 | `/api/webui/status` | GET | webui same-origin proxy availability (`enabled` from the `webui_proxy_enabled` settings key > env `WEBUI_PROXY_ENABLED` > auto-detect), so the frontend entry auto-points at `/webui/`; deliberately kept out of `SETTINGS_DEFAULTS` — a read-only probe that must not be pinned from the settings page — issue #196 | frontend |
@@ -1637,9 +1732,10 @@ force-skipped by main as an explicit product decision.
 | `/api/schedule/tasks/<id>/update` | POST | edit a queued task; only a `paused` task may be edited (409 otherwise) and the row stays `paused` after the edit; `detail` (400 when blank) and `priority` (400 when invalid) are validated — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/pause` | POST | `pending -> paused`; a task that does not exist is a 404, an illegal transition is a 409 — issue #164 | frontend |
 | `/api/schedule/tasks/<id>/resume` | POST | `paused -> pending` and re-arms the countdown; 404 when the task is gone, 409 on a state conflict — issue #164 | frontend |
-| `/api/schedule/tasks/<id>/cancel` | POST | `pending`/`paused -> cancelled`; 404 when the task is gone, 409 on a state conflict — issue #164 | frontend |
+| `/api/schedule/tasks/<id>/cancel` | POST | `pending`/`paused`/`running -> cancelled`; 404 when the task is gone, 409 on a state conflict — issue #164. **Widened in issue #234**: the store guard now also accepts `running`, so an operator can cancel a `running` inbox task that has no `run_id` (the deadlock shape: main was interrupted before the run row was created, and such a row blocks the `inbox_running` busy criterion forever); the service layer answers `409` with `schedule.err_run_busy` when the `running` row is linked to an **ACTIVE** Team Work run — that run must be closed or held on the board first, so a task-side cancel never bypasses the run lifecycle; a `running` row whose run row is missing or no longer `ACTIVE` is cancellable (the observation layer converges it to `done` in the same direction). The frontend shows a dedicated `409` toast on this path | frontend |
 | `/api/schedule/tasks/<id>/delete` | POST | permanently delete a task; **only** a `cancelled` task may be deleted (409 otherwise, 404 when the task is gone) — issue #164 | frontend |
 | `/api/schedule/run-now` | POST | run the countdown holder right now instead of waiting for the countdown (§4.5; issue #197: the holder, not the head of the queue); the server re-checks every condition inside the fire lock (auto-execute off / an in-progress inbox task (issue #206) / an active Team Work run / a busy gateway / an unreachable gateway / no active countdown / no pending task — each a 409 with its own reason) so the button cannot double-fire against the ticker — issue #164; the no-pending case carries its own message instead of a generic "operation not allowed" one (issue #179) | frontend |
+| `/api/model/options` | GET | **worker gateway endpoint — not a native console route** (the console never serves this path; it only calls it as a client): returns the worker's real effective model/provider (the worker config.yaml `model.default` — `/v1/models` only echoes the request alias) — issue #236 | console `api_worker_detail` (`mw/console.py:2565`) / frontend worker detail modal (via the `/api/w/<path>` passthrough) |
 | `/health` | GET | health check | monitoring |
 | `/` | GET | serve React UI | user's browser |
 

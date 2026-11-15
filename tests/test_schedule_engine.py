@@ -993,3 +993,129 @@ def test_q197_pause_api_wakes_ticker(tmp_path, monkeypatch):
     code, _ = S.api_schedule_action(tid, "pause")
     assert code == 200
     assert woke, "暂停未唤醒 ticker (持有者被暂停时倒计时不会即时转移)"
+
+
+# ════════════════════════════════════════════════════════════════════
+# G: gateway 忙读数陈旧豁免 (issue #241, FIX-PLAN §⑤ G1-G6)
+#
+# 泄漏场景: gateway /health/detailed 恒报 busy 且读数冻结 (active_agents
+# == active_api_runs == 1, 零 delegation/零租约) ⇒ mw 永久判忙, 倒计时
+# 永不起表、run-now 恒 409。修法 = 四信号合取豁免 (S1 api_runs 签名 +
+# S2 state.db 零活跃 turn 租约 + S3 签名冻结 ≥ _STALE_EXEMPT_S +
+# S4 零 delegation/process_completions)。
+# 沿用 _FakeResp + monkeypatch urlopen 既有模式 (:578 先例); 阈值
+# monkeypatch S._STALE_EXEMPT_S=0.05 + TTL 缩短以便测试内多次重探。
+# G4 (fail-closed 不回归) 由既有 test_probe_error_reason_not_overwritten
+# 覆盖, 此处另立一条显式锚定用例。
+
+def _leak_payload(active_agents=1, active_api_runs=1,
+                  delegations=0, procs=0, with_readiness=True):
+    """issue #241 泄漏签名载荷 (FIX-PLAN §⑤ G1)。"""
+    p = {"gateway_busy": True, "active_agents": active_agents}
+    if with_readiness:
+        p["readiness"] = {"checks": {"background_queues": {
+            "active_api_runs": active_api_runs,
+            "process_completions": procs,
+            "active_delegations": delegations}}}
+    return p
+
+
+def _stale_probe_engine(tmp_path, monkeypatch, payload, leases=0):
+    """泄漏场景引擎: 假 gateway 恒返 payload, 租约数 stub, 阈值/TTL 缩短。"""
+    eng = make_real_probe_engine(tmp_path)
+    monkeypatch.setattr(S, "_STALE_EXEMPT_S", 0.05)
+    monkeypatch.setattr(S, "_PROBE_TTL_S", 0.01)
+    _probe_stub(monkeypatch, payload)
+    monkeypatch.setattr(eng, "_live_turn_lease_count",
+                        lambda: leases if not callable(leases) else leases())
+    return eng
+
+
+def test_g241_g1_leak_stale_exempt(tmp_path, monkeypatch):
+    """G1 泄漏豁免: 冻结超阈值 + 四信号齐 ⇒ (True, None), _busy_reason None。"""
+    eng = _stale_probe_engine(tmp_path, monkeypatch, _leak_payload(), leases=0)
+    eng.store.create("A")                        # 有 pending ⇒ 走得到 gateway 判据
+    assert eng._gateway_free() == (False, "gateway_busy")   # 冻结未达阈值 ⇒ 仍判忙
+    time.sleep(0.07)                             # 越过 _STALE_EXEMPT_S=0.05
+    free, reason = eng._gateway_free()
+    assert free is True and reason is None, f"泄漏签名冻结后应豁免, 实得 {free, reason}"
+    assert eng._busy_reason() is None, "豁免后 _busy_reason 必须 None ⇒ 倒计时可起表"
+
+
+def test_g241_g2_real_busy_lease_no_exempt(tmp_path, monkeypatch):
+    """G2 真忙不回归 (租约): 同读数但有活跃 turn 租约 ⇒ 恒判忙。"""
+    eng = _stale_probe_engine(tmp_path, monkeypatch, _leak_payload(), leases=1)
+    eng.store.create("A")
+    eng._gateway_free()
+    time.sleep(0.07)
+    free, reason = eng._gateway_free()
+    assert free is False and reason == "gateway_busy", "有活跃租约 ⇒ 真忙, 不得豁免"
+    ok, r = eng._condition_ok()
+    assert ok is False and r == "gateway_busy", "run-now 条件必须仍被挡"
+
+
+def test_g241_g3_cron_busy_signature_mismatch_no_exempt(tmp_path, monkeypatch):
+    """G3 cron 真忙不回归: active_agents(2) != active_api_runs(1) ⇒ 签名不符不豁免。"""
+    eng = _stale_probe_engine(
+        tmp_path, monkeypatch,
+        _leak_payload(active_agents=2, active_api_runs=1), leases=0)
+    eng.store.create("A")
+    eng._gateway_free()
+    time.sleep(0.07)
+    free, reason = eng._gateway_free()
+    assert free is False and reason == "gateway_busy", \
+        "active_agents>active_api_runs (cron/delegation 类真忙) ⇒ 不豁免"
+
+
+def test_g241_g4_probe_error_fail_closed_unchanged(tmp_path, monkeypatch):
+    """G4 fail-closed 不回归: 探活异常 ⇒ gateway_probe_unavailable (红线分支)。"""
+    eng = make_real_probe_engine(tmp_path)
+    eng.store.create("A")
+
+    def boom(req, timeout=None):
+        raise OSError("gateway down")
+
+    monkeypatch.setattr(S.urllib.request, "urlopen", boom)
+    free, reason = eng._gateway_free()
+    assert free is False and reason == "gateway_probe_unavailable"
+
+
+def test_g241_g5_signature_change_resets_freeze(tmp_path, monkeypatch):
+    """G5 签名复位: 读数中途变化 (active 1→2) ⇒ _busy_since 重置, 不豁免。"""
+    eng = make_real_probe_engine(tmp_path)
+    monkeypatch.setattr(S, "_STALE_EXEMPT_S", 0.05)
+    monkeypatch.setattr(S, "_PROBE_TTL_S", 0.01)
+    monkeypatch.setattr(eng, "_live_turn_lease_count", lambda: 0)
+    holder = {"p": _leak_payload()}
+
+    def urlopen(req, timeout=None):
+        return _FakeResp(holder["p"])
+
+    monkeypatch.setattr(S.urllib.request, "urlopen", urlopen)
+    eng._gateway_free()
+    time.sleep(0.07)                             # 旧签名已冻结超阈值
+    holder["p"] = _leak_payload(active_agents=2)  # 读数变化 ⇒ 签名重置
+    free, reason = eng._gateway_free()
+    assert free is False and reason == "gateway_busy", "签名变化后不得沿用旧冻结时长"
+    assert eng._busy_sig[1] == 2
+    time.sleep(0.07)                             # 新签名重新冻结也须达标后才谈豁免
+    # 新签名 active_agents=2 != active_api_runs=1 ⇒ S1 不符, 恒不豁免
+    assert eng._gateway_free() == (False, "gateway_busy")
+
+
+def test_g241_g6_conservative_degradation(tmp_path, monkeypatch):
+    """G6 保守降级: 无 readiness 结构 / 租约查询 None ⇒ 不豁免仍判忙。"""
+    # 6a: 响应缺 readiness 结构
+    eng = _stale_probe_engine(
+        tmp_path, monkeypatch,
+        _leak_payload(with_readiness=False), leases=0)
+    eng.store.create("A")
+    eng._gateway_free()
+    time.sleep(0.07)
+    assert eng._gateway_free() == (False, "gateway_busy"), "缺 readiness ⇒ 保守不豁免"
+    # 6b: 租约查询失败 (None = 未知 ≠ 无)
+    eng2 = _stale_probe_engine(tmp_path, monkeypatch, _leak_payload(), leases=None)
+    eng2.store.create("A")
+    eng2._gateway_free()
+    time.sleep(0.07)
+    assert eng2._gateway_free() == (False, "gateway_busy"), "租约未知 ⇒ 保守不豁免"

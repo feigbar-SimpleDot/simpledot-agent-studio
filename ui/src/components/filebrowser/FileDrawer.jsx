@@ -275,8 +275,8 @@ export function FileDrawer({ open, project, onClose, revealTarget, refreshKey })
 
       {/* 主体: 树 + 预览 (桌面双栏, 移动下钻) */}
       <div className="flex-1 min-h-0 flex flex-col md:flex-row">
-        <div className="md:w-[220px] md:border-r md:border-line
-                        md:block flex-shrink-0">
+        <div className="min-h-0 flex-1 md:flex-none
+                        md:w-[220px] md:border-r md:border-line md:block">
           <FileTree project={project}
                     onPick={setSelection}
                     onEnterDir={(p) => setCwd(p)}

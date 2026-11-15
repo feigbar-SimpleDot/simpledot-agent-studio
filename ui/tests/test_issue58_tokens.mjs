@@ -189,8 +189,31 @@ test('i18n: 顶层全量 flatten 键集合 en == zh (基线 639 → 643 → 644)
   // 861 → 862: issue #228 新增 1 键 (workers.field.api_key_edit_hint ——
   // 编辑弹窗 api_key「留空 = 不修改」提示, 双语同 commit, INV-09 先例口径
   // —— 键数锚随合法新增同步上调)。
-  assert(fe.size === 862 && fz.size === 862,
-    `期望 820+17+8+1+12+3+1=862 键, 实际 en=${fe.size} zh=${fz.size}`)
+  // 862 → 863: issue #234 新增 1 键 (schedule.toast.cancel_blocked_run ——
+  // running 任务取消被 ACTIVE run 409 拦截时的「先关 run」指路文案,
+  // 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 863 → 866: issue #235 新增 3 键 (dashboard.r4_task_label /
+  // r4_duration_label / r4_output_label —— 工作中卡「当前任务/持续/最近输出」
+  // 三行标签, 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 866 → 882: issue #232 新增 16 键 (chat.team_work_modal.voice.* 子树 16 键
+  // —— 语音创建任务弹窗 [文本|语音] 切换/能力状态点/长按录音/转写中/错误条/
+  // 改用文出口 全部文案, 逐字取 UX-PROTOTYPE.md §4 定稿 16 条, 双语同 commit,
+  // INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 882 → 890: issue ASR-SET 新增 8 键 (settings.group.asr +
+  // settings.row.asr_{base_url,model,key}_{label,hint} 6 键 +
+  // settings.invalid_asr_url —— 设置页「语音转写 (ASR)」分组全部文案,
+  // 逐字取 docs/asr-config-settings/DESIGN.md §4 表, 双语同 commit,
+  // INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 890 → 893: voice-diag s2 新增 3 键 (chat.team_work_modal.voice.err_insecure
+  // / err_denied / err_nomic —— 语音录音错误分类修复, 「浏览器禁录」与
+  // 「转写失败」分开报, 文案逐字取 docs/voice-diag/ANALYSIS.md §3 方案一,
+  // 双语同 commit, INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  // 893 → 894: issue #241 s2 新增 1 键 (schedule.busy_hint_gateway —— gateway
+  // 报忙但本地无 running 行时的区分文案, 泄漏场景误导排查方向修复,
+  // 文案逐字取 docs/gw-leak-241/FIX-PLAN.md §③, 双语同 commit,
+  // INV-09 先例口径 —— 键数锚随合法新增同步上调)。
+  assert(fe.size === 894 && fz.size === 894,
+    `期望 820+17+8+1+12+3+1+1+3+16+8+3+1=894 键, 实际 en=${fe.size} zh=${fz.size}`)
 })
 
 test('i18n: tboard 子 dict 键集合差集为空 (124+5=129, +1=130)', () => {

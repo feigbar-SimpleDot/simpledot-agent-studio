@@ -149,7 +149,10 @@ test('E2c 弹窗标题固定 edit_title (无 new_title 分支)', () => {
 test('E3 schedActions 矩阵逐格不变 (paused 仍含 edit)', () => {
   eq(F.schedActions('pending'), ['pause', 'cancel'], 'pending')
   eq(F.schedActions('paused'), ['resume', 'cancel', 'edit'], 'paused')
-  eq(F.schedActions('running'), [], 'running')
+  // issue #234: running 放开取消 (running→cancelled 出口, 修 main 中断
+  // 后 run_id=NULL 永久卡死) —— 本格按 #234 裁定表 §2.1 由 [] 改 ['cancel'],
+  // 其余格仍逐字不变。
+  eq(F.schedActions('running'), ['cancel'], 'running')
   eq(F.schedActions('done'), [], 'done')
   eq(F.schedActions('cancelled'), ['delete'], 'cancelled')
   eq(F.schedActions('nonsense'), [], '未知态')

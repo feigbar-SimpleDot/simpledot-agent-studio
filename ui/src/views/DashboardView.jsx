@@ -389,6 +389,27 @@ function WorkerAvatar({ name, avatar, size = 64, ring = false, live = false }) {
   )
 }
 
+// ── issue #235: 工作中卡「持续时间 / 最近一次输出」两纯函数 (vm 直测口径) ──
+// 持续时间: 当前卡 started_at (epoch 秒) → "42s" / "23m" / "1h 23m"。
+// started_at 缺失/非法 (None/0/非数) ⇒ null ⇒ 前端不渲染该行; 时钟回拨
+// 负值钳 0。单位用 s/m/h 通用记法, 零 i18n 新键。
+export function formatCardDuration(startedAt, nowSec) {
+  if (typeof startedAt !== 'number' || !isFinite(startedAt) || startedAt <= 0) return null
+  const sec = Math.max(0, Math.floor(nowSec - startedAt))
+  if (sec < 60) return `${sec}s`
+  const m = Math.floor(sec / 60)
+  if (m < 60) return `${m}m`
+  return `${Math.floor(m / 60)}h ${m % 60}m`
+}
+
+// 最近一次输出截断 (裁定 §2.2 默认口径: 当前卡 result 字段, 空则不渲染
+// 该行): 折叠连续空白为单空格后截断 n 字符加省略号; 空/全空白 ⇒ null。
+export function truncateOutput(s, n = 160) {
+  const v = String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+  if (!v) return null
+  return v.length > n ? v.slice(0, n) + '…' : v
+}
+
 // ── dashboard-fix-20261105 R-B / issue #229 GG轮: 工作中 worker 条目卡 ──
 // 用户评论 2287 新口径: working 条目住在左栏「工作中」大卡内 ⇒ 条目卡改为
 // 撑满栏宽 (w-full, 原 w-[260px] 固定宽随双栏改造移除); 动效边框从卡级
@@ -398,7 +419,14 @@ function WorkerAvatar({ name, avatar, size = 64, ring = false, live = false }) {
 // 经 team_work_active 命中显示当前 run display_title, 仅 SSE 活体无 run 不显示)。
 // token 数值行已移除 (OQ-2 裁决 / AC-C3, token 展示统一由 24h 柱状图承担)。
 // 模块级定义 (issue #207 同款纪律: 5s 轮询重渲染不重挂组件身份)。
-function WorkerRunCard({ name, avatar, cardCount, runTitle, onChat, t }) {
+// issue #235: 三行增信息 (裁定 §2.2 默认口径) —— 当前 task 标题
+// (current_card_title)、持续时间 (current_card_started_at 起算, 5s 轮询
+// 自然刷新)、最近一次输出 (current_card_result 截断展示, title 悬停全文);
+// 任一行数据缺失 ⇒ 该行不渲染 (与 run 标签行同款条件渲染纪律)。
+function WorkerRunCard({ name, avatar, cardCount, runTitle, taskTitle,
+                         taskStartedAt, taskResult, onChat, t }) {
+  const duration = formatCardDuration(taskStartedAt, Date.now() / 1000)
+  const output = truncateOutput(taskResult)
   return (
     <div className="w-full bg-panel border border-line rounded-2xl p-4
                     flex flex-col gap-3">
@@ -419,6 +447,24 @@ function WorkerRunCard({ name, avatar, cardCount, runTitle, onChat, t }) {
         <div className="flex items-center gap-1.5 min-w-0 text-[11px]">
           <span className="badge-blue shrink-0">{t('dashboard.r4_run_label')}</span>
           <span className="text-dim truncate" title={runTitle}>{runTitle}</span>
+        </div>
+      )}
+      {taskTitle && (
+        <div className="flex items-center gap-1.5 min-w-0 text-[11px]">
+          <span className="badge-blue shrink-0">{t('dashboard.r4_task_label')}</span>
+          <span className="text-dim truncate" title={taskTitle}>{taskTitle}</span>
+        </div>
+      )}
+      {duration && (
+        <div className="flex items-center gap-1.5 min-w-0 text-[11px]">
+          <span className="badge-blue shrink-0">{t('dashboard.r4_duration_label')}</span>
+          <span className="text-dim">{duration}</span>
+        </div>
+      )}
+      {output && (
+        <div className="flex items-center gap-1.5 min-w-0 text-[11px]">
+          <span className="badge-blue shrink-0">{t('dashboard.r4_output_label')}</span>
+          <span className="text-dim truncate" title={taskResult}>{output}</span>
         </div>
       )}
       <button onClick={() => onChat && onChat(name)}
@@ -873,7 +919,9 @@ export default function DashboardView({ onNavigate, onWorkerChat }) {
   // countdown.active && busy_reason==null && auto_execute
   const runNowEnabled = !!(cdActive && c1.st && c1.st.busy_reason == null && c1.st.auto_execute)
   const runNowHint = !cdActive ? t('dashboard.r5_run_now_off_idle')
-    : (c1.st && c1.st.busy_reason != null) ? t('schedule.busy_hint')
+    : (c1.st && c1.st.busy_reason === 'gateway_busy' && !c1.st.running_task_id)
+      ? t('schedule.busy_hint_gateway')
+      : (c1.st && c1.st.busy_reason != null) ? t('schedule.busy_hint')
     : !(c1.st && c1.st.auto_execute) ? t('dashboard.r5_run_now_off_auto')
     : t('dashboard.r5_run_now')
   const doRunNow = async () => {
@@ -1066,7 +1114,11 @@ export default function DashboardView({ onNavigate, onWorkerChat }) {
                   <WorkerRunCard key={w.name} t={t}
                     name={w.name} avatar={avatarOf(w.name)}
                     cardCount={w.viaRun ? w.cardCount : 0}
-                    runTitle={w.viaRun ? runTitleOf : null} onChat={onWorkerChat} />
+                    runTitle={w.viaRun ? runTitleOf : null}
+                    taskTitle={w.viaRun && twa ? (twa.current_card_title || null) : null}
+                    taskStartedAt={w.viaRun && twa ? (twa.current_card_started_at ?? null) : null}
+                    taskResult={w.viaRun && twa ? (twa.current_card_result || null) : null}
+                    onChat={onWorkerChat} />
                 ))}
                 {workingWorkers.length === 0 && (
                   <p className="text-xs text-dim text-center py-4">{t('dashboard.z1_empty')}</p>

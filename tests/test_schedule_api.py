@@ -99,6 +99,73 @@ def test_delete_only_cancelled():
     assert code == 404                                   # 已删 ⇒ 不存在
 
 
+# ── issue #234: running 取消出口 (API 层守卫迁移守护) ─────────────────
+def _mk_ledger_with_run(tmp_path, run_id, status):
+    """最小 ledger: team_work_runs 一行 (run_id, status), 供 ACTIVE 拦截用例。"""
+    import sqlite3
+    db = tmp_path / "ledger234.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE team_work_runs (run_id TEXT PRIMARY KEY, "
+              "status TEXT NOT NULL)")
+    c.execute("INSERT INTO team_work_runs VALUES (?, ?)", (run_id, status))
+    c.commit()
+    c.close()
+    return str(db)
+
+
+def _to_running(task_id):
+    eng = S.get_engine()
+    assert eng.store.take_pending(task_id) is not None
+    return eng
+
+
+def test_cancel_running_no_run_ok(tmp_path):
+    """#234 死锁形态: running 且 run_id=NULL (main 中断于建 run 前) ⇒ 可取消。
+
+    这正是 issue 实测卡死场景 (id=ac5ac06dd26342d0): 旧守卫 409, 新守卫
+    200 + cancelled + finished_at ⇒ inbox_running 门禁解锁。
+    """
+    t = _create()
+    eng = _to_running(t["id"])
+    code, body = S.api_schedule_action(t["id"], "cancel")
+    assert code == 200, body
+    assert body["task"]["status"] == "cancelled"
+    assert body["task"]["finished_at"] is not None
+    row = eng.store.get(t["id"])
+    assert row is not None and row["status"] == "cancelled"
+
+
+def test_cancel_running_active_run_409(tmp_path):
+    """#234 边界: running 关联 ACTIVE run ⇒ 409 提示先关 run (不旁路 run)。"""
+    t = _create()
+    eng = _to_running(t["id"])
+    assert eng.store.backfill_run(t["id"], "run-234") is True
+    eng.ledger_db = _mk_ledger_with_run(tmp_path, "run-234", "ACTIVE")
+    code, body = S.api_schedule_action(t["id"], "cancel")
+    assert code == 409 and body["code"] == 409 and body["error"]
+    row = eng.store.get(t["id"])
+    assert row is not None and row["status"] == "running"   # 未被取消
+
+
+def test_cancel_running_closed_run_ok(tmp_path):
+    """run 已 CLOSED ⇒ 非 ACTIVE, 取消放行 (与观察层收敛口径一致)。"""
+    t = _create()
+    eng = _to_running(t["id"])
+    assert eng.store.backfill_run(t["id"], "run-234") is True
+    eng.ledger_db = _mk_ledger_with_run(tmp_path, "run-234", "CLOSED")
+    code, body = S.api_schedule_action(t["id"], "cancel")
+    assert code == 200 and body["task"]["status"] == "cancelled"
+
+
+def test_cancel_running_run_row_missing_ok(tmp_path):
+    """run_id 非空但 ledger 无该行 (fixture 默认空库) ⇒ 按无 run 降级放行。"""
+    t = _create()
+    eng = _to_running(t["id"])
+    assert eng.store.backfill_run(t["id"], "run-ghost") is True
+    code, body = S.api_schedule_action(t["id"], "cancel")
+    assert code == 200 and body["task"]["status"] == "cancelled"
+
+
 # ── update: 仅 paused ────────────────────────────────────────────────
 def test_update_only_paused():
     t = _create("原详情")

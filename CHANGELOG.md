@@ -6,6 +6,147 @@ first. Prose is English per the repo root-doc convention (see
 spans. Process/review/test notes live outside the repo under the task
 workspace `docs/` and are referenced by card id, not duplicated here.
 
+## Unreleased — Inbox queue stale-busy exemption (2026-11-14): a leaked gateway run record no longer freezes the schedule queue forever
+
+Range: one commit `74f8fce`, i.e. `370ac2e..74f8fce` — 1 commit, 8 files changed, 214 insertions(+), 21 deletions(-) (`mw/schedule.py` +62/−6, the guard suite `tests/test_schedule_engine.py` +126, `ui/src/views/ScheduleView.jsx` +4/−1, `ui/src/views/DashboardView.jsx` +3/−1, the new bilingual key `schedule.busy_hint_gateway` in `ui/src/i18n/locales/en.json` and `zh-cn.json` (+1 each), the key-count anchor `ui/tests/test_issue58_tokens.mjs` 893→894, and the rebuilt tracked bundle `ui/dist/index.html` +11/−11). The plan of record is `docs/gw-leak-241/FIX-PLAN.md` in the task workspace (card t_4ff729f0); this entry is the release-facing summary.
+
+### Fixed
+
+- **A leaked gateway run record could freeze the inbox queue forever — a pending task never started, `POST /api/schedule/run-now` always answered 409, and the UI kept claiming a task was running while nothing was** — the gateway (hermes-agent 0.21.5) can leave a non-terminal `queued`/`running` entry in its in-memory run table after an abnormally aborted turn, so `/health/detailed` reports `gateway_busy=true, active_agents=1, active_api_runs=1` indefinitely while the gateway is actually idle. The schedule release probe in `mw/schedule.py` (`_gateway_free`) was purely fail-closed — any busy reading blocked the countdown — with no stale fallback, so one leaked record starved the whole queue until a gateway restart (observed in the field: a task stuck 6+ hours while the gateway sat idle, with no non-restart escape). The old copy "a task is running" also sent users hunting a phantom task. Root cause and evidence: issue #241 and `docs/gw-leak-241/FIX-PLAN.md`.
+- **`_gateway_free` now exempts a busy reading that is provably stale, via a four-signal conjunction** — the exemption fires only when all four signals hold together: the busy reading has been frozen for at least `_STALE_EXEMPT_S` (900 s); the leak signature `active_agents == active_api_runs` holds with `readiness.checks.background_queues` present; no active delegations or process completions; and zero live session turn leases in `state.db` (a failed lease query counts as unknown and conservatively refuses the exemption). Any signal missing or mismatched keeps the old busy behaviour; idle readings reset the freeze tracking; an exemption logs once. The fail-closed branch for an unavailable probe is untouched — probe failure still means busy.
+- **The UI now distinguishes "gateway reports busy" from "a task is running"** — when `busy_reason === 'gateway_busy'` and no local task is running, `ScheduleView` and `DashboardView` render the new bilingual key `schedule.busy_hint_gateway` (which names the likely cause and the restart remedy) instead of the old "task is running" hint, so the leak scenario no longer masquerades as a real running task.
+
+### Notes
+
+- **Guards** — six new cases G1-G6 in `tests/test_schedule_engine.py` (leak exemption, real-busy-with-live-lease no-exempt, signature-mismatch no-exempt, probe-error fail-closed, signature-change reset, conservative degradation); the i18n key-count anchor moved 893→894 in the same commit (the INV-09 precedent). Verification evidence lives in the task workspace (`docs/gw-leak-241/REVIEW.md` verdict PASS; `docs/gw-leak-241/TEST-REPORT.md`: A1 leak exemption on the factory 900 s threshold, A2 real-busy control hard gate, A3 probe-unavailable fail-closed, and G7 bilingual UI rendering all PASS; the S4 discrimination matrix 6/6 with mutation counter-proof; full pytest 1305 passed).
+- **Scope** — issue #241 has two halves. This delivery is the mw side (stale exemption + UI copy split). The gateway-side half — the leaked `_run_statuses` entry inside hermes-agent upstream — lives outside this repo and is tracked upstream; a gateway restart still clears a leak immediately on today's upstream build.
+- **Deployment** — this changes the tracked frontend bundle, so `git pull` alone is not enough: run `./deploy/install.sh` and restart the container. At write time the tracked `ui/dist/index.html` (`fd12393a…`) carries the fix while the runtime copies do not (`mw/ui_dist` is `216da73a…`, `/share_workspace/ui_dist` is `b7c90ab1…`) — the dist gate's C2 copy-consistency check is red for exactly this pre-existing runtime-copy staleness, not anything this commit introduced. **None of the new busy hint is live until the user pulls, installs and restarts.**
+
+## Unreleased — Voice-recording error classification fix (2026-11-13): a browser-blocked microphone no longer reports as a failed transcription
+
+Range: one commit `6b7ebe5`, i.e. `d332e49..6b7ebe5` — 1 commit, 5 files changed, 93 insertions(+), 73 deletions(-) (`ui/src/components/VoiceRecorder.jsx` +12/−2, `ui/src/i18n/locales/en.json` +3, `ui/src/i18n/locales/zh-cn.json` +3, the key-count anchor `ui/tests/test_issue58_tokens.mjs` 890→893, and the rebuilt tracked bundle `ui/dist/index.html` +69/−69). Zero backend changes. The plan of record is `docs/voice-diag/ANALYSIS.md` in the task workspace (card t_f63df5bf); this entry is the release-facing summary.
+
+### Fixed
+
+- **Opening the console over `http://<internal-IP>:8700` made the voice button always answer "Transcription failed, try again" — even though no request was ever sent** — in a non-secure context (anything but `http://localhost` or HTTPS) the browser disables `navigator.mediaDevices.getUserMedia` outright, so recording could never start. The old code funneled every `getUserMedia` failure into a single `fail('generic')` in the `VoiceRecorder.jsx` catch, and the UI rendered `chat.team_work_modal.voice.err_generic` — an ASR-side message ("Transcription failed, try again") for a microphone-side problem. The ASR backend itself was healthy throughout (voice-status `available: true`, upstream reachable, end-to-end transcription round-trip verified), so the message sent users hunting a broken speech service that was never involved. Root cause and evidence: `docs/voice-diag/ANALYSIS.md`.
+- **The recorder now checks the environment first and classifies microphone errors** — `onDown` begins with a preflight (`!window.isSecureContext || !navigator.mediaDevices?.getUserMedia` → `fail('insecure')`) before touching any recording API, so a non-secure-context user gets the accurate message instantly and no doomed request is attempted. The catch now splits on `err.name`: `NotAllowedError` → `denied` (microphone permission denied), `NotFoundError`/`DevicesNotFoundError` → `nomic` (no microphone device), everything else → `generic` (the original path B, unchanged). Three new bilingual i18n keys under `chat.team_work_modal.voice.` — `err_insecure`, `err_denied`, `err_nomic` — landed in both `en.json` and `zh-cn.json`; the `err_insecure` text names the actual fix: open via `http://localhost:8700`, an SSH tunnel `ssh -L 8700:localhost:8700`, or HTTPS.
+
+### Notes
+
+- **Guards** — the i18n key-count anchor in `ui/tests/test_issue58_tokens.mjs` moved 890→893 in the same commit (the INV-09 precedent: the anchor rises with legitimate key additions). Verification evidence lives in the task workspace (`docs/voice-diag/IMPL-NOTES.md`, `docs/voice-diag/TEST-REPORT.md`): a BASE-vs-FIXED control group reproduced the original misreport on the base build and confirmed the new copy on the fixed build, with a real fake-microphone end-to-end run proving the secure-context path is untouched.
+- **Deployment** — this changes the tracked frontend bundle, so `git pull` alone is not enough: run `./deploy/install.sh` and restart the container. At write time the tracked `ui/dist/index.html` (`b7c90ab1…`) already carries the fix while both runtime copies do not (`mw/ui_dist` is `216da73a…`, `/share_workspace/ui_dist` is `03199de7…`) — the dist gate's C2 copy-consistency check is red for exactly this reason, a pre-existing runtime-copy staleness rather than anything this commit introduced. **None of the new error copy is live until the user pulls, installs and restarts — an old UI keeps showing the single old "transcription failed" message and the fix will look like it did nothing.**
+
+## Unreleased — Mobile file-browser scroll fix (2026-11-13): the drawer's file list finally scrolls on phones
+
+Range: one commit `db7bdcc`, i.e. `18f126a..db7bdcc` — 1 commit, 2 files changed, 5 insertions(+), 5 deletions(-) (`ui/src/components/filebrowser/FileDrawer.jsx` +2/−2, the rebuilt tracked bundle `ui/dist/index.html` +3/−3). The plan of record is `docs/mobile-scroll/ANALYSIS.md` in the task workspace (card t_3a97fc28); this entry is the release-facing summary.
+
+### Fixed
+
+- **On mobile (<768px) the file browser's file list could not be scrolled — with a long directory, everything below the fold was invisible and unreachable** — the file-tree wrapper at `ui/src/components/filebrowser/FileDrawer.jsx:278-279` carried no height constraint and a `flex-shrink-0`, so under the mobile `flex flex-col` body it was pinned to its content height; the `overflow-y-auto h-full` scroll container in `FileTree.jsx:257` therefore matched its content height and never produced a scroll, and the overflowing content was clipped by the drawer with no scrollable ancestor anywhere above it. Desktop was unaffected because the `md:flex-row` stretch gave the wrapper a definite height. The wrapper's className went from `md:w-[220px] md:border-r md:border-line md:block flex-shrink-0` to `min-h-0 flex-1 md:flex-none md:w-[220px] md:border-r md:border-line md:block` — drop `flex-shrink-0`, add `min-h-0 flex-1`, and restore the desktop behaviour with `md:flex-none`.
+- **Desktop behaviour is unchanged** — `md:flex-none` (`flex:none`) combined with `md:w-[220px]` is equivalent to the old `flex-shrink-0` width-protection semantics, and the column height is still driven by the `md:flex-row` stretch. Measured in the shipped CSS: `.md\:flex-none{flex:none}`, `.flex-1{flex:1 1 0%}`, `.min-h-0{min-height:0px}`.
+
+### Notes
+
+- **Mobile layout consequence** — the tree and the preview now split the drawer body in half and scroll independently (measured at 390×844: tree area y=61..431 h=370, preview area y=431..801 h=370). This is the scrollability the fix buys; the cost is that the first screen shows 9 files instead of 20. The layout is a top/bottom split, not a drill-down — the drill-down alternative was rejected in the analysis (ANALYSIS.md §③).
+- **Guards** — no new frontend guard ships with this fix: nothing in `ui/tests/` asserts the changed wrapper classes today. The evidence is the verification card (t_55e36380, `docs/mobile-scroll/TEST-REPORT.md`): a BASE-vs-FIXED control group reproduced the defect and confirmed the fix under CDP device emulation (390×844, touch emulation), with a pixel-diff desktop regression at zero difference; real iOS/Android hardware was not exercised.
+- **Deployment** — this changes the tracked frontend bundle, so `git pull` alone is not enough: run `./deploy/install.sh` and restart the container. At audit time the tracked `ui/dist/index.html` (`03199de7…`) already carried the fix while both runtime copies (`mw/ui_dist` and `/share_workspace/ui_dist`, `216da73a…`) did not — this commit is exactly what flipped the dist gate's C2 copy-consistency check from green to red, the `DEPLOY.md` case "if the pull changed the tracked frontend, re-run `./deploy/install.sh`". **None of this fix is live until the user pulls, installs and restarts.**
+
+## Unreleased — ASR settings-page configuration (2026-11-12): the speech-to-text upstream moves from env-only to a settings-page group with a three-tier resolution chain
+
+The user's call was "this belongs in configuration, not env": the ASR upstream
+base URL, model id and API key are now first-class settings-page entries (a new
+"Speech-to-text (ASR)" / 「语音转写 (ASR)」 group with three rows — `asr_base_url`,
+`asr_model`, `asr_key`; the key row renders as a password input). Resolution is
+a three-tier chain — settings page (empty string = not set, read live on every
+call, no cache) > env `MW_ASR_*` (kept as the deployment-time fallback tier) >
+built-in defaults held solely by `mw/audio_proxy.py`. Saving any `asr_*` key
+also clears the 30 s voice-status probe cache, so **a save takes effect
+immediately, no restart**. `asr_base_url` is validated on both ends (backend
+`_clean_asr_base` → 422, frontend pre-check) to accept only `http(s)://`
+absolute addresses or empty. Backward compatibility is byte-identical when the
+user never touches the group: the `SETTINGS_DEFAULTS` entries are deliberately
+empty-string sentinels (the webui_proxy_enabled pinning trap, `#131`, is the
+cautionary precedent), so a settings save pins nothing over the env tier.
+Guards: `tests/test_asr_settings_page.py` S1-S5 + `ui/tests/test_issue_asr_settings.mjs` U1-U4.
+Design: task workspace `docs/asr-config-settings/DESIGN.md`.
+
+## Unreleased — Issue convergence HH batch (2026-11-11): a running inbox task can finally be cancelled, the dashboard's working card shows the task / duration / last output, and the Team Work dialog can take a voice requirement
+
+Range: one commit `cdb9e1f`, i.e. `11001bc..cdb9e1f`
+(17 files, +1431/−182). Three user issues in one batch — #234 (a running
+inbox task could not be cancelled), #235 (the dashboard's working card
+showed too little), and #232 (voice input for the Team Work dialog) —
+plus the documentation corrections listed under "Docs corrections".
+
+### Added
+
+- **A running inbox task can be cancelled (#234)** — the store guard for
+  `cancel` was widened from `status IN ('pending','paused')` to
+  `status IN ('pending','paused','running')`, and the inbox row now renders
+  a cancel button in the `running` group. This closes a real deadlock: when
+  main was interrupted before the run row was created, the task stayed
+  `running` with `run_id = NULL`, nothing ever converged it (the engine
+  warns but deliberately does not auto-revert — see `design.md` §4.4), and
+  the row permanently held the `inbox_running` busy criterion, so no later
+  task could ever start its countdown. A `running` row that **is** linked to
+  an ACTIVE Team Work run is refused with a `409` (`schedule.err_run_busy`)
+  — a run's lifecycle goes through the board's close / hold channel, never
+  through a task-side cancel bypass — and the frontend answers that `409`
+  with a dedicated toast pointing at the board. The zombie warning now
+  names the `run_id` in its text (`run_id=NULL` identifies the cancellable
+  shape) and points at the inbox's cancel button.
+- **The dashboard's working card shows three more lines (#235)** — the
+  current task's title, its elapsed duration (`started_at` → `42s` / `23m` /
+  `1h 23m`, clock-skew clamped to 0) and its most recent output (the
+  current card's `result`, truncated to 160 characters with the full text on
+  hover). Each line renders only when its data is present, so a card that
+  has not started yet, or whose result is still empty, shows no empty row.
+  The two new backend keys (`current_card_started_at` /
+  `current_card_result`) are assigned unconditionally with a `None`
+  default, so the lightweight and the full task endpoint keep a
+  byte-identical key set (issue #178's discipline) and no new query is
+  added (the existing card query was widened by two columns).
+- **The Team Work dialog can take a voice requirement (#232)** — a new
+  `[Text / Voice]` mode next to the existing text requirement. The dialog
+  probes `GET /api/audio/voice-status` on open; only when the upstream ASR
+  answers is the voice entry point rendered at all (otherwise a dim "voice
+  input is not enabled" line that re-probes on click), so the feature
+  never disturbs a deployment that has no ASR. Recording is a press-and-hold
+  button: PCM is captured through the Web Audio API and wrapped as a WAV in
+  the browser (16 kHz mono, a 60 s hard cap, a 50 s warning, a 40 px upward
+  slide to cancel, a sub-0.5 s tap discarded as a mis-touch), then posted
+  to `POST /api/audio/transcribe`. The console proxies it to the upstream
+  ASR as multipart (`file=audio.wav` + `model`); the browser never talks to
+  the ASR directly, so there is no CORS problem, no ASR credential in the
+  browser, and **no extra host port** for the upstream. The upstream is
+  OpenAI-compatible and configured by `MW_ASR_BASE_URL` / `MW_ASR_MODEL` /
+  `MW_ASR_KEY` (see DEPLOY.md §3). A successful transcript is appended to
+  the requirement text and the dialog returns to text mode for review; an
+  unreachable upstream answers `503`, a rejected payload `400` / `413`, an
+  upstream error `502`, and an empty transcript is a normal `200` with an
+  empty text.
+
+### Changed
+
+- The `GET /api/tasks?fields=active` response now carries the current card's
+  full `result` text under `current_card_result`. This is a **deliberate
+  but non-free** trade: the field is unbounded, so the endpoint that
+  `design.md` §4.7 documents as a ~1 KB lightweight polling surface now
+  scales with the size of the current card's result. `design.md` §4.7
+  records the payload discipline this puts on the surface, and any future
+  unbounded field on that segment must be bounded server side.
+
+### Docs corrections
+
+- `design.md` §11.7 registers the two new `/api/audio/*` endpoints; §4.3
+  and §11.7 record the widened `running -> cancelled` transition and the
+  `409` rule for a task linked to an ACTIVE run; §4.4 records the new
+  operator-driven exit for the zombie-`running` shape; §11.2 documents the
+  dialog's voice mode (gate, path, degradation, fill-back); §4.7 states the
+  bounded-payload discipline of the active-run summary; `DEPLOY.md` §3 adds
+  the ASR upstream's env configuration and the secure-context requirement
+  for `getUserMedia`.
+
 ## Unreleased — Dashboard fix batch (2026-11-05): the desktop navigation returns to the left-sidebar shell, workers split into a working zone (large card, animated border, current-run label) and a one-line idle list, and worker 24h tokens move to a dedicated bar chart
 
 Range: two commits `51b407e` + `6bd2736`, i.e. `9c1d297..6bd2736`

@@ -56,6 +56,8 @@ COUNTDOWN_S = 300
 # 探活缓存 TTL (秒) 与探活超时 (ARCH-164 §2.2)
 _PROBE_TTL_S = 3.0
 _PROBE_TIMEOUT_S = 5.0
+# issue #241: gateway 忙读数陈旧豁免阈值 (签名连续不变 ≥ 此值 且 交叉信号无真活 ⇒ 判泄漏)
+_STALE_EXEMPT_S = 900.0
 # chat/stream 单连接硬上限 (ARCH-164 §2.2 触发流程 3)
 _STREAM_HARD_CAP_S = 3600
 # issue #206 僵尸 running 兜底阈值: running 行 updated_at 距今超过
@@ -568,10 +570,16 @@ class ScheduleStore:
         return self._cond_update(task_id, "status='pending'",
                                  "status='paused'", ())
 
-    def cancel(self, task_id: str) -> bool:     # pending/paused→cancelled
+    def cancel(self, task_id: str) -> bool:     # pending/paused/running→cancelled
         # 取消属终态 ⇒ 同步写 finished_at (AC-Q197-4: 终态行按完成时刻排序)
+        # issue #234: 守卫放开 running —— running→cancelled = 操作者显式
+        # 放弃该任务 (修复 main 中断后 run_id=NULL 的 running 无任何回收
+        # 路径、永久占住 inbox_running 门禁的死锁)。关联 ACTIVE run 的
+        # running 任务由服务层 api_schedule_action 先行拦截 (409 提示先
+        # 关 run), 存储层守卫只管状态机可达性。
         return self._cond_update(task_id, "status='cancelled', finished_at=?",
-                                 "status IN ('pending','paused')", (time.time(),))
+                                 "status IN ('pending','paused','running')",
+                                 (time.time(),))
 
     def delete_cancelled(self, task_id: str) -> bool:
         """仅取消态可删 (AC-3.5)。"""
@@ -804,6 +812,10 @@ class ScheduleEngine:
         # (单槽结构, AC-Q197-12)。
         self.countdown_task_id: str | None = None
         self._probe_cache: tuple[float, tuple[bool, str | None] | None] = (0.0, None)
+        # issue #241: busy 签名冻结跟踪 (仅 _gateway_free 单点读写; ticker/run_now 均经此)
+        self._busy_sig: tuple | None = None
+        self._busy_since: float = 0.0
+        self._stale_exempt_logged: bool = False
         # issue #206: 僵尸 running 告警去重 (键 = (task_id, updated_at),
         # 同一行同一时刻只告警一次, 不刷屏)
         self._zombie_warned: set = set()
@@ -956,6 +968,41 @@ class ScheduleEngine:
                          "WHERE status='ACTIVE' LIMIT 1")
         return bool(rows)
 
+    def _live_turn_lease_count(self) -> int | None:
+        """state.db session_turn_leases 活跃租约数; 任何异常 ⇒ None (保守: 未知≠无)。
+        home 口径与 console 同款: MW_HERMES_HOME 兜底 /opt/data (console.py:4743 先例;
+        harvest.py:604 只读直查 state.db 先例)。"""
+        db = os.path.join(os.environ.get("MW_HERMES_HOME", "/opt/data"), "state.db")
+        try:
+            c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+            try:
+                row = c.execute("SELECT COUNT(*) FROM session_turn_leases "
+                                "WHERE expires_at > ?", (time.time(),)).fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                c.close()
+        except sqlite3.Error:
+            return None
+
+    def _gateway_busy_is_stale(self, busy_sig: tuple, data: dict) -> bool:
+        """issue #241 陈旧豁免判定 (签名冻结 + S1/S2/S4 交叉验证), 见 FIX-PLAN §②。"""
+        # S3: 签名冻结时长 (调用方已维护 _busy_sig/_busy_since)
+        if time.monotonic() - self._busy_since < _STALE_EXEMPT_S:
+            return False
+        # S1: 忙完全由 api run 表解释 (泄漏签名); 缺 readiness 结构 ⇒ 保守不豁免
+        bq = ((data.get("readiness") or {}).get("checks") or {}).get("background_queues")
+        if not isinstance(bq, dict) or "active_api_runs" not in bq:
+            return False
+        if busy_sig[1] != int(bq.get("active_api_runs") or 0):
+            return False
+        # S4: 无其它后台真活
+        if int(bq.get("active_delegations") or 0) or int(bq.get("process_completions") or 0):
+            return False
+        # S2: 无活跃 turn 租约 (None=未知 ⇒ 不豁免)
+        if self._live_turn_lease_count() != 0:
+            return False
+        return True
+
     def _gateway_free(self) -> tuple[bool, str | None]:
         """gateway 探活 (A9): GET /health/detailed 的 gateway_busy==False
         且 active_agents==0。结果缓存 3s, 探活失败按忙处理。
@@ -989,14 +1036,29 @@ class ScheduleEngine:
                 data = json.loads(r.read())
             busy = bool(data.get("gateway_busy"))
             active = int(data.get("active_agents") or 0)
-            # 三态归因 (issue #181): busy 与「不忙但有活跃 agent」都归
-            # gateway_busy (PM 裁决, 不新增 gateway_active_agents 码)
-            if busy or active > 0:
-                val = (False, "gateway_busy")
-            else:
+            # issue #241: busy 签名冻结跟踪 —— 读数(含各计数)完全不变才累计冻结时长
+            sig = (busy, active,
+                   ((data.get("readiness") or {}).get("checks") or {})
+                     .get("background_queues", {}))
+            if not busy and active <= 0:
+                self._busy_sig, self._busy_since = None, 0.0
+                self._stale_exempt_logged = False
                 val = (True, None)
+            else:
+                if sig != self._busy_sig:
+                    self._busy_sig, self._busy_since = sig, time.monotonic()
+                if self._gateway_busy_is_stale(sig, data):
+                    if not self._stale_exempt_logged:
+                        self._stale_exempt_logged = True
+                        log.warning("issue #241: gateway busy 读数冻结 ≥%.0fs 且交叉信号"
+                                    "(turn租约/api_runs签名/delegations)均无活跃工作, "
+                                    "按泄漏豁免放行: %s", _STALE_EXEMPT_S, sig)
+                    val = (True, None)
+                else:
+                    # 三态归因 (issue #181) 原语义保留
+                    val = (False, "gateway_busy")
         except Exception:
-            val = (False, "gateway_probe_unavailable")
+            val = (False, "gateway_probe_unavailable")   # fail-closed 原样 (红线)
         # 时间戳取在探测**结束之后** (issue #180): 成功与失败两条路径共用
         # 这一行 ⇒ 探活耗时 ≥ TTL 时缓存仍能命中
         self._probe_cache = (time.monotonic(), val)
@@ -1103,6 +1165,9 @@ class ScheduleEngine:
         for row in self.store.list_by_status("running"):
             # issue #206 兜底: running 行超阈值未收敛 (run 行始终未出现,
             # 如进程重启残留) ⇒ 告警一次。自动回退 pending 列 OQ-R1, 未裁决。
+            # issue #234 加固: 告警显式带 run_id —— run_id=NULL 即 #234 死锁
+            # 形态 (main 中断于建 run 前); 该形态现已有操作者出口 (收件箱
+            # running 行取消按钮 → running→cancelled), 告警文案指路。
             upd = row.get("updated_at") or 0.0
             if self.clock() - upd > _ZOMBIE_RUNNING_WARN_S:
                 key = (row["id"], upd)
@@ -1110,8 +1175,11 @@ class ScheduleEngine:
                     self._zombie_warned.add(key)
                     log.warning(
                         "schedule: running task %s 已 %.0fs 未收敛 "
-                        "(run 行未出现? 疑似僵尸, 倒计时被 inbox_running "
-                        "阻塞, issue #206)", row["id"], self.clock() - upd)
+                        "(run_id=%s; run 行未出现? 疑似僵尸, 倒计时被 "
+                        "inbox_running 阻塞, issue #206/#234; 可在收件箱"
+                        "取消该任务解锁下一个)",
+                        row["id"], self.clock() - upd,
+                        row.get("run_id") or "NULL")
             run_id = row.get("run_id")
             if not run_id and row.get("session_id"):
                 r = _ro_query(self.ledger_db,
@@ -1284,6 +1352,26 @@ _ACTIONS = {
 }
 
 
+def _cancel_blocked_by_active_run(eng, task: dict) -> bool:
+    """issue #234: running 任务关联 ACTIVE run ⇒ 取消被拒 (先关 run)。
+
+    关联键 = schedule_tasks.run_id (与 hold_running_for_run 同键, :692-716
+    既有 hold 语义)。run_id 为空 ⇒ 放行 —— 这正是 #234 的死锁形态 (main 在
+    launch 建 run 前被打断, running 且 run_id=NULL, 无任何自动回收路径);
+    run 行不存在或已非 ACTIVE ⇒ 同样放行 (观察层 _observe_running 会把
+    run 已关闭的 running 转 done, 取消与观察收敛口径一致)。
+    """
+    if task.get("status") != "running":
+        return False
+    run_id = task.get("run_id")
+    if not run_id:
+        return False
+    r = _ro_query(eng.ledger_db,
+                  "SELECT status FROM team_work_runs WHERE run_id=? LIMIT 1",
+                  (run_id,))
+    return bool(r) and r[0]["status"] == "ACTIVE"
+
+
 def api_schedule_action(task_id: str, action: str) -> tuple[int, dict]:
     """POST /api/schedule/tasks/<id>/pause|resume|cancel|delete。
     任务不存在 ⇒ 404; 非法迁移 ⇒ 409 (条件 UPDATE 0 行)。"""
@@ -1295,8 +1383,14 @@ def api_schedule_action(task_id: str, action: str) -> tuple[int, dict]:
     eng = get_engine()
     method, wake = _ACTIONS[action]
     fn = getattr(eng.store, method)
-    if eng.store.get(task_id) is None:
+    task = eng.store.get(task_id)
+    if task is None:
         return 404, {"error": _t("schedule.err_task_not_found"), "code": 404}
+    # issue #234: running 放开取消, 但关联 ACTIVE run 的必须走 run 自己的
+    # close/hold 通道 (联动 hold_running_for_run 处理任务), 不允许经任务
+    # 取消旁路 run 生命周期 ⇒ 明确 409 提示先关 run。
+    if action == "cancel" and _cancel_blocked_by_active_run(eng, task):
+        return 409, {"error": _t("schedule.err_run_busy"), "code": 409}
     if not fn(task_id):
         # delete 的 409 语义 = 非取消态不可删 (AC-3.5)
         msg = (_t("schedule.err_only_cancelled_delete") if action == "delete"

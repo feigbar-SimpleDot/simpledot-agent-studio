@@ -27,10 +27,17 @@ const SETTING_ROWS = [
   'default_image',
   'hermes_webui_url',
   'pixel_office_enabled',
+  // ASR-SET: 语音转写上游三键 (留空 = 回退 env MW_ASR_* → 内置默认)
+  'asr_base_url',
+  'asr_model',
+  'asr_key',
 ]
 
 // boolean 型设置项: 渲染成开关 checkbox, 保存时转 bool。
 const BOOL_KEYS = new Set(['pixel_office_enabled'])
+
+// 密码型设置项: 渲染 password 输入框 (值仍随表单提交, 仅屏幕遮蔽)
+const PASSWORD_KEYS = new Set(['asr_key'])
 
 // CONSOLE2 §2.1: 三组卡片的信息架构(键不改, 只改呈现顺序与分组标题)。
 // i18n keys under settings.group.* carry the title text.
@@ -38,6 +45,8 @@ const GROUP_KEYS = [
   { titleKey: 'settings.group.paths', rowKeys: ['shared_workspace_host', 'docker_compose_dir', 'default_image'] },
   { titleKey: 'settings.group.timeout', rowKeys: ['default_timeout_seconds', 'reaper_interval_seconds'] },
   { titleKey: 'settings.group.external', rowKeys: ['hermes_webui_url', 'pixel_office_enabled'] },
+  // ASR-SET: 语音转写分组 (置于 external 组之后)
+  { titleKey: 'settings.group.asr', rowKeys: ['asr_base_url', 'asr_model', 'asr_key'] },
 ]
 
 // CONSOLE2 §2.2 + issue #60: 按字段类型分派校验, 不再无差别套整数校验。
@@ -55,6 +64,12 @@ function validateField(key, raw) {
     const low = raw.toLowerCase()
     return (low.startsWith('http://') || low.startsWith('https://'))
       ? '' : 'settings.invalid_webui_url'
+  }
+  if (key === 'asr_base_url') {
+    if (!raw) return ''  // 留空合法: 回退 env/内置默认
+    const low = raw.toLowerCase()
+    return (low.startsWith('http://') || low.startsWith('https://'))
+      ? '' : 'settings.invalid_asr_url'
   }
   return ''
 }
@@ -156,6 +171,7 @@ export default function SettingsView({ onSaved }) {
           ) : (
             <>
               <input id={'set_' + k} className={`input ${fe ? 'input-err' : ''}`}
+                type={PASSWORD_KEYS.has(k) ? 'password' : 'text'}
                 defaultValue={settings[k] ?? ''}
                 onChange={() => setDirty(true)}
                 onBlur={() => onBlurNum(k)} />
